@@ -1,0 +1,37 @@
+# 开发环境 - 独立后端容器
+# 用法:
+#   启动: docker compose -f docker-compose.dev.yml up -d
+#   停止: docker compose -f docker-compose.dev.yml down
+# 生产环境不受影响，正常使用: docker compose up -d
+
+services:
+  backend-dev:
+    image: testhub-backend:latest
+    container_name: testhub-backend-dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./apps:/app/apps
+      - ./backend:/app/backend
+      - ./knowledge-base:/app/knowledge-bases
+      - testhub-media:/app/media
+      - testhub-logs:/app/logs
+    networks:
+      - testhub-net
+    ports:
+      - "8001:8000"
+    command: ["python", "docker_start.py"]
+
+networks:
+  testhub-net:
+    external: true
+    name: testhub_testhub-net
+
+volumes:
+  testhub-media:
+    external: true
+    name: testhub_testhub-media
+  testhub-logs:
+    external: true
+    name: testhub_testhub-logs

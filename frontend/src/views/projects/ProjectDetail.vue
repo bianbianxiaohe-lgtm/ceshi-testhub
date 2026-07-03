@@ -134,37 +134,14 @@
                 <el-empty description="目录为空" :image-size="60" />
               </div>
               <div v-else class="kb-fs-tree-list">
-                <template v-for="node in fsFiles" :key="node.path">
-                  <!-- 目录 -->
-                  <div v-if="node.type === 'directory'" class="kb-fs-dir">
-                    <div class="kb-fs-dir-name" @click="toggleDir(node.path)">
-                      <el-icon><FolderOpened v-if="expandedDirs.has(node.path)" /><Folder v-else /></el-icon>
-                      {{ node.name }}
-                    </div>
-                    <div v-show="expandedDirs.has(node.path)" class="kb-fs-dir-children">
-                      <div
-                        v-for="child in node.children"
-                        :key="child.path"
-                        class="kb-fs-file"
-                        :class="{ active: selectedFile === child.path }"
-                        @click="selectFile(child)"
-                      >
-                        <el-icon><Document /></el-icon>
-                        <span class="kb-fs-file-name">{{ child.title || child.name }}</span>
-                      </div>
-                    </div>
-                  </div>
-                  <!-- 文件 -->
-                  <div
-                    v-else
-                    class="kb-fs-file"
-                    :class="{ active: selectedFile === node.path }"
-                    @click="selectFile(node)"
-                  >
-                    <el-icon><Document /></el-icon>
-                    <span class="kb-fs-file-name">{{ node.title || node.name }}</span>
-                  </div>
-                </template>
+                <KnowledgeTreeNode
+                  :nodes="fsFiles"
+                  :expanded-dirs="expandedDirs"
+                  :selected-file="selectedFile"
+                  :depth="0"
+                  @toggle-dir="toggleDir"
+                  @select-file="selectFile"
+                />
               </div>
             </div>
 
@@ -433,6 +410,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Document, Folder, FolderOpened, Edit, Delete, Check, Close, ArrowRight, ArrowDown } from '@element-plus/icons-vue'
+import KnowledgeTreeNode from './KnowledgeTreeNode.vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 import { marked } from 'marked'
@@ -587,11 +565,13 @@ const fetchFsTree = async () => {
 }
 
 const toggleDir = (path) => {
-  if (expandedDirs.value.has(path)) {
-    expandedDirs.value.delete(path)
+  const next = new Set(expandedDirs.value)
+  if (next.has(path)) {
+    next.delete(path)
   } else {
-    expandedDirs.value.add(path)
+    next.add(path)
   }
+  expandedDirs.value = next
 }
 
 const selectFile = async (node) => {
