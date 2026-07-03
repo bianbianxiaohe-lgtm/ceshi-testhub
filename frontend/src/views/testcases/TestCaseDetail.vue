@@ -77,6 +77,42 @@
       </el-descriptions>
     </div>
 
+    <!-- ==================== 执行日志 ==================== -->
+    <div class="card-container" v-if="testcase" style="margin-top: 20px">
+      <div class="execution-log-header">
+        <h3 class="section-title">📋 执行日志</h3>
+        <el-button type="success" size="small" @click="openExecuteDialog">+ 新增执行</el-button>
+      </div>
+      
+      <div v-if="executionLogs.length === 0" class="empty-log">
+        暂无执行记录，点击"新增执行"开始记录
+      </div>
+      
+      <el-timeline v-else style="margin-top: 16px">
+        <el-timeline-item
+          v-for="log in executionLogs"
+          :key="log.id"
+          :timestamp="formatDate(log.executed_at)"
+          placement="top"
+          :type="log.result === 'pass' ? 'success' : 'danger'"
+          :icon="log.result === 'pass' ? Check : Close"
+          :color="log.result === 'pass' ? '#67c23a' : '#f56c6c'"
+          :hollow="true"
+        >
+          <div class="log-item">
+            <div class="log-result">
+              <el-tag :type="log.result === 'pass' ? 'success' : 'danger'" size="small">
+                {{ log.result === 'pass' ? '✅ 通过' : '❌ 失败' }}
+              </el-tag>
+              <span class="log-executor">{{ log.executed_by_name }}</span>
+            </div>
+            <div v-if="log.notes" class="log-notes">{{ log.notes }}</div>
+            <div v-else class="log-notes no-notes">无备注</div>
+          </div>
+        </el-timeline-item>
+      </el-timeline>
+    </div>
+
     <!-- 执行用例弹窗 -->
     <el-dialog v-model="showExecuteDialog" title="执行测试用例" width="420px" :close-on-click-modal="false">
       <div class="execute-info">
@@ -107,12 +143,30 @@
 import { ref, computed, watch, onMounted, reactive } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Check, Close } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 
 const route = useRoute()
 const router = useRouter()
 const testcase = ref(null)
+
+// 执行日志
+const executionLogs = ref([])
+const loadingLogs = ref(false)
+
+const fetchExecutionLogs = async () => {
+  if (!testcase.value?.id) return
+  loadingLogs.value = true
+  try {
+    const response = await api.get(`/testcases/${testcase.value.id}/executions/`)
+    executionLogs.value = response.data || []
+  } catch {
+    executionLogs.value = []
+  } finally {
+    loadingLogs.value = false
+  }
+}
 
 // 上下文导航：同项目+同版本下的用例ID列表
 const neighborIds = ref([])
@@ -160,6 +214,8 @@ const fetchTestCase = async () => {
     const versions = response.data.versions || []
     const versionId = versions.length > 0 ? versions[0].id : null
     loadNeighborList(projectId, versionId)
+    // 加载执行日志
+    fetchExecutionLogs()
   } catch (error) {
     ElMessage.error('获取用例详情失败')
   }
@@ -199,6 +255,7 @@ const confirmExecute = async () => {
     ElMessage.success(`执行完成：${executeForm.result === 'pass' ? '通过 ✅' : '失败 ❌'}`)
     showExecuteDialog.value = false
     await fetchTestCase()
+    await fetchExecutionLogs()
   } catch (error) {
     ElMessage.error('执行失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -312,5 +369,53 @@ onMounted(() => {
   line-height: 1.6;
   color: #303133;
   font-family: inherit;
+}
+
+/* ===== 执行日志样式 ===== */
+.execution-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #303133;
+  margin: 0;
+}
+
+.empty-log {
+  text-align: center;
+  color: #909399;
+  padding: 40px 0;
+  font-size: 14px;
+}
+
+.log-item {
+  .log-result {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 4px;
+  }
+  .log-executor {
+    font-size: 13px;
+    color: #606266;
+  }
+  .log-notes {
+    font-size: 13px;
+    color: #303133;
+    background: #f5f7fa;
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin-top: 4px;
+    white-space: pre-wrap;
+  }
+  .log-notes.no-notes {
+    color: #c0c4cc;
+    font-style: italic;
+  }
 }
 </style>
