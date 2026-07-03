@@ -160,7 +160,7 @@ const fetchExecutionLogs = async () => {
   loadingLogs.value = true
   try {
     const response = await api.get(`/testcases/${testcase.value.id}/executions/`)
-    executionLogs.value = response.data || []
+    executionLogs.value = response.data?.results || []
   } catch {
     executionLogs.value = []
   } finally {
