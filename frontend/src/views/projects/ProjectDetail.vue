@@ -409,7 +409,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Document, Folder, FolderOpened, Edit, Delete, Check, Close, ArrowRight, ArrowDown } from '@element-plus/icons-vue'
+import { Plus, Document, Edit, Delete, Check, Close, ArrowRight, ArrowDown } from '@element-plus/icons-vue'
 import KnowledgeTreeNode from './KnowledgeTreeNode.vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
@@ -1042,58 +1042,56 @@ onUnmounted(() => {
 }
 
 .kb-fs-layout {
-  display: flex; height: calc(100vh - 280px); min-height: 500px;
-  border: 1px solid #e4e7ed; border-radius: 8px; overflow: hidden;
+  display: flex;
+  height: calc(100vh - 260px);
+  min-height: 420px;
+  max-height: 760px;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  overflow: hidden;
 }
 
 .kb-fs-tree {
-  width: 260px; flex-shrink: 0;
+  width: 280px;
+  min-width: 220px;
+  max-width: 360px;
+  flex-shrink: 0;
   border-right: 1px solid #e4e7ed;
   background: #fafafa;
-  overflow-y: auto;
-  display: flex; flex-direction: column;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .kb-fs-tree-header {
-  display: flex; justify-content: space-between; align-items: center;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
   padding: 12px 14px;
   border-bottom: 1px solid #e4e7ed;
-  h4 { margin: 0; font-size: 14px; color: #303133; }
-  .kb-fs-tree-count { font-size: 12px; color: #c0c4cc; }
+  flex-shrink: 0;
+  h4 { margin: 0; font-size: 14px; color: #303133; white-space: nowrap; }
+  .kb-fs-tree-count { font-size: 12px; color: #c0c4cc; white-space: nowrap; }
 }
 
 .kb-fs-tree-loading { padding: 16px; }
 .kb-fs-tree-empty { padding: 30px 0; }
 
 .kb-fs-tree-list {
-  flex: 1; overflow-y: auto; padding: 6px 0;
-}
-
-.kb-fs-dir {
-  .kb-fs-dir-name {
-    display: flex; align-items: center; gap: 6px;
-    padding: 7px 14px;
-    font-size: 13px; font-weight: 600; color: #303133;
-    cursor: pointer;
-    &:hover { background: #f0f2f5; }
-  }
-  .kb-fs-dir-children { padding-left: 0; }
-}
-
-.kb-fs-file {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 14px 6px 28px;
-  font-size: 13px; color: #606266;
-  cursor: pointer;
-  transition: background 0.15s;
-  &:hover { background: #ecf5ff; }
-  &.active { background: #d9ecff; color: #409eff; font-weight: 600; }
-  .kb-fs-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 10px;
 }
 
 .kb-fs-content {
-  flex: 1; display: flex; flex-direction: column;
-  overflow-y: auto; background: #fff;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #fff;
+  min-width: 0;
 }
 
 .kb-fs-content-placeholder {
@@ -1242,6 +1240,67 @@ onUnmounted(() => {
     .kb-gen-uncertain-file { font-size: 12px; color: #909399; }
     .kb-gen-uncertain-question { font-size: 14px; color: #303133; margin-bottom: 4px; }
     .kb-gen-uncertain-context { font-size: 13px; color: #909399; font-style: italic; }
+  }
+}
+
+// ============== 响应式适配 ==============
+@media (max-width: 768px) {
+  .kb-fs-layout {
+    flex-direction: column;
+    height: auto;
+    min-height: 520px;
+    max-height: none;
+  }
+
+  .kb-fs-tree {
+    width: 100%;
+    max-width: none;
+    min-width: auto;
+    max-height: 40vh;
+    border-right: none;
+    border-bottom: 1px solid #e4e7ed;
+  }
+
+  .kb-fs-content {
+    min-height: 280px;
+  }
+
+  .kb-fs-content-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+
+  .kb-fs-content-body {
+    padding: 14px 16px;
+  }
+
+  .kb-fs-edit-textarea {
+    padding: 14px 16px;
+  }
+}
+
+@media (max-width: 480px) {
+  .kb-fs-tree-header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .kb-fs-content-header {
+    .kb-fs-content-title {
+      font-size: 13px;
+    }
+  }
+
+  .kb-fs-content-body {
+    padding: 12px;
+    font-size: 13px;
+  }
+
+  .kb-fs-edit-textarea {
+    padding: 12px;
+    font-size: 13px;
   }
 }
 </style>
