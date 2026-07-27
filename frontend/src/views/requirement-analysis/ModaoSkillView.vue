@@ -954,30 +954,34 @@ export default {
     },
     // ---------- PCI 子问题拆解与逐条解答 ----------
     // 纯前端本地快速拆分（按中文标点，零等待）
-    // 修复：拆分时从 pci 已保存的 sub_questions 中恢复已有答案，避免重开弹窗后答案丢失
+    // 优先直接读取已保存的 sub_questions（与主视图 mainPageFlatPci 逻辑一致），
+    // 仅在 sub_questions 缺失/损坏时回退到按 description 拆分，避免重开弹窗后出现"新问题"。
     splitAllPciLocal() {
       this.parsedPciItems.forEach((pci, i) => {
+        // 1) 优先：已有结构化子问题则直接采用（保留各自独立的 question/answer/confirmed）
+        const savedSubs = (pci.sub_questions || []).filter(s => s && s.question)
+        if (savedSubs.length) {
+          this.pciSubQuestions[i] = savedSubs.map(s => ({
+            question: s.question,
+            answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
+            confirmed: !!s.confirmed,
+            _loading: false,
+          }))
+          return
+        }
+        // 2) 回退：无 sub_questions 时按 description 中文标点拆分
         const desc = (pci.description || '').trim()
         if (!desc) {
           this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.resolution_condition || ''), confirmed: false, _loading: false }]
           return
         }
-        // 按常见中文分隔符拆分："且"、"以及"、"、" "；"、"，"（但不在引号内时）
         const parts = desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean)
-        // 取出已保存的子问题答案映射（question → {answer, confirmed}），用于恢复
-        const savedSubs = (pci.sub_questions || []).filter(s => s && s.question)
-        const savedMap = {}
-        savedSubs.forEach(s => { savedMap[(s.question || '').trim()] = { answer: (s.answer || '').trim(), confirmed: !!s.confirmed } })
-        const items = parts.map(p => {
-          const trimmed = p.trim()
-          const saved = savedMap[trimmed] || {}
-          return {
-            question: p,
-            answer: saved.answer || '',
-            confirmed: saved.confirmed || false,
-            _loading: false,
-          }
-        })
+        const items = parts.map(p => ({
+          question: p,
+          answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+          confirmed: false,
+          _loading: false,
+        }))
         this.pciSubQuestions[i] = items.length ? items : [{ question: desc, answer: '', confirmed: false, _loading: false }]
       })
     },
@@ -991,22 +995,26 @@ export default {
       pcis.forEach((pci, i) => {
         const cur = this.pciSubQuestions[i]
         if (!Array.isArray(cur) || !cur.length) {
+          // 优先直接读取已保存的 sub_questions（与主视图一致，避免重建时混入"新问题"）
+          const savedSubs = (pci.sub_questions || []).filter(s => s && s.question)
+          if (savedSubs.length) {
+            this.pciSubQuestions[i] = savedSubs.map(s => ({
+              question: s.question,
+              answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
+              confirmed: !!s.confirmed,
+              _loading: false,
+            }))
+            return
+          }
+          // 回退：无 sub_questions 时按 description 拆分
           const desc = (pci.description || '').trim()
           const parts = desc ? desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean) : ['(无描述内容)']
-          // 从已保存的 sub_questions 恢复答案
-          const savedSubs = (pci.sub_questions || []).filter(s => s && s.question)
-          const savedMap = {}
-          savedSubs.forEach(s => { savedMap[(s.question || '').trim()] = { answer: (s.answer || '').trim(), confirmed: !!s.confirmed } })
-          const items = (parts.length ? parts : [desc || '(无描述内容)']).map(q => {
-            const trimmed = q.trim()
-            const saved = savedMap[trimmed] || {}
-            return {
-              question: q,
-              answer: saved.answer || (pci.answer || pci.resolution_condition || pci.resolution || ''),
-              confirmed: saved.confirmed || false,
-              _loading: false,
-            }
-          })
+          const items = (parts.length ? parts : [desc || '(无描述内容)']).map(q => ({
+            question: q,
+            answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+            confirmed: false,
+            _loading: false,
+          }))
           this.pciSubQuestions[i] = items
         } else {
           // 数组已存在：同步已有答案到子问题对象（避免重开弹窗后答案丢失）
