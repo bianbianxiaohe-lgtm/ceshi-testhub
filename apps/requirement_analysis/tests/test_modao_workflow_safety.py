@@ -7,6 +7,7 @@ from unittest.mock import patch
 from django.test import SimpleTestCase
 
 from apps.requirement_analysis.modao_extractor import ModaoExtractor
+from apps.requirement_analysis.modao_views import _reset_modao_workflow
 from apps.requirement_analysis.modao_workflow import ModaoWorkflow
 
 
@@ -194,3 +195,49 @@ class ModaoDedupAuditTests(SimpleTestCase):
         self.assertEqual(audit[0]['kept_id'], 'TP-1')
         self.assertEqual(audit[0]['removed_id'], 'TP-2')
         self.assertGreaterEqual(audit[0]['similarity'], 0.85)
+
+
+class ModaoWorkflowResetTests(SimpleTestCase):
+    def test_reset_clears_stage_products_but_keeps_source(self):
+        class Pages:
+            deleted = False
+
+            def all(self):
+                return self
+
+            def delete(self):
+                self.deleted = True
+
+        class Proto:
+            url = 'https://modao.example/prototype'
+            auth_cookie = 'kept-cookie'
+            project_id = 7
+            version_id = 9
+            status = 'testpoints_ready'
+            current_stage = 3
+            extracted_json = '{"pages":[1]}'
+            requirement_summary = '旧摘要'
+            final_testpoints_json = '[{"title":"旧测试点"}]'
+            testcases_json = '[{"title":"旧用例"}]'
+            stage_confirmations = '{"stage2_confirmed":true}'
+            pages = Pages()
+            saved_fields = []
+
+            def save(self, update_fields=None):
+                self.saved_fields = update_fields or []
+
+        proto = Proto()
+
+        _reset_modao_workflow(proto)
+
+        self.assertEqual(proto.status, 'pending')
+        self.assertEqual(proto.current_stage, 0)
+        self.assertEqual(proto.extracted_json, '')
+        self.assertEqual(proto.final_testpoints_json, '')
+        self.assertEqual(proto.testcases_json, '')
+        self.assertEqual(proto.stage_confirmations, '{}')
+        self.assertTrue(proto.pages.deleted)
+        self.assertEqual(proto.url, 'https://modao.example/prototype')
+        self.assertEqual(proto.auth_cookie, 'kept-cookie')
+        self.assertEqual(proto.project_id, 7)
+        self.assertEqual(proto.version_id, 9)

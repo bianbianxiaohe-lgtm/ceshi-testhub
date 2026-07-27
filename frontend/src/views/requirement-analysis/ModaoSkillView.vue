@@ -55,9 +55,11 @@
           <template #default="{ row }">{{ row.created_by_name || '未知' }}</template>
         </el-table-column>
         <el-table-column prop="updated_at" label="更新时间" width="160" />
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="success" @click="onContinue(row)">继续</el-button>
+            <el-button v-if="row.source_type !== 'text'" size="small" type="warning" plain
+              @click="onResetWorkflow(row)">重走</el-button>
             <el-button size="small" type="danger" plain @click="onDelete(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -130,7 +132,7 @@
       </el-form>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'"
         :description="proto.error_message" show-icon />
-      <el-button type="primary" :loading="busy" @click="onCreate">{{ form.source_type === 'modao' ? '开始读取墨刀' : form.source_type === 'webshare' ? '开始读取 webshare 页面树' : '保存需求文本' }}</el-button>
+      <el-button type="primary" :loading="busy" @click="protoId ? onReExtract() : onCreate()">{{ protoId ? '重新读取当前任务' : form.source_type === 'modao' ? '开始读取墨刀' : form.source_type === 'webshare' ? '开始读取 webshare 页面树' : '保存需求文本' }}</el-button>
       <el-button v-if="proto && proto.status === 'extracting'" :loading="true">读取中…</el-button>
       <el-button v-if="proto && proto.status === 'extracted' && proto.current_stage >= 0"
         type="success" @click="goStep(1)">✅ 已读取，进入阶段1</el-button>
@@ -1401,6 +1403,49 @@ export default {
       }
       await this.refresh()
       this.$message.success(`已恢复流程「${row.title}」`)
+    },
+    async onResetWorkflow(row) {
+      try {
+        await this.$confirm(
+          `确认将「${row.title}」退回第一步？该任务的读取结果、结构化内容、澄清答案、测试点和用例将被清空；已采纳到用例库的数据不会删除。`,
+          '重新走完整流程',
+          { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' }
+        )
+      } catch (e) { return }
+      try {
+        const res = await request({ url: `${this.base()}/${row.id}/reset/`, method: 'post' })
+        this.stopPoll()
+        this.protoId = row.id
+        this.proto = res.data
+        this.step = 0
+        this.busy = false
+        this.form = {
+          source_type: row.source_type,
+          url: row.source_type === 'modao' ? (row.url || '') : '',
+          webshare_url: row.source_type === 'webshare' ? (row.url || '') : '',
+          cookies: '', requirement_text: '', title: row.title,
+          project: row.project || null, version: row.version || null, dual_fusion: true,
+        }
+        await this.loadHistory()
+        this.$message.success('已回到第一步，请点击“重新读取当前任务”')
+      } catch (e) {
+        this.$message.error('重置失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+    async onReExtract() {
+      if (!this.protoId) return this.onCreate()
+      this.busy = true
+      try {
+        const urls = this.form.source_type === 'webshare'
+          ? (this.form.webshare_url || '').split('\n').map(s => s.trim()).filter(Boolean)
+          : (this.form.url || '').split('\n').map(s => s.trim()).filter(Boolean)
+        const payload = { ...this.form, urls }
+        await request({ url: `${this.base()}/${this.protoId}/extract/`, method: 'post', data: payload })
+        this.startPoll()
+      } catch (e) {
+        this.busy = false
+        this.$message.error('重新读取失败：' + (e.response?.data?.detail || e.message))
+      }
     },
     onNew() {
       this.stopPoll()

@@ -253,6 +253,42 @@ def modao_create(request):
     return Response(ModaoPrototypeSerializer(proto).data, status=http_status.HTTP_201_CREATED)
 
 
+def _reset_modao_workflow(proto):
+    """重置当前流程产物；保留来源、Cookie、项目/版本及已同步到其他业务表的数据。"""
+    reset_values = {
+        'status': 'pending', 'current_stage': 0, 'extracted_json': '',
+        'requirement_summary': '', 'clarification_log': '', 'module_split': '',
+        'risks_json': '', 'pci_json': '', 'final_testpoints_json': '',
+        'dedup_audit_json': '[]', 'testcases_json': '', 'smoke_json': '',
+        'quality_report_json': '', 'excel_path': '', 'stage_confirmations': '{}',
+        'stage4_decision': '', 'error_message': '', 'work_log': '', 'qa_log': '[]',
+    }
+    for field, value in reset_values.items():
+        setattr(proto, field, value)
+    proto.pages.all().delete()
+    proto.save(update_fields=list(reset_values))
+    return proto
+
+
+@api_view(['POST'])
+def modao_reset(request, pk):
+    """将墨刀/webshare任务退回阶段0，以同一来源重新走完整流程。"""
+    from apps.core.mixins import _is_superuser
+
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    if proto.created_by_id != request.user.id and not _is_superuser(request.user):
+        return Response({'detail': '无权重置该任务'}, status=http_status.HTTP_403_FORBIDDEN)
+    if proto.source_type == 'text':
+        return Response({'detail': '文本来源没有独立原文副本，暂不支持重置到阶段0，请新建文本任务'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    if proto.status in ('extracting', 'structuring', 'clarifying', 'designing'):
+        return Response({'detail': '任务正在运行，请等待当前阶段结束后再重置'},
+                        status=http_status.HTTP_409_CONFLICT)
+
+    _reset_modao_workflow(proto)
+    return Response(ModaoPrototypeSerializer(proto).data)
+
+
 @api_view(['POST'])
 def modao_extract(request, pk):
     proto = get_object_or_404(ModaoPrototype, pk=pk)

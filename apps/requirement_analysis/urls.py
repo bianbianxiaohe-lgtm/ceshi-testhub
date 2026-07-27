@@ -23,7 +23,7 @@ from .views import (
     refine_analysis,
 )
 from .modao_views import (
-    modao_list, modao_create, modao_extract, modao_struct, modao_clarify, modao_design,
+    modao_list, modao_create, modao_extract, modao_reset, modao_struct, modao_clarify, modao_design,
     modao_generate_cases, modao_approve_case_generation,
     modao_confirm, modao_smoke, modao_detail, modao_excel,     modao_edit, modao_ask, modao_adopt,
     modao_adopt_single,
@@ -64,6 +64,7 @@ urlpatterns = [
     path('api/modao/create/', modao_create, name='modao-create'),
     path('api/modao/list/', modao_list, name='modao-list'),
     path('api/modao/<int:pk>/extract/', modao_extract, name='modao-extract'),
+    path('api/modao/<int:pk>/reset/', modao_reset, name='modao-reset'),
     path('api/modao/<int:pk>/struct/', modao_struct, name='modao-struct'),
     path('api/modao/<int:pk>/clarify/', modao_clarify, name='modao-clarify'),
     path('api/modao/<int:pk>/design/', modao_design, name='modao-design'),
