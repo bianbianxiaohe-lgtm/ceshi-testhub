@@ -195,6 +195,15 @@ for col in ('feature_module_id', 'version_id'):
     else:
         print(f'{col} already exists')
 
+# 去重审计：保留每次向量去重的保留项、删除项、相似度和原因。
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'modao_prototype' AND column_name = 'dedup_audit_json'",
+)
+if not cur.fetchone():
+    cur.execute("ALTER TABLE modao_prototype ADD COLUMN dedup_audit_json LONGTEXT NOT NULL DEFAULT ('[]')")
+    print('ensured column dedup_audit_json on modao_prototype')
+
 # 确保 feature_modules 有 parent_id 列（功能模块层级：阶段3 子模块挂在阶段1 顶层模块下）
 cur.execute(
     "SELECT 1 FROM information_schema.columns "

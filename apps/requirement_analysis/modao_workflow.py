@@ -355,15 +355,15 @@ class ModaoWorkflow:
     def _vector_dedup(self, items):
         """
         items: [{'id','title','description','source'(list),'priority'}]
-        返回 (deduped_items, dedup_count)
+        返回 (deduped_items, dedup_count, audit_records)
         """
         if not items:
-            return items, 0
+            return items, 0, []
         texts = [it.get('description') or it.get('title') or '' for it in items]
         vecs = self._embed(texts)
         if vecs is None:
             logger.info('无 embedder，跳过向量去重')
-            return items, 0
+            return items, 0, []
         try:
             arr = np.array(vecs, dtype=float)
             norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -371,11 +371,12 @@ class ModaoWorkflow:
             sim = arr @ arr.T
         except Exception as e:
             logger.warning(f'向量去重计算失败: {e}')
-            return items, 0
+            return items, 0, []
 
         n = len(items)
         keep = [True] * n
         dedup = 0
+        audit_records = []
         # 优先级权重：P0>P1>P2
         prio_w = {'P0': 0, 'P1': 1, 'P2': 2}
 
@@ -387,6 +388,15 @@ class ModaoWorkflow:
                 continue
             for j in range(i + 1, n):
                 if keep[j] and sim[i][j] >= self.dedup_threshold:
+                    audit_records.append({
+                        'kept_id': items[i].get('id'),
+                        'kept_title': items[i].get('title', ''),
+                        'removed_id': items[j].get('id'),
+                        'removed_title': items[j].get('title', ''),
+                        'similarity': round(float(sim[i][j]), 6),
+                        'threshold': self.dedup_threshold,
+                        'reason': '同模块测试点描述的向量相似度达到阈值',
+                    })
                     # 合并来源标记，保留高优先级代表
                     src = list(set((items[i].get('source') or []) + (items[j].get('source') or [])))
                     if better(items[j], items[i]):
@@ -396,7 +406,7 @@ class ModaoWorkflow:
                     keep[j] = False
                     dedup += 1
         result = [items[i] for i in range(n) if keep[i]]
-        return result, dedup
+        return result, dedup, audit_records
 
     def _log(self, msg: str):
         """追加工作日志到 prototype.work_log（带时间戳）。"""
@@ -470,6 +480,7 @@ class ModaoWorkflow:
         self._log(f'开始需求读取，共 {len(urls)} 个地址...')
         extractor = ModaoExtractor(run_id=self.session_id)
         all_pages = []
+        all_warnings = []
         for ui, u in enumerate(urls, 1):
             try:
                 # webshare：始终枚举页面树（目录地址自动发现所有子页面）。
@@ -490,6 +501,7 @@ class ModaoWorkflow:
                         # 单页模式 extractor 给的是默认"第N页"，用 URL 推断更可读的页面名
                         p['page_name'] = self._page_label_from_url(u) or p.get('page_name') or f'地址{ui}'
                     all_pages.append(p)
+                all_warnings.extend(data.get('warnings') or [])
                 self._log(f'地址{ui}读取完成：{len(data["pages"])} 页')
             except Exception as e:
                 logger.error(f'地址[{u}]读取失败: {e}')
@@ -508,7 +520,9 @@ class ModaoWorkflow:
                 annotations=json.dumps(p.get('annotations', []), ensure_ascii=False),
                 screenshot=p.get('screenshot', ''),
             )
-        self._log(f'全部读取完成，共 {len(all_pages)} 页')
+        valid_pages = [p for p in all_pages if not p.get('duplicate_of_page')]
+        duplicate_count = len(all_pages) - len(valid_pages)
+        self._log(f'全部读取完成，共 {len(all_pages)} 页 / {len(valid_pages)} 个独立画布')
         self.prototype.extracted_json = json.dumps({
             'urls': urls,
             'pages': [{
@@ -519,14 +533,28 @@ class ModaoWorkflow:
                 'screenshot': p.get('screenshot', ''),
                 'visual_summary': p.get('visual_summary', ''),
                 'visual_artifacts': p.get('visual_artifacts', []),
+                'screenshot_sha256': p.get('screenshot_sha256', ''),
+                'duplicate_of_page': p.get('duplicate_of_page'),
+                'extraction_warnings': p.get('extraction_warnings', []),
             } for p in all_pages],
-            'warnings': [],
+            'warnings': all_warnings,
         }, ensure_ascii=False)
         self.prototype.source_type = source_type
-        self.prototype.status = 'extracted'
+        # 多页原型如果超过 20% 的页面是完全相同截图，说明画布切换不可信；
+        # 保留所有读取产物供排查，但阻断结构化和后续用例生成。
+        duplicate_ratio = duplicate_count / len(all_pages) if all_pages else 0
+        extraction_blocked = len(all_pages) > 1 and duplicate_ratio > 0.2
+        self.prototype.status = 'failed' if extraction_blocked else 'extracted'
+        self.prototype.error_message = (
+            f'原型逐页读取校验失败：{len(all_pages)} 页中有 {duplicate_count} 页截图重复，'
+            '请确认页面树可点击或登录 Cookie 有效后重新读取。'
+            if extraction_blocked else ''
+        )
         self.prototype.current_stage = 0
         self.prototype.save()
-        return {'pages': all_pages}
+        if extraction_blocked:
+            self._log(self.prototype.error_message)
+        return {'pages': all_pages, 'valid_pages': len(valid_pages), 'blocked': extraction_blocked}
 
     # ---------- 阶段1：需求结构化 ----------
     def _source_text(self) -> str:
@@ -793,6 +821,13 @@ class ModaoWorkflow:
         split_yaml = _parse_yaml(_extract_block(split_out, 'yaml')) or {}
         modules = split_yaml.get('modules', []) if isinstance(split_yaml, dict) else []
         summary_yaml = _parse_yaml(_extract_block(self.prototype.requirement_summary or '', 'yaml')) or {}
+        summary_modules = summary_yaml.get('modules', []) if isinstance(summary_yaml, dict) else []
+        expected_names = [m.get('name', '').strip() for m in summary_modules if isinstance(m, dict) and m.get('name')]
+        actual_names = [m.get('name', '').strip() for m in modules if isinstance(m, dict) and m.get('name')]
+        missing_modules = [
+            name for name in expected_names
+            if not any(name in actual or actual in name for actual in actual_names)
+        ]
         decision_tables = (
             summary_yaml.get('decision_tables', [])
             if isinstance(summary_yaml, dict) else []
@@ -833,11 +868,22 @@ class ModaoWorkflow:
             import yaml
             split_out = yaml.safe_dump(split_yaml, allow_unicode=True, sort_keys=False, width=120)
         self.prototype.module_split = split_out
+        if missing_modules:
+            self.prototype.status = 'failed'
+            self.prototype.error_message = (
+                '模块覆盖校验失败，模块拆分遗漏：' + '、'.join(missing_modules)
+                + '。请修正模块拆分后再生成测试点。'
+            )
+            self.prototype.save(update_fields=['module_split', 'status', 'error_message'])
+            self._log(self.prototype.error_message)
+            return {'modules': len(modules), 'final_testpoints': 0, 'error': 'module_coverage_failed',
+                    'missing_modules': missing_modules, 'phase': 1}
         self._log(f'3.1 模块拆分完成，共 {len(modules)} 个模块')
 
         all_final_tps = []      # 全部模块的最终测试点
         all_risks = []
         all_pci = []
+        dedup_audit = []
 
         for idx, mod in enumerate(modules, 1):
             mod_name = mod.get('name', '未命名模块')
@@ -888,7 +934,10 @@ class ModaoWorkflow:
                         'priority': t.get('priority', 'P1'),
                         'source': t.get('source', ['draft']),
                     })
-                deduped, dedup_count = self._vector_dedup(combined)
+                deduped, dedup_count, audit = self._vector_dedup(combined)
+                for record in audit:
+                    record.update({'stage': 'pre_merge', 'module': mod_name})
+                dedup_audit.extend(audit)
                 merge_prompt = render_prompt(
                     P7_MERGE_DEDUP,
                     draft_testpoints=json.dumps(deduped, ensure_ascii=False),
@@ -926,7 +975,10 @@ class ModaoWorkflow:
                 grouped.setdefault(t.get('module', '') or '', []).append(t)
             merged = []
             for mod_name, mod_items in grouped.items():
-                deduped, cnt = self._vector_dedup(mod_items)
+                deduped, cnt, audit = self._vector_dedup(mod_items)
+                for record in audit:
+                    record.update({'stage': 'post_merge', 'module': mod_name})
+                dedup_audit.extend(audit)
                 global_dedup += cnt
                 merged.extend(deduped)
             all_final_tps = merged
@@ -937,6 +989,7 @@ class ModaoWorkflow:
         self.prototype.risks_json = json.dumps(all_risks, ensure_ascii=False)
         self.prototype.pci_json = json.dumps(all_pci, ensure_ascii=False)
         self.prototype.final_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)
+        self.prototype.dedup_audit_json = json.dumps(dedup_audit, ensure_ascii=False)
         self.prototype.status = 'testpoints_ready'
         self.prototype.current_stage = 3
         self.prototype.save()
@@ -1041,6 +1094,21 @@ class ModaoWorkflow:
         quality_json = _parse_json(_extract_block(quality_out, 'json')) or {}
         self.prototype.quality_report_json = json.dumps(quality_json, ensure_ascii=False)
         self._log('3.6 质量自检完成')
+
+        quality_report = quality_json.get('quality_report', quality_json) if isinstance(quality_json, dict) else {}
+        overall_result = str(quality_report.get('overall_result', '')).upper() if isinstance(quality_report, dict) else ''
+        blocking_issues = quality_report.get('blocking_issues', []) if isinstance(quality_report, dict) else []
+        if overall_result == 'FAIL' or blocking_issues:
+            self.prototype.status = 'failed'
+            self.prototype.error_message = '质量门禁未通过，已保留测试用例和质量报告，但未导出正式 Excel。'
+            self.prototype.excel_path = ''
+            self.prototype.save()
+            self._log(self.prototype.error_message)
+            return {
+                'final_testpoints': len(all_final_tps), 'testcases': len(all_cases),
+                'smoke': len(smoke_json.get('smoke_testcases', []) if isinstance(smoke_json, dict) else []),
+                'excel': '', 'quality': 'failed', 'blocking_issues': blocking_issues, 'phase': 2,
+            }
 
         # 3.7 Excel 导出
         self._log('3.7 正在导出 Excel...')

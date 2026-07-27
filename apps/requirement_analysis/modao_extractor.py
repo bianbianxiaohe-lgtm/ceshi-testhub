@@ -29,9 +29,10 @@ logger = logging.getLogger(__name__)
 # 页面树常见选择器（按优先级尝试；命中其一即认为找到页面列表）。
 # 既兼容墨刀，也尽量覆盖 webshare / 通用原型 SPA 的左侧页面树（best-effort）。
 PAGE_TREE_SELECTORS = [
-    # 墨刀（分享视图页面列表项 class 含 screen-item，共 N 页）
-    '[class*="screen-item"]',
-    '[class*="ScreenItem"]',
+    # 墨刀当前分享视图：真正可点击的页面行带 data-cid；不要命中其内部
+    # `.screen-item-icon`，否则 click() 只会选中图标而不会切换画布。
+    '.rn-list-item.page[data-cid][data-interactive-target-type="6"]',
+    '[data-cid][data-interactive-target-type="6"][class*="StyledScreenItem"]',
     # 墨刀
     '.page-list .page-item',
     '.page-panel .page-item',
@@ -215,17 +216,18 @@ class ModaoExtractor:
 
             for idx, item in enumerate(page_items[:max_pages], start=1):
                 try:
+                    extraction_warnings: List[str] = []
                     page_name = f'第{idx}页'
                     if item is not None:
                         try:
                             page_name = (await item.inner_text()).strip() or page_name
                         except Exception:
                             pass
-                        try:
-                            await item.click()
-                            await page.wait_for_timeout(1500)
-                        except Exception as e:
-                            warnings.append(f'第{idx}页点击失败: {e}')
+                        switched = await self._activate_page_item(page, item)
+                        if not switched:
+                            msg = f'第{idx}页“{page_name}”点击后画布未发生变化'
+                            warnings.append(msg)
+                            extraction_warnings.append(msg)
                     else:
                         # 单页模式：确保回到原型根视图
                         pass
@@ -274,7 +276,7 @@ class ModaoExtractor:
                         'screenshot': os.path.relpath(shot_path, self.media_root) if shot_path else '',
                         'visual_summary': vision_result.get('visual_summary', ''),
                         'visual_artifacts': vision_result.get('visual_artifacts', []),
-                        'extraction_warnings': [],
+                        'extraction_warnings': extraction_warnings,
                     })
                 except Exception as e:
                     warnings.append(f'第{idx}页提取异常: {e}')
@@ -288,6 +290,14 @@ class ModaoExtractor:
                         'visual_summary': '',
                         'visual_artifacts': [],
                     })
+
+            duplicate_groups = self._mark_duplicate_screenshots(pages)
+            if duplicate_groups:
+                duplicate_count = sum(len(group) - 1 for group in duplicate_groups)
+                warnings.append(
+                    f'检测到 {duplicate_count} 个重复画布截图，重复页不应视为读取成功：'
+                    + '；'.join(','.join(str(no) for no in group) for group in duplicate_groups)
+                )
 
             await browser.close()
 
@@ -549,6 +559,66 @@ class ModaoExtractor:
             except Exception:
                 continue
         return []
+
+    @staticmethod
+    async def _viewport_fingerprint(page) -> str:
+        """返回当前稳定视口指纹，用于验证点击页面树后画布确实发生变化。"""
+        try:
+            payload = await page.screenshot(full_page=False)
+            return hashlib.sha256(payload).hexdigest()
+        except Exception:
+            return ''
+
+    async def _activate_page_item(self, page, item) -> bool:
+        """点击页面树条目，并用视口指纹确认切换；普通点击失败时再强制点击一次。"""
+        try:
+            await page.keyboard.press('Escape')
+            await page.wait_for_timeout(200)
+        except Exception:
+            pass
+        before = await self._viewport_fingerprint(page)
+        for force in (False, True):
+            try:
+                await item.scroll_into_view_if_needed()
+                await item.click(force=force, timeout=5000)
+                await page.wait_for_timeout(1500)
+                try:
+                    await page.keyboard.press('Escape')
+                    await page.wait_for_timeout(200)
+                except Exception:
+                    pass
+                after = await self._viewport_fingerprint(page)
+                if before and after and before != after:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _mark_duplicate_screenshots(self, pages: List[Dict[str, Any]]) -> List[List[int]]:
+        """标记字节完全相同的截图；保留页面供审计，但明确标为读取异常。"""
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for page_data in pages:
+            rel_path = page_data.get('screenshot') or ''
+            abs_path = os.path.join(self.media_root, rel_path) if rel_path else ''
+            if not abs_path or not os.path.exists(abs_path):
+                continue
+            with open(abs_path, 'rb') as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+            page_data['screenshot_sha256'] = digest
+            groups.setdefault(digest, []).append(page_data)
+
+        duplicates = []
+        for same_pages in groups.values():
+            if len(same_pages) < 2:
+                continue
+            page_nos = [int(page_data.get('page_no') or 0) for page_data in same_pages]
+            duplicates.append(page_nos)
+            for page_data in same_pages[1:]:
+                page_data.setdefault('extraction_warnings', []).append(
+                    f'截图与第{page_nos[0]}页完全一致，未计为独立有效页面'
+                )
+                page_data['duplicate_of_page'] = page_nos[0]
+        return duplicates
 
     async def _extract_visible_text(self, page) -> str:
         try:

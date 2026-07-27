@@ -408,14 +408,14 @@ class ModaoPrototypeSerializer(serializers.ModelSerializer):
             'id', 'uuid', 'title', 'url', 'source_type', 'status', 'current_stage',
             'extracted_json', 'requirement_summary', 'clarification_log', 'module_split',
             'risks_json', 'pci_json', 'final_testpoints_json', 'testcases_json',
-            'smoke_json', 'quality_report_json', 'excel_path', 'stage4_decision',
+            'dedup_audit_json', 'smoke_json', 'quality_report_json', 'excel_path', 'stage4_decision',
             'error_message', 'work_log', 'qa_log', 'project', 'project_name', 'created_by_name', 'created_at', 'updated_at',
             'pages', 'confirmations', 'feature_module_info', 'generation_gate',
         ]
         read_only_fields = [
             'id', 'uuid', 'status', 'current_stage', 'extracted_json', 'requirement_summary',
             'clarification_log', 'module_split', 'risks_json', 'pci_json',
-            'final_testpoints_json', 'testcases_json', 'smoke_json', 'quality_report_json',
+            'final_testpoints_json', 'dedup_audit_json', 'testcases_json', 'smoke_json', 'quality_report_json',
             'excel_path', 'stage4_decision', 'error_message', 'work_log', 'qa_log', 'created_by_name',
             'created_at', 'updated_at', 'pages', 'confirmations', 'generation_gate',
         ]

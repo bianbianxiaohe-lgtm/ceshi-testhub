@@ -1932,6 +1932,7 @@ class ModaoPrototype(models.Model):
     risks_json = models.TextField(blank=True, verbose_name='阶段3-风险')
     pci_json = models.TextField(blank=True, verbose_name='阶段3-PCI')
     final_testpoints_json = models.TextField(blank=True, verbose_name='阶段3-合并测试点')
+    dedup_audit_json = models.TextField(default='[]', blank=True, verbose_name='阶段3-去重审计记录')
     testcases_json = models.TextField(blank=True, verbose_name='阶段3-用例')
     smoke_json = models.TextField(blank=True, verbose_name='阶段3-冒烟')
     quality_report_json = models.TextField(blank=True, verbose_name='阶段3-质量报告')
