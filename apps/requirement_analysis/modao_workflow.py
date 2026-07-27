@@ -458,9 +458,23 @@ class ModaoWorkflow:
         path = u.split('#')[0].rstrip('/')
         return path.split('/')[-1] or u
 
-    def run_extract(self, urls=None, url=None, cookies=None, headless=True, source_type=None):
+    def run_extract(self, urls=None, url=None, cookies=None, headless=True, source_type=None,
+                    dual_fusion=False, fusion_config=None):
         from apps.requirement_analysis.modao_extractor import ModaoExtractor
         source_type = source_type or self.prototype.source_type or 'modao'
+        # 双路融合：未显式指定 fusion_config 时，复用分析用的 analyzer 配置做交叉融合
+        if dual_fusion and fusion_config is None:
+            fusion_config = self.analyzer_config
+        if dual_fusion and not self.vision_config:
+            self.prototype.status = 'failed'
+            self.prototype.error_message = '双路融合需要启用 writer_vision 视觉模型配置，读取已中止。'
+            self.prototype.save(update_fields=['status', 'error_message'])
+            return {'pages': [], 'blocked': True, 'error': 'missing_vision_config'}
+        if dual_fusion and not fusion_config:
+            self.prototype.status = 'failed'
+            self.prototype.error_message = '双路融合需要可用的 analyzer/writer 文本模型配置，读取已中止。'
+            self.prototype.save(update_fields=['status', 'error_message'])
+            return {'pages': [], 'blocked': True, 'error': 'missing_fusion_config'}
         # 规范化 URL 列表（兼容单字符串 / 列表 / 换行或逗号分隔）
         if urls is None:
             urls = [url] if url else []
@@ -481,6 +495,7 @@ class ModaoWorkflow:
         extractor = ModaoExtractor(run_id=self.session_id)
         all_pages = []
         all_warnings = []
+        all_fused_requirements = []
         for ui, u in enumerate(urls, 1):
             try:
                 # webshare：始终枚举页面树（目录地址自动发现所有子页面）。
@@ -495,13 +510,16 @@ class ModaoWorkflow:
                 data = extractor.extract_sync(url=u, cookies=cookies, headless=headless,
                                               enumerate_pages=enumerate_pages,
                                               source_type=source_type,
-                                              vision_config=self.vision_config)
+                                              vision_config=self.vision_config,
+                                              dual_fusion=dual_fusion,
+                                              fusion_config=fusion_config)
                 for p in data['pages']:
                     if single:
                         # 单页模式 extractor 给的是默认"第N页"，用 URL 推断更可读的页面名
                         p['page_name'] = self._page_label_from_url(u) or p.get('page_name') or f'地址{ui}'
                     all_pages.append(p)
                 all_warnings.extend(data.get('warnings') or [])
+                all_fused_requirements.extend(data.get('fused_requirements') or [])
                 self._log(f'地址{ui}读取完成：{len(data["pages"])} 页')
             except Exception as e:
                 logger.error(f'地址[{u}]读取失败: {e}')
@@ -529,6 +547,11 @@ class ModaoWorkflow:
                 'page_no': p['page_no'],
                 'page_name': p['page_name'],
                 'text': p.get('text', ''),
+                'dom_text': p.get('dom_text', ''),
+                'vision_text': p.get('vision_text', ''),
+                'dom_text_len': p.get('dom_text_len', 0),
+                'vision_attempted': bool(p.get('vision_attempted')),
+                'vision_success': bool(p.get('vision_success')),
                 'annotations': p.get('annotations', []),
                 'screenshot': p.get('screenshot', ''),
                 'visual_summary': p.get('visual_summary', ''),
@@ -537,31 +560,85 @@ class ModaoWorkflow:
                 'duplicate_of_page': p.get('duplicate_of_page'),
                 'extraction_warnings': p.get('extraction_warnings', []),
             } for p in all_pages],
+            'dual_fusion': bool(dual_fusion),
+            'fused_requirements': all_fused_requirements,
             'warnings': all_warnings,
         }, ensure_ascii=False)
         self.prototype.source_type = source_type
         # 多页原型如果超过 20% 的页面是完全相同截图，说明画布切换不可信；
         # 保留所有读取产物供排查，但阻断结构化和后续用例生成。
         duplicate_ratio = duplicate_count / len(all_pages) if all_pages else 0
-        extraction_blocked = len(all_pages) > 1 and duplicate_ratio > 0.2
+        block_reasons = []
+        if not all_pages:
+            block_reasons.append('没有读取到任何页面')
+        if len(all_pages) > 1 and duplicate_ratio > 0.2:
+            block_reasons.append(
+                f'{len(all_pages)} 页中有 {duplicate_count} 页截图重复'
+            )
+        attempted_pages = [p for p in valid_pages if p.get('vision_attempted')]
+        vision_failed = [p for p in attempted_pages if not p.get('vision_success')]
+        vision_failure_ratio = len(vision_failed) / len(attempted_pages) if attempted_pages else 0
+        if dual_fusion and len(attempted_pages) != len(valid_pages):
+            block_reasons.append(
+                f'{len(valid_pages)} 个独立页面中仅 {len(attempted_pages)} 页执行了视觉识别'
+            )
+        if dual_fusion and vision_failure_ratio > 0.2:
+            failed_names = '、'.join(p.get('page_name', '') for p in vision_failed[:8])
+            block_reasons.append(
+                f'视觉识别失败 {len(vision_failed)}/{len(attempted_pages)} 页：{failed_names}'
+            )
+        if dual_fusion and not all_fused_requirements:
+            block_reasons.append('DOM/视觉交叉融合未生成有效需求')
+        fused_source_pages = set()
+        for item in all_fused_requirements:
+            if not isinstance(item, dict):
+                continue
+            for page_name in item.get('source_pages') or []:
+                fused_source_pages.add(_normalize_evidence_text(page_name))
+        uncovered_pages = [
+            p for p in valid_pages
+            if _normalize_evidence_text(p.get('page_name')) not in fused_source_pages
+        ]
+        uncovered_ratio = len(uncovered_pages) / len(valid_pages) if valid_pages else 0
+        if dual_fusion and all_fused_requirements and uncovered_ratio > 0.2:
+            uncovered_names = '、'.join(p.get('page_name', '') for p in uncovered_pages[:8])
+            block_reasons.append(
+                f'融合需求缺少 {len(uncovered_pages)}/{len(valid_pages)} 个页面的来源证据：{uncovered_names}'
+            )
+        extraction_blocked = bool(block_reasons)
         self.prototype.status = 'failed' if extraction_blocked else 'extracted'
         self.prototype.error_message = (
-            f'原型逐页读取校验失败：{len(all_pages)} 页中有 {duplicate_count} 页截图重复，'
-            '请确认页面树可点击或登录 Cookie 有效后重新读取。'
+            '原型读取完整性校验失败：' + '；'.join(block_reasons) + '。请修复后重新读取。'
             if extraction_blocked else ''
         )
         self.prototype.current_stage = 0
         self.prototype.save()
         if extraction_blocked:
             self._log(self.prototype.error_message)
-        return {'pages': all_pages, 'valid_pages': len(valid_pages), 'blocked': extraction_blocked}
+        return {
+            'pages': all_pages,
+            'valid_pages': len(valid_pages),
+            'vision_attempted': len(attempted_pages),
+            'vision_failed': len(vision_failed),
+            'fused_requirements': len(all_fused_requirements),
+            'uncovered_pages': len(uncovered_pages),
+            'blocked': extraction_blocked,
+        }
 
     # ---------- 阶段1：需求结构化 ----------
     def _source_text(self) -> str:
         if self.prototype.extracted_json:
             data = json.loads(self.prototype.extracted_json)
             parts = []
+            fused = data.get('fused_requirements') or []
+            if fused:
+                parts.append(
+                    '## DOM + 视觉双路交叉融合需求（结构化主输入）\n'
+                    + json.dumps(fused, ensure_ascii=False)
+                )
             for p in data.get('pages', []):
+                if p.get('duplicate_of_page'):
+                    continue
                 parts.append(
                     f"### {p['page_name']}\n{p.get('text','')}\n"
                     f"[注释/标注] {json.dumps(p.get('annotations', []), ensure_ascii=False)}\n"

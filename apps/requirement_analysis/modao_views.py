@@ -273,11 +273,19 @@ def modao_extract(request, pk):
     a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
                         request.data.get('writer_config_id'),
                         request.data.get('embedder_config_id'))
+    # 可选增强：双路 DOM+视觉 交叉融合（默认关闭）
+    dual_fusion = bool(request.data.get('dual_fusion', False))
+    fusion_config_id = request.data.get('fusion_config_id')
+    fusion_config = None
+    if fusion_config_id:
+        from apps.requirement_analysis.models import AIModelConfig
+        fusion_config = AIModelConfig.objects.filter(id=fusion_config_id).first()
 
     def job():
         wf = _build_wf(proto, a_id, w_id, e_id)
         wf.run_extract(urls=raw_urls, cookies=cookies, headless=headless,
-                       source_type=proto.source_type)
+                       source_type=proto.source_type,
+                       dual_fusion=dual_fusion, fusion_config=fusion_config)
 
     threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
     return Response({'detail': '墨刀读取已启动，请轮询状态'})

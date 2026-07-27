@@ -157,6 +157,8 @@ class ModaoExtractor:
         max_pages: int = 200,
         enumerate_pages: bool = True,
         source_type: str = 'modao',
+        dual_fusion: bool = False,
+        fusion_config=None,
     ) -> Dict[str, Any]:
         """
         逐页提取墨刀原型需求内容。
@@ -205,7 +207,6 @@ class ModaoExtractor:
                     warnings.append(f'二次加载失败，终止: {e2}')
                     await browser.close()
                     return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
-
             await page.wait_for_timeout(2000)
 
             # 枚举页面（多 URL 批量场景由调用方传 enumerate_pages=False，避免重复抓取）
@@ -225,7 +226,7 @@ class ModaoExtractor:
                             pass
                         switched = await self._activate_page_item(page, item)
                         if not switched:
-                            msg = f'第{idx}页“{page_name}”点击后画布未发生变化'
+                            msg = f'第{idx}页"{page_name}"点击后画布未发生变化'
                             warnings.append(msg)
                             extraction_warnings.append(msg)
                     else:
@@ -240,7 +241,7 @@ class ModaoExtractor:
                     except Exception:
                         pass
 
-                    text = await self._extract_visible_text(page)
+                    dom_text = await self._extract_visible_text(page, retry=dual_fusion)
                     annotations = await self._extract_annotations(page, warnings)
                     shot_path = os.path.join(self.shot_dir, f'page_{idx}.png')
                     try:
@@ -261,17 +262,39 @@ class ModaoExtractor:
                         need_vision = bool(shot_path and os.path.exists(shot_path))
                     else:
                         has_visual = await self._page_has_visual(page)
-                        need_vision = len((text or '').strip()) < 30 or has_visual
+                        need_vision = len((dom_text or '').strip()) < 30 or has_visual
+                    vision_text = ''
+                    vision_attempted = bool(
+                        vision_config and shot_path and os.path.exists(shot_path) and need_vision
+                    )
                     if vision_config and shot_path and os.path.exists(shot_path) and need_vision:
                         vision_result = await self._ocr_screenshot(vision_config, shot_path)
                         vision_text = vision_result.get('ocr_text', '')
-                        if vision_text:
-                            text = (text or '') + '\n[视觉OCR补充]\n' + vision_text
+                    vision_success = bool(
+                        vision_text
+                        or vision_result.get('visual_summary')
+                        or vision_result.get('visual_artifacts')
+                    )
+                    if vision_attempted and not vision_success:
+                        extraction_warnings.append('视觉识别未返回有效内容')
+                    # 兼容字段：DOM 文本 + 视觉 OCR 合并，维持 run_struct 既有消费方式
+                    text = (dom_text or '')
+                    if vision_text:
+                        text = text + '\n[视觉OCR补充]\n' + vision_text
+                    # 双路融合策略：DOM 路径与视觉路径作为独立输入分开保留
+                    page_vision_text = vision_text or ''
+                    if vision_result.get('visual_summary'):
+                        page_vision_text = (page_vision_text + '\n' + vision_result['visual_summary']).strip()
 
                     pages.append({
                         'page_no': idx,
                         'page_name': page_name,
                         'text': text,
+                        'dom_text': dom_text,
+                        'vision_text': page_vision_text,
+                        'dom_text_len': len(dom_text or ''),
+                        'vision_attempted': vision_attempted,
+                        'vision_success': vision_success,
                         'annotations': annotations,
                         'screenshot': os.path.relpath(shot_path, self.media_root) if shot_path else '',
                         'visual_summary': vision_result.get('visual_summary', ''),
@@ -301,7 +324,21 @@ class ModaoExtractor:
 
             await browser.close()
 
-        return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+        # 可选增强策略：双路 DOM + 视觉 交叉融合（仅 dual_fusion=True 且提供 fusion_config 时触发）
+        fused_requirements: List[Dict[str, Any]] = []
+        if dual_fusion and fusion_config:
+            try:
+                fused_requirements = await self.dual_fusion_requirements(pages, fusion_config)
+            except Exception as e:
+                logger.warning(f'双路融合失败（已跳过，保留分路径数据）: {e}')
+                warnings.append(f'双路融合失败（已跳过）: {e}')
+
+        result: Dict[str, Any] = {
+            'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+        if dual_fusion:
+            result['dual_fusion'] = True
+            result['fused_requirements'] = fused_requirements
+        return result
 
     @staticmethod
     def _is_axure_url(url: str, cookies: Optional[str] = None) -> bool:
@@ -328,6 +365,8 @@ class ModaoExtractor:
         """同步包装（供 Django 视图在线程中调用）。
         webshare 走纯 HTTP 解析路径；墨刀来源若检测到实际是 Axure/webshare 原型，
         也自动路由到 webshare 多页解析（避免把 webshare 地址误粘到墨刀框时只读出单页）。"""
+        kwargs.setdefault('dual_fusion', False)
+        kwargs.setdefault('fusion_config', None)
         source_type = kwargs.get('source_type', 'modao')
         url = kwargs.get('url')
         # 自动识别：墨刀来源但 URL 实为 Axure/webshare 原型时，自动走多页解析
@@ -355,6 +394,8 @@ class ModaoExtractor:
                 url=url,
                 cookies=kwargs.get('cookies'),
                 vision_config=kwargs.get('vision_config'),
+                dual_fusion=kwargs.get('dual_fusion'),
+                fusion_config=kwargs.get('fusion_config'),
             )
         import logging
         logging.getLogger('modao').info(f'[extract_sync] falling through to Playwright path, source_type={source_type}')
@@ -389,7 +430,8 @@ class ModaoExtractor:
         return d
 
     def extract_webshare_sync(self, url: str, cookies: Optional[str] = None, timeout: int = 30,
-                              vision_config=None) -> Dict[str, Any]:
+                              vision_config=None, dual_fusion: bool = False,
+                              fusion_config=None) -> Dict[str, Any]:
         """webshare / Axure 原型读取：解析 data/document.js 拿页面树，逐个 HTTP 抓取页面 HTML 提取文本。
 
         返回结构与 extract() 一致：{'run_id','url','pages':[{page_no,page_name,text,annotations,screenshot,extraction_warnings}],'warnings'}
@@ -429,14 +471,19 @@ class ModaoExtractor:
                 r = requests.get(page_url, cookies=cookie_dict, timeout=timeout, headers=_UA_HEADERS)
                 if not r.encoding or r.encoding.lower() in ('iso-8859-1', 'ascii'):
                     r.encoding = 'utf-8'
-                text = extract_axure_text(r.text)
+                dom_text = extract_axure_text(r.text)
                 screenshot_path = ''
                 vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                vision_text = ''
+                vision_attempted = False
                 # 视觉 OCR 补充（自动切换）。触发条件满足其一：
                 #   1) 文本极少(<30字) → 纯图片/截图/表格页；
                 #   2) HTML 含 <img> / <table> / 背景图 → 混合页（文字+图片+表格），
                 #      需视觉补充图片/表格内容。纯文本页不受影响。
-                if vision_config and (len(text.strip()) < 30 or self._html_has_visual(r.text)):
+                if vision_config and (
+                    dual_fusion or len(dom_text.strip()) < 30 or self._html_has_visual(r.text)
+                ):
+                    vision_attempted = True
                     try:
                         vision_result = asyncio.run(
                             self._ocr_webshare_page_async(page_url, cookie_dict, vision_config, idx)
@@ -445,20 +492,38 @@ class ModaoExtractor:
                         vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
                         logger.warning(f'webshare 页面[{ap.get("pageName")}]视觉OCR失败: {e}')
                     vision_text = vision_result.get('ocr_text', '')
-                    if vision_text:
-                        text = (text or '') + '\n[视觉OCR补充]\n' + vision_text
-                        if os.path.exists(os.path.join(self.shot_dir, f'ws_page_{idx}.png')):
-                            screenshot_path = os.path.relpath(
-                                os.path.join(self.shot_dir, f'ws_page_{idx}.png'), self.media_root)
+                vision_success = bool(
+                    vision_text
+                    or vision_result.get('visual_summary')
+                    or vision_result.get('visual_artifacts')
+                )
+                # 兼容字段：DOM 文本 + 视觉 OCR 合并，维持 run_struct 既有消费方式
+                text = (dom_text or '')
+                if vision_text:
+                    text = text + '\n[视觉OCR补充]\n' + vision_text
+                rendered_shot = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
+                if os.path.exists(rendered_shot):
+                    screenshot_path = os.path.relpath(rendered_shot, self.media_root)
+                page_vision_text = vision_text or ''
+                if vision_result.get('visual_summary'):
+                    page_vision_text = (page_vision_text + '\n' + vision_result['visual_summary']).strip()
                 pages.append({
                     'page_no': idx,
                     'page_name': ap.get('pageName') or f'第{idx}页',
                     'text': text,
+                    'dom_text': dom_text,
+                    'vision_text': page_vision_text,
+                    'dom_text_len': len(dom_text or ''),
+                    'vision_attempted': vision_attempted,
+                    'vision_success': vision_success,
                     'annotations': [],
                     'screenshot': screenshot_path,
                     'visual_summary': vision_result.get('visual_summary', ''),
                     'visual_artifacts': vision_result.get('visual_artifacts', []),
-                    'extraction_warnings': [],
+                    'extraction_warnings': (
+                        ['视觉识别未返回有效内容']
+                        if vision_attempted and not vision_success else []
+                    ),
                 })
             except Exception as e:
                 warnings.append(f"页面[{ap.get('pageName')}]抓取失败: {e}")
@@ -473,7 +538,19 @@ class ModaoExtractor:
                     'extraction_warnings': [str(e)],
                 })
 
-        return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+        fused_requirements: List[Dict[str, Any]] = []
+        if dual_fusion and fusion_config:
+            try:
+                fused_requirements = asyncio.run(self.dual_fusion_requirements(pages, fusion_config))
+            except Exception as e:
+                logger.warning(f'webshare 双路融合失败（已跳过）: {e}')
+                warnings.append(f'双路融合失败（已跳过）: {e}')
+        result: Dict[str, Any] = {
+            'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+        if dual_fusion:
+            result['dual_fusion'] = True
+            result['fused_requirements'] = fused_requirements
+        return result
 
     # ---------- webshare / Axure：纯图片页视觉 OCR 兜底 ----------
     async def _ocr_webshare_page_async(self, page_url: str, cookie_dict: Dict[str, str],
@@ -620,13 +697,24 @@ class ModaoExtractor:
                 page_data['duplicate_of_page'] = page_nos[0]
         return duplicates
 
-    async def _extract_visible_text(self, page) -> str:
+    async def _extract_visible_text(self, page, retry: bool = False,
+                                    min_chars: int = 60, max_retries: int = 2) -> str:
+        """提取页面可见文本。retry=True 时（墨刀 DOM 异步渲染）首抓偏短则等待重试，
+        对抗偶发 0 字符 / 未就绪，返回最终文本。"""
         try:
-            text = await page.evaluate('() => document.body.innerText')
-            return (text or '').strip()
+            text = (await page.evaluate('() => document.body.innerText') or '').strip()
         except Exception as e:
             logger.warning(f'提取可见文本失败: {e}')
             return ''
+        tries = 1
+        while retry and len(text) < min_chars and tries <= max_retries:
+            await page.wait_for_timeout(1500)
+            try:
+                text = (await page.evaluate('() => document.body.innerText') or '').strip()
+            except Exception:
+                break
+            tries += 1
+        return text
 
     async def _extract_annotations(self, page, warnings: List[str]) -> List[str]:
         """尽力提取注释/标注文本。"""
@@ -1133,3 +1221,144 @@ class ModaoExtractor:
         except Exception as exc:
             logger.warning(f'视觉结构提取失败（可忽略）: {exc}')
             return empty
+
+    # ---------- 可选增强策略：双路 DOM + 视觉 交叉融合 ----------
+    # 背景：跨多原型验证（canvas 训练页 / 文本层设置页 / 排行榜活动页 / 测试+贴纸+日历页）表明，
+    # 墨刀原型「DOM 文本路径」与「视觉截图路径」互补且不可互相替代：DOM 能抽到精确数值/次数/规则，
+    # 视觉能理解布局/纯图/全局结构；纯 DOM 在墨刀上偶发 0 字符（异步渲染），需重试兜底。
+    # 本策略把两路作为独立输入，分别抽需求后 LLM 交叉融合，标注
+    # sources(dom/vision/both) / confidence(high/medium/low) / evidence(A/B/C/D)。
+    # 作为可选策略：默认关闭（dual_fusion=False），保持既有行为不变；由调用方（如 modao_workflow）
+    # 在采用 analyzer 配置时开启并传入 fusion_config。
+
+    async def dual_fusion_requirements(self, pages, fusion_config):
+        """对已被分别记录 dom_text / vision_text 的各页，做双路 LLM 交叉融合。
+
+        pages: extract / extract_webshare_sync 在 dual_fusion=True 时产出的页面列表，
+               每项含 'page_name' / 'dom_text' / 'vision_text' / 'dom_text_len'。
+        fusion_config: 具备文本能力的 AIModelConfig（如 analyzer）。
+        返回融合需求数组（含 sources/confidence/evidence）。失败返回空列表，不抛异常。
+        """
+        if not fusion_config:
+            return []
+        from apps.requirement_analysis.models import AIModelService
+        dom_all, vis_all = [], []
+        dom_total = 0
+        for p in pages:
+            name = p.get('page_name') or f"第{p.get('page_no', '?')}页"
+            dom = (p.get('dom_text') or '').strip()
+            vis = (p.get('vision_text') or '').strip()
+            if dom:
+                dom_all.append(f"### {name}\n{dom}")
+                dom_total += len(dom)
+            if vis:
+                vis_all.append(f"### {name}\n{vis}")
+        if not dom_all and not vis_all:
+            return []
+        dom_reqs = await self._dual_extract_one(
+            AIModelService, fusion_config, dom_all) if dom_all else []
+        vis_reqs = await self._dual_extract_one(
+            AIModelService, fusion_config, vis_all) if vis_all else []
+        return await self._dual_fuse(AIModelService, fusion_config, dom_reqs, vis_reqs, dom_total)
+
+    async def _dual_extract_one(self, aim_service, fusion_config, blocks):
+        """单路分批抽取；按完整页面分组，禁止整体截断导致尾部页面丢失。"""
+        batches = []
+        current = []
+        current_len = 0
+        for block in blocks:
+            # 单页异常超长时按字符切片，但每片都保留原页面标题。
+            pieces = [block[i:i + 10000] for i in range(0, len(block), 10000)] or ['']
+            for piece in pieces:
+                if current and current_len + len(piece) > 12000:
+                    batches.append(current)
+                    current, current_len = [], 0
+                current.append(piece)
+                current_len += len(piece)
+        if current:
+            batches.append(current)
+
+        requirements = []
+        for batch_no, batch in enumerate(batches, 1):
+            messages = [
+                {'role': 'system', 'content': DUAL_EXTRACT_PROMPT},
+                {'role': 'user', 'content': f'批次 {batch_no}/{len(batches)} 页面内容:\n' + '\n\n'.join(batch)},
+            ]
+            try:
+                result = await aim_service.call_openai_compatible_api(
+                    fusion_config, messages, max_tokens=8000)
+                parsed = _parse_llm_json_array(result['choices'][0]['message']['content'])
+                requirements.extend(parsed)
+            except Exception as e:
+                raise RuntimeError(f'双路抽取第 {batch_no}/{len(batches)} 批失败: {e}') from e
+        return requirements
+
+    async def _dual_fuse(self, aim_service, fusion_config, dom_reqs, vis_reqs, dom_len):
+        """交叉融合两路需求数组；任一失败降级为两路并集。"""
+        if not dom_reqs and not vis_reqs:
+            return []
+        user = (
+            f"DOM 可见文本长度 = {dom_len} 字符。\n\n"
+            f"===== 方式A（DOM 文本）原始结果 =====\n{json.dumps(dom_reqs, ensure_ascii=False)}\n\n"
+            f"===== 方式B（视觉截图）原始结果 =====\n{json.dumps(vis_reqs, ensure_ascii=False)}\n"
+        )
+        messages = [
+            {'role': 'system', 'content': DUAL_FUSE_PROMPT},
+            {'role': 'user', 'content': user},
+        ]
+        try:
+            result = await aim_service.call_openai_compatible_api(
+                fusion_config, messages, max_tokens=8000)
+            return _parse_llm_json_array(result['choices'][0]['message']['content']) or []
+        except Exception as e:
+            raise RuntimeError(f'双路交叉融合失败: {e}') from e
+
+
+# ---------- 模块级常量与工具（双路融合用） ----------
+DUAL_EXTRACT_PROMPT = (
+    "你是资深需求分析师。请根据提供的页面内容，提取其中的功能需求点。"
+    "输出 JSON 数组，每条包含：source_pages(证据页面名称数组)、module(所属模块)、feature(功能点)、"
+    "interaction(关键交互/边界/数值规则)、evidence(证据等级 A/B/C/D)。"
+    "只输出 JSON 数组，不要解释。"
+)
+DUAL_FUSE_PROMPT = (
+    "你是资深需求分析架构师。下面是对同一个产品原型，分别用两种方式提取的需求：\n"
+    "- 方式A（DOM 文本）：基于页面 DOM 可见文本（含精确数值/次数/规则）\n"
+    "- 方式B（视觉截图）：基于页面截图（含布局/纯图/全局结构）\n"
+    "请融合两份结果，输出去重后的功能需求数组。每条包含：\n"
+    "  source_pages(合并两路证据页面名称数组), module(所属模块), feature(功能点), interaction(关键交互/边界),\n"
+    "  evidence(取两种方式中最严格的证据等级 A/B/C/D),\n"
+    "  sources(数组，元素取自 'dom' 或 'vision'，表示该需求被哪种方式支持),\n"
+    "  confidence('high' 若 dom 与 vision 都支持 / 'medium' 若仅一种且 evidence>=B / 'low' 若仅一种且 evidence 为 C 或 D)\n"
+    "只输出 JSON 数组，不要解释。"
+)
+
+
+def _parse_llm_json_array(raw):
+    """鲁棒解析 LLM 返回的 JSON 数组；失败返回空列表。"""
+    if not raw:
+        return []
+    s = (raw or '').strip()
+    try:
+        val = json.loads(s)
+        if isinstance(val, list):
+            return val
+    except Exception:
+        pass
+    m = re.search(r"```(?:json)?\s*(.*?)```", s, re.DOTALL)
+    if m:
+        try:
+            val = json.loads(m.group(1).strip())
+            if isinstance(val, list):
+                return val
+        except Exception:
+            pass
+    i, j = s.find("["), s.rfind("]")
+    if i != -1 and j != -1 and j > i:
+        try:
+            val = json.loads(s[i:j + 1])
+            if isinstance(val, list):
+                return val
+        except Exception:
+            pass
+    return []

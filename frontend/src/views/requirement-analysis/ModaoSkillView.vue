@@ -123,6 +123,10 @@
               @click="showQuickVersion = true">+ 新建版本</el-button>
           </div>
         </el-form-item>
+        <el-form-item v-if="form.source_type !== 'text'" label="双路融合">
+          <el-switch v-model="form.dual_fusion" />
+          <div class="form-hint">默认开启。DOM 与视觉分别逐页提取，再由 AI 分批交叉融合；任一路覆盖不足会阻断后续分析，避免生成不完整用例。</div>
+        </el-form-item>
       </el-form>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'"
         :description="proto.error_message" show-icon />
@@ -692,6 +696,7 @@ export default {
         title: '墨刀需求梳理',
         project: null,
         version: null,
+        dual_fusion: true,
       },
       // 一键采纳到用例库
       adoptLoading: false,
@@ -1408,7 +1413,7 @@ export default {
       this.clarifyItems = []
       this.clarifyReplies = []
       this.clarifyParsed = false
-      this.form = { source_type: 'modao', url: '', webshare_url: '', cookies: '', requirement_text: '', title: '墨刀需求梳理' }
+      this.form = { source_type: 'modao', url: '', webshare_url: '', cookies: '', requirement_text: '', title: '墨刀需求梳理', project: null, version: null, dual_fusion: true }
     },
     async onDelete(row) {
       try {
