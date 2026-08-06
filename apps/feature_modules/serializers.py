@@ -9,15 +9,26 @@ class FeatureModuleSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
     project = ProjectSimpleSerializer(read_only=True)
     project_id = serializers.IntegerField(write_only=True, required=False)
+    version_ids = serializers.ListField(child=serializers.IntegerField(), write_only=True, required=False)
+    versions = serializers.SerializerMethodField()
     testcases_count = serializers.SerializerMethodField()
 
     class Meta:
         model = FeatureModule
-        fields = ['id', 'name', 'description', 'project', 'project_id', 'created_by', 'created_at', 'testcases_count']
+        fields = ['id', 'name', 'description', 'project', 'project_id', 'parent', 'created_by',
+                  'created_at', 'testcases_count', 'version_ids', 'versions']
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        # version_ids 是 M2M 字段，不能传给 objects.create()，需提前取出
+        validated_data.pop('version_ids', None)
+        return super().create(validated_data)
 
     def get_testcases_count(self, obj):
         return obj.testcases.count()
+
+    def get_versions(self, obj):
+        return [{'id': v.id, 'name': v.name} for v in obj.versions.all()]
 
 
 class FeatureModuleSimpleSerializer(serializers.ModelSerializer):

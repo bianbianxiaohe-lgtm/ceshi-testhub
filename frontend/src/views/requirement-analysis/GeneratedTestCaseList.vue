@@ -40,10 +40,24 @@
 
         <div class="filter-group">
           <label>功能模块:</label>
-          <select v-model="selectedFeatureModule" @change="loadTasks" class="filter-select" :disabled="!selectedProject">
+          <select v-model="selectedFeatureModule" @change="onFeatureModuleChange" class="filter-select" :disabled="!selectedProject && !selectedVersion">
             <option value="">全部模块</option>
-            <option v-for="fm in filteredFeatureModules" :key="fm.id" :value="fm.id">
-              {{ fm.name }}
+            <optgroup v-if="featureModuleGroups.version.length" :label="`已关联 ${selectedVersionName}`">
+              <option v-for="fm in featureModuleGroups.version" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+            </optgroup>
+            <optgroup v-if="featureModuleGroups.unassociated.length" label="未关联版本">
+              <option v-for="fm in featureModuleGroups.unassociated" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+            </optgroup>
+            <option v-for="fm in featureModuleGroups.all" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+          </select>
+        </div>
+
+        <div class="filter-group">
+          <label>测试点:</label>
+          <select v-model="selectedTestPoint" @change="loadTasks" class="filter-select" :disabled="!selectedFeatureModule">
+            <option value="">全部测试点</option>
+            <option v-for="tp in filteredTestPoints" :key="tp.id" :value="tp.id">
+              {{ tp.name }}
             </option>
           </select>
         </div>
@@ -181,6 +195,14 @@
                   @click="batchDiscardTask(task)"
                   title="一键弃用">
                   ❌ 弃用
+                </button>
+                <button 
+                  v-if="task.status === 'completed'"
+                  class="convert-btn" 
+                  @click="convertToUiAutomation(task)"
+                  title="转为UI自动化AI用例并直接执行"
+                  style="background:#409eff;color:#fff;border:none;border-radius:4px;padding:4px 8px;cursor:pointer;">
+                  🚀 转UI自动化
                 </button>
                 <button 
                   class="delete-btn" 
@@ -370,7 +392,17 @@
                 <div style="display:flex;gap:6px;align-items:center;">
                   <select v-model="adoptForm.feature_module_id" style="flex:1">
                     <option value="">请选择功能模块</option>
-                    <option v-for="fm in availableFeatureModulesCalc" :key="fm.id" :value="fm.id">
+                    <optgroup v-if="adoptFeatureModuleGroups.version.length" :label="`已关联 ${adoptVersionName}`">
+                      <option v-for="fm in adoptFeatureModuleGroups.version" :key="fm.id" :value="fm.id">
+                        {{ fm.project?.name ? `${fm.project.name} / ${fm.name}` : fm.name }}
+                      </option>
+                    </optgroup>
+                    <optgroup v-if="adoptFeatureModuleGroups.unassociated.length" label="未关联版本">
+                      <option v-for="fm in adoptFeatureModuleGroups.unassociated" :key="fm.id" :value="fm.id">
+                        {{ fm.project?.name ? `${fm.project.name} / ${fm.name}` : fm.name }}
+                      </option>
+                    </optgroup>
+                    <option v-for="fm in adoptFeatureModuleGroups.all" :key="fm.id" :value="fm.id">
                       {{ fm.project?.name ? `${fm.project.name} / ${fm.name}` : fm.name }}
                     </option>
                   </select>
@@ -484,6 +516,7 @@
 <script>
 import api from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { importGeneratedToAICase } from '@/api/requirement-analysis'
 
 export default {
   name: 'GeneratedTestCaseList',
@@ -495,6 +528,7 @@ export default {
       selectedProject: '',
       selectedVersion: '',
       selectedFeatureModule: '',
+      selectedTestPoint: '',
       selectedTaskDetail: null,
       showAdoptModal: false,
       isAdopting: false,
@@ -503,6 +537,7 @@ export default {
       allVersions: [], // 存储所有版本列表
       allFeatureModules: [], // 存储所有功能模块列表
       availableFeatureModules: [], // 当前项目的功能模块
+      allTestPoints: [], // 存储所有测试点列表
       // 快速创建功能模块
       showQuickCreateFeatureModule: false,
       quickFeatureModuleSaving: false,
@@ -572,13 +607,30 @@ export default {
       }
     },
     
-    // 可用功能模块 - 根据是否选择项目来决定显示哪些功能模块
-    availableFeatureModulesCalc() {
-      if (this.adoptForm.project_id && this.availableFeatureModules.length > 0) {
-        return this.availableFeatureModules
-      } else {
-        return this.allFeatureModules
+    // 采用表单选中版本的名称（用于下拉分组标题）
+    adoptVersionName() {
+      if (!this.adoptForm.version_id) return ''
+      const list = (this.adoptForm.project_id && this.projectVersions.length) ? this.projectVersions : this.allVersions
+      const v = list.find(v => v.id === Number(this.adoptForm.version_id))
+      return v ? v.name : ''
+    },
+
+    // 采用表单功能模块下拉分组：已关联选中版本 + 未关联版本
+    adoptFeatureModuleGroups() {
+      const base = (this.adoptForm.project_id && this.availableFeatureModules.length > 0)
+        ? this.availableFeatureModules : this.allFeatureModules
+      if (this.adoptForm.version_id) {
+        const vid = Number(this.adoptForm.version_id)
+        const versionMods = []
+        const unassociated = []
+        for (const fm of base) {
+          const versions = fm.versions || []
+          if (versions.some(v => v.id === vid)) versionMods.push(fm)
+          else if (versions.length === 0) unassociated.push(fm)
+        }
+        return { version: versionMods, unassociated, all: [] }
       }
+      return { version: [], unassociated: [], all: base }
     },
     
     // 计算总页数
@@ -598,30 +650,54 @@ export default {
       return this.tasks.length > 0 && this.selectedTasks.length === this.tasks.length
     },
 
-    // 根据选中项目/版本过滤的功能模块列表（用于筛选区）
-    filteredFeatureModules() {
-      // 优先按选中的项目过滤
+    // 选中版本的名称（用于下拉分组标题）
+    selectedVersionName() {
+      if (!this.selectedVersion) return ''
+      const v = this.allVersions.find(v => v.id === Number(this.selectedVersion))
+      return v ? v.name : ''
+    },
+
+    // 功能模块下拉分组：属于选中版本的归「已关联」，未填写版本的归「未关联版本」
+    featureModuleGroups() {
+      // 选了版本 → 按版本关联分组
+      if (this.selectedVersion) {
+        const vid = Number(this.selectedVersion)
+        const version = this.allVersions.find(v => v.id === vid)
+        const projectIds = (version && version.projects && version.projects.length)
+          ? version.projects.map(p => p.id) : []
+        const versionMods = []
+        const unassociated = []
+        for (const fm of this.allFeatureModules) {
+          const fpid = fm.project ? fm.project.id : fm.project_id
+          if (projectIds.length && !projectIds.includes(fpid)) continue
+          const versions = fm.versions || []
+          if (versions.some(v => v.id === vid)) versionMods.push(fm)
+          else if (versions.length === 0) unassociated.push(fm)
+        }
+        return { version: versionMods, unassociated, all: [] }
+      }
+      // 没有版本但选了项目 → 按项目过滤
       if (this.selectedProject) {
         const pid = Number(this.selectedProject)
-        return this.allFeatureModules.filter(fm => {
-          const fpid = fm.project ? fm.project.id : fm.project_id
-          return fpid === pid
-        })
-      }
-      // 其次按选中的版本过滤
-      if (this.selectedVersion) {
-        const version = this.allVersions.find(v => v.id === Number(this.selectedVersion))
-        if (!version || !version.projects) {
-          return this.allFeatureModules
+        return {
+          version: [],
+          unassociated: [],
+          all: this.allFeatureModules.filter(fm => {
+            const fpid = fm.project ? fm.project.id : fm.project_id
+            return fpid === pid
+          })
         }
-        const projectIds = version.projects.map(p => p.id)
-        return this.allFeatureModules.filter(fm => {
-          const pid = fm.project ? fm.project.id : fm.project_id
-          return projectIds.includes(pid)
-        })
       }
-      // 未选项目和版本 → 不显示任何模块（必须选项目后才可选模块）
-      return []
+      return { version: [], unassociated: [], all: [] }
+    },
+
+    // 根据选中功能模块过滤的测试点列表
+    filteredTestPoints() {
+      if (!this.selectedFeatureModule) return []
+      return this.allTestPoints.filter(tp => {
+        const tfm = tp.feature_module ? tp.feature_module.id : tp.feature_module_id
+        return tfm === Number(this.selectedFeatureModule)
+      })
     }
   },
   
@@ -630,6 +706,7 @@ export default {
     this.fetchProjects()
     this.fetchAllVersions()
     this.fetchAllFeatureModules()
+    this.fetchAllTestPoints()
   },
   
   methods: {
@@ -654,6 +731,9 @@ export default {
         }
         if (this.selectedFeatureModule) {
           params.append('feature_module', this.selectedFeatureModule)
+        }
+        if (this.selectedTestPoint) {
+          params.append('test_point', this.selectedTestPoint)
         }
         
         if (params.toString()) {
@@ -827,6 +907,9 @@ export default {
         if (this.selectedFeatureModule) {
           params.append('feature_module', this.selectedFeatureModule)
         }
+        if (this.selectedTestPoint) {
+          params.append('test_point', this.selectedTestPoint)
+        }
         
         url += '?' + params.toString()
         
@@ -942,6 +1025,32 @@ export default {
       }
     },
 
+    // 将AI生成用例转为UI自动化AI用例（AICase），转换后可直接执行
+    async convertToUiAutomation(task) {
+      try {
+        await ElMessageBox.confirm(
+          `确定将任务"${task.title}"的所有AI生成用例转为UI自动化AI用例吗？转换后可在 AI 用例管理页直接执行。`,
+          '转为UI自动化',
+          {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            type: 'info'
+          }
+        )
+      } catch {
+        return
+      }
+
+      try {
+        const res = await importGeneratedToAICase({ task_id: task.task_id })
+        ElMessage.success((res.data && res.data.message) || '导入成功，已转为UI自动化AI用例')
+        this.$router.push('/ai-intelligent-mode/cases')
+      } catch (error) {
+        console.error('转换失败:', error)
+        ElMessage.error('转换失败: ' + (error.response?.data?.error || error.message))
+      }
+    },
+
     async batchAdoptTask(task) {
       try {
         await ElMessageBox.confirm(
@@ -1012,12 +1121,23 @@ export default {
     onProjectFilterChange() {
       this.selectedVersion = ''
       this.selectedFeatureModule = ''
+      this.selectedTestPoint = ''
       this.loadTasks()
     },
 
     // 版本筛选变化时清空功能模块（因为模块需要匹配版本的归属项目）
     onVersionFilterChange() {
       this.selectedFeatureModule = ''
+      this.selectedTestPoint = ''
+      this.loadTasks()
+    },
+
+    onFeatureModuleChange() {
+      this.selectedTestPoint = ''
+      // 加载该模块下的测试点（用于下拉）
+      if (this.selectedFeatureModule) {
+        this.fetchTestPoints(this.selectedFeatureModule)
+      }
       this.loadTasks()
     },
 
@@ -1050,6 +1170,28 @@ export default {
       } catch (error) {
         console.error('获取所有功能模块列表失败:', error)
         this.allFeatureModules = []
+      }
+    },
+
+    // 获取所有测试点（用于筛选下拉）
+    async fetchAllTestPoints() {
+      try {
+        const response = await api.get('/feature-modules/test-points/')
+        this.allTestPoints = response.data.results || response.data || []
+      } catch (error) {
+        console.error('获取测试点列表失败:', error)
+        this.allTestPoints = []
+      }
+    },
+
+    // 获取指定功能模块下的测试点
+    async fetchTestPoints(moduleId) {
+      if (!moduleId) return
+      try {
+        const response = await api.get(`/feature-modules/modules/${moduleId}/test-points/`)
+        this.allTestPoints = response.data || []
+      } catch (error) {
+        console.error('获取模块测试点失败:', error)
       }
     },
 

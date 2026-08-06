@@ -12,6 +12,22 @@
           批量删除 ({{ selectedTestCases.length }})
         </el-button>
         <el-button 
+          v-if="!selectAllMode && selectedTestCases.length > 0"
+          type="primary"
+          @click="openConvertDialog(selectedTestCases, 'ui')"
+          style="background:#409eff;border-color:#409eff;">
+          <el-icon><Promotion /></el-icon>
+          🚀 转UI自动化 ({{ selectedTestCases.length }})
+        </el-button>
+        <el-button 
+          v-if="!selectAllMode && selectedTestCases.length > 0"
+          type="success"
+          @click="openConvertDialog(selectedTestCases, 'appium')"
+          style="background:#67c23a;border-color:#67c23a;">
+          <el-icon><Promotion /></el-icon>
+          📱 转Appium用例 ({{ selectedTestCases.length }})
+        </el-button>
+        <el-button 
           v-if="selectAllMode"
           type="danger" 
           @click="deleteAllFiltered"
@@ -83,13 +99,25 @@
             </el-select>
           </div>
           <div class="filter-item">
+            <el-select v-model="tagsFilter" placeholder="用例类别" @change="handleFilter" size="default">
+              <el-option label="常规" value="" />
+              <el-option label="冒烟用例" value="冒烟" />
+            </el-select>
+          </div>
+          <div class="filter-item">
             <el-select v-model="versionFilter" placeholder="关联版本" clearable :disabled="!projectFilter" @change="handleVersionFilterChange" size="default">
               <el-option v-for="ver in projectVersions" :key="ver.id" :label="ver.name + (ver.is_baseline ? ' (基线)' : '')" :value="ver.id" />
             </el-select>
           </div>
           <div class="filter-item filter-item--module">
             <el-select v-model="featureModuleFilter" placeholder="功能模块" clearable :disabled="!projectFilter" @change="handleFeatureModuleChange" size="default" class="module-select">
-              <el-option v-for="fm in filteredFeatureModules" :key="fm.id" :label="fm.name" :value="fm.id" />
+              <el-option-group v-if="featureModuleGroups.version.length" :label="`已关联 ${selectedVersionName}`">
+                <el-option v-for="fm in featureModuleGroups.version" :key="fm.id" :label="fm.name" :value="fm.id" />
+              </el-option-group>
+              <el-option-group v-if="featureModuleGroups.unassociated.length" label="未关联版本">
+                <el-option v-for="fm in featureModuleGroups.unassociated" :key="fm.id" :label="fm.name" :value="fm.id" />
+              </el-option-group>
+              <el-option v-for="fm in featureModuleGroups.all" :key="fm.id" :label="fm.name" :value="fm.id" />
             </el-select>
             <el-button size="small" circle @click="openQuickCreateFeatureModule" title="快速新建功能模块" class="quick-add-btn">
               <el-icon><Plus /></el-icon>
@@ -230,11 +258,23 @@
             {{ formatDate(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right" :show-overflow-tooltip="false">
+        <el-table-column label="操作" width="290" fixed="right" :show-overflow-tooltip="false">
           <template #default="{ row }">
             <el-button size="small" type="success" @click="openExecuteDialog(row)">执行</el-button>
             <el-button size="small" @click="editTestCase(row)">编辑</el-button>
             <el-button size="small" type="danger" @click="deleteTestCase(row)">删除</el-button>
+            <el-button
+              size="small"
+              type="primary"
+              @click="openConvertDialog([row], 'ui')"
+              title="将这条用例转为UI自动化结构化用例"
+              style="background:#409eff;border-color:#409eff;">🚀 转UI</el-button>
+            <el-button
+              size="small"
+              type="success"
+              @click="openConvertDialog([row], 'appium')"
+              title="转为UI自动化结构化用例（Appium App自动化），需回填元素定位器"
+              style="background:#67c23a;border-color:#67c23a;">📱 转Appium</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -319,16 +359,43 @@
       </template>
     </el-dialog>
   </div>
+    <!-- 转换为 UI 自动化用例：选择目标项目 -->
+    <el-dialog v-model="convertAppiumVisible" :title="convertMode === 'ui' ? '转为 UI 自动化用例' : '转为 Appium 结构化用例'" width="480px" @closed="resetConvertAppium">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="将生成结构化用例（步骤 + 占位元素）"
+        :description="convertMode === 'ui' ? '转换后将跳转到 UI 自动化测试的用例库，可在那里编辑步骤、回填元素定位器后执行。每条用例会拆成步骤骨架，交互步骤带占位元素。' : '转换后将跳转到 App 自动化「真机录制」页面，可在那里选择设备/App执行。每条用例会拆成步骤骨架，交互步骤带占位元素。'"
+        style="margin-bottom:16px;"
+      />
+      <el-form label-width="110px">
+        <el-form-item label="目标项目" required>
+          <el-select v-model="selectedUiProject" placeholder="选择 UI 自动化项目" style="width:100%" :loading="loadingUiProjects">
+            <el-option v-for="p in uiProjects" :key="p.id" :label="p.name" :value="p.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="待转换">
+          {{ convertAppiumCases.length }} 条用例
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="convertAppiumVisible = false">取消</el-button>
+        <el-button type="success" :loading="convertingAppium" @click="confirmConvertAppium">确定转换</el-button>
+      </template>
+    </el-dialog>
+
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Search, Download, Delete, RefreshLeft, Select } from '@element-plus/icons-vue'
+import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 import * as XLSX from 'xlsx'
+import { convertTestcasesToAppium, getUiProjects } from '@/api/ui_automation'
 
 const router = useRouter()
 const route = useRoute()
@@ -346,6 +413,7 @@ const searchText = ref(route.query.search || '')
 const projectFilter = ref(parseNum(route.query.project))
 const priorityFilter = ref(route.query.priority || '')
 const statusFilter = ref(route.query.status || '')
+const tagsFilter = ref(route.query.tags || '')
 const versionFilter = ref(parseNum(route.query.version))
 const featureModuleFilter = ref(parseNum(route.query.feature_module))
 const testPointFilter = ref(parseNum(route.query.test_point))
@@ -384,16 +452,30 @@ const saveQuickFeatureModule = async () => {
   }
   quickFeatureModuleSaving.value = true
   try {
-    await api.post('/feature-modules/', {
+    const payload = {
       name: quickFeatureModuleForm.name.trim(),
       description: quickFeatureModuleForm.description.trim(),
       project_id: quickFeatureModuleForm.project_id
-    })
+    }
+    // 如果当前选了版本，自动关联到该版本
+    if (versionFilter.value) {
+      payload.version_ids = [Number(versionFilter.value)]
+    }
+    await api.post('/feature-modules/', payload)
     ElMessage.success(`功能模块「${quickFeatureModuleForm.name}」创建成功`)
     showQuickCreateFeatureModule.value = false
     await fetchFeatureModules()
   } catch (error) {
-    ElMessage.error(error.response?.data?.detail || '创建功能模块失败')
+    // 优先提取字段级错误（DRF ValidationError格式）
+    const errData = error.response?.data
+    let msg = '创建功能模块失败'
+    if (errData?.detail) {
+      msg = errData.detail
+    } else if (errData && typeof errData === 'object') {
+      const fieldErrors = Object.values(errData).flat()
+      if (fieldErrors.length > 0) msg = fieldErrors[0]
+    }
+    ElMessage.error(msg)
   } finally {
     quickFeatureModuleSaving.value = false
   }
@@ -491,6 +573,7 @@ const fetchTestCases = async () => {
       project: projectFilter.value,
       priority: priorityFilter.value,
       status: statusFilter.value,
+      tags: tagsFilter.value,
       version: versionFilter.value,
       feature_module: featureModuleFilter.value,
       test_point: testPointFilter.value
@@ -570,34 +653,50 @@ const projectVersions = computed(() => {
   })
 })
 
-// 根据选中版本/项目过滤的功能模块列表
-const filteredFeatureModules = computed(() => {
-  // 优先按版本的项目过滤
+// 选中版本的名称（用于下拉分组标题）
+const selectedVersionName = computed(() => {
+  if (!versionFilter.value) return ''
+  const v = allVersions.value.find(v => v.id === Number(versionFilter.value))
+  return v ? v.name : ''
+})
+
+// 功能模块下拉分组：属于选中版本的归「已关联」，未填写版本的归「未关联版本」
+const featureModuleGroups = computed(() => {
+  // 选了版本 → 按版本关联分组
   if (versionFilter.value) {
-    const version = allVersions.value.find(v => v.id === Number(versionFilter.value))
-    if (version && version.projects) {
-      const projectIds = version.projects.map(p => p.id)
-      return allFeatureModules.value.filter(fm => {
-        const pid = fm.project ? fm.project.id : fm.project_id
-        return projectIds.includes(pid)
+    const vid = Number(versionFilter.value)
+    const version = allVersions.value.find(v => v.id === vid)
+    const projectIds = (version && version.projects) ? version.projects.map(p => p.id) : []
+    const versionMods = []
+    const unassociated = []
+    for (const fm of allFeatureModules.value) {
+      const pid = fm.project ? fm.project.id : fm.project_id
+      if (projectIds.length && !projectIds.includes(pid)) continue
+      const versions = fm.versions || []
+      if (versions.some(v => v.id === vid)) versionMods.push(fm)
+      else if (versions.length === 0) unassociated.push(fm)
+    }
+    return { version: versionMods, unassociated, all: [] }
+  }
+  // 只选了项目 → 该项目下所有模块（扁平）
+  if (projectFilter.value) {
+    const pid = Number(projectFilter.value)
+    return {
+      version: [],
+      unassociated: [],
+      all: allFeatureModules.value.filter(fm => {
+        const fpid = fm.project ? fm.project.id : fm.project_id
+        return fpid === pid
       })
     }
   }
-  // 其次按选中的项目过滤
-  if (projectFilter.value) {
-    const pid = Number(projectFilter.value)
-    return allFeatureModules.value.filter(fm => {
-      const fpid = fm.project ? fm.project.id : fm.project_id
-      return fpid === pid
-    })
-  }
-  return allFeatureModules.value
+  return { version: [], unassociated: [], all: [] }
 })
 
 // 是否有激活的筛选器
 const hasActiveFilters = computed(() => {
   return searchText.value || projectFilter.value || priorityFilter.value ||
-    statusFilter.value || versionFilter.value || featureModuleFilter.value ||
+    statusFilter.value || tagsFilter.value || versionFilter.value || featureModuleFilter.value ||
     testPointFilter.value
 })
 
@@ -607,6 +706,7 @@ const resetAllFilters = () => {
   projectFilter.value = ''
   priorityFilter.value = ''
   statusFilter.value = ''
+  tagsFilter.value = ''
   versionFilter.value = ''
   featureModuleFilter.value = ''
   testPointFilter.value = ''
@@ -625,6 +725,7 @@ const syncFiltersToUrl = () => {
   if (projectFilter.value) query.project = projectFilter.value
   if (priorityFilter.value) query.priority = priorityFilter.value
   if (statusFilter.value) query.status = statusFilter.value
+  if (tagsFilter.value) query.tags = tagsFilter.value
   if (versionFilter.value) query.version = versionFilter.value
   if (featureModuleFilter.value) query.feature_module = featureModuleFilter.value
   if (testPointFilter.value) query.test_point = testPointFilter.value
@@ -648,11 +749,23 @@ const handlePageChange = () => {
 }
 
 const goToTestCase = (id) => {
-  router.push(`/ai-generation/testcases/${id}`)
+  // 将当前列表的筛选条件带入详情页，使「上一个/下一个」在同一筛选集合内切换
+  const q = {}
+  const src = route.query
+  ;['search', 'project', 'priority', 'status', 'version', 'feature_module', 'test_point'].forEach(k => {
+    if (src[k]) q[k] = src[k]
+  })
+  router.push({ path: `/ai-generation/testcases/${id}`, query: q })
 }
 
 const editTestCase = (testcase) => {
-  router.push(`/ai-generation/testcases/${testcase.id}/edit`)
+  // 将当前列表的筛选条件带入编辑页，保存后返回详情页才能保持筛选后的用例集合
+  const q = {}
+  const src = route.query
+  ;['search', 'project', 'priority', 'status', 'version', 'feature_module', 'test_point'].forEach(k => {
+    if (src[k]) q[k] = src[k]
+  })
+  router.push({ path: `/ai-generation/testcases/${testcase.id}/edit`, query: q })
 }
 
 const deleteTestCase = async (testcase) => {
@@ -814,6 +927,73 @@ const refreshAfterDelete = async () => {
 // 获取序号
 const getSerialNumber = (index) => {
   return (currentPage.value - 1) * pageSize.value + index + 1
+}
+
+// 将选中的用例库用例转为 UI 自动化用例（UI模式或Appium模式共用）
+const convertMode = ref('appium') // 'ui' | 'appium'
+const convertAppiumVisible = ref(false)
+const convertAppiumCases = ref([])
+const uiProjects = ref([])
+const selectedUiProject = ref(null)
+const loadingUiProjects = ref(false)
+const convertingAppium = ref(false)
+
+const openConvertDialog = async (cases, mode) => {
+  if (!cases || cases.length === 0) {
+    ElMessage.warning('请先选择要转换的测试用例')
+    return
+  }
+  convertMode.value = mode
+  convertAppiumCases.value = cases
+  selectedUiProject.value = null
+  convertAppiumVisible.value = true
+  loadingUiProjects.value = true
+  try {
+    const res = await getUiProjects({ page_size: 999 })
+    uiProjects.value = res.data.results || res.data || []
+    if (uiProjects.value.length === 1) {
+      selectedUiProject.value = uiProjects.value[0].id
+    }
+  } catch (e) {
+    ElMessage.error('加载 UI 自动化项目失败')
+  } finally {
+    loadingUiProjects.value = false
+  }
+}
+
+const resetConvertAppium = () => {
+  convertAppiumCases.value = []
+  selectedUiProject.value = null
+}
+
+const confirmConvertAppium = async () => {
+  if (!selectedUiProject.value) {
+    ElMessage.warning('请选择目标 UI 自动化项目')
+    return
+  }
+  convertingAppium.value = true
+  try {
+    const res = await convertTestcasesToAppium({
+      case_ids: convertAppiumCases.value.map(c => c.id),
+      ui_project_id: selectedUiProject.value,
+      mode: convertMode.value === 'ui' ? 'web' : 'appium'
+    })
+    ElMessage.success((res.data && res.data.message) || '转换成功，已转为UI自动化结构化用例')
+    convertAppiumVisible.value = false
+    if (selectedTestCases.value.length > 0) {
+      tableRef.value?.clearSelection()
+      selectedTestCases.value = []
+    }
+    router.push({
+      path: convertMode.value === 'ui' ? '/ui-automation/test-cases' : '/app-automation/recorder',
+      query: { project: 'ui_' + selectedUiProject.value }
+    })
+  } catch (error) {
+    console.error('转换失败:', error)
+    ElMessage.error('转换失败: ' + (error.response?.data?.message || error.response?.data?.error || error.message))
+  } finally {
+    convertingAppium.value = false
+  }
 }
 
 // 批量删除

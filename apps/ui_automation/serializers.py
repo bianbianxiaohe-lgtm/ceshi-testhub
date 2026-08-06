@@ -6,7 +6,8 @@ from .models import (
     ElementGroup, PageObject, PageObjectElement, ScriptStep, ScriptElementUsage,
     TestCase, TestCaseStep, TestCaseExecution, OperationRecord,
     UiScheduledTask, UiNotificationLog, UiTaskNotificationSetting,
-    AICase, AIExecutionRecord
+    AICase, AIExecutionRecord,
+    AppDevice, AppConfig
 )
 from django.contrib.auth import get_user_model
 
@@ -524,15 +525,26 @@ class CodeGenerationSerializer(serializers.Serializer):
         return data
 
 
+class TestCaseStepElementSerializer(serializers.ModelSerializer):
+    """步骤关联元素的轻量序列化器（供 TestCaseStep 嵌套回显）"""
+    locator_strategy = LocatorStrategySerializer(read_only=True)
+
+    class Meta:
+        model = Element
+        fields = ['id', 'name', 'locator_value', 'locator_strategy', 'element_type']
+
+
 class TestCaseStepSerializer(serializers.ModelSerializer):
     """测试用例步骤序列化器"""
+    element = TestCaseStepElementSerializer(read_only=True)
+    element_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     element_name = serializers.CharField(source='element.name', read_only=True)
     element_locator = serializers.CharField(source='element.locator_value', read_only=True)
 
     class Meta:
         model = TestCaseStep
         fields = [
-            'id', 'step_number', 'action_type', 'element', 'element_name', 'element_locator',
+            'id', 'step_number', 'action_type', 'element', 'element_id', 'element_name', 'element_locator',
             'input_value', 'wait_time', 'assert_type', 'assert_value', 'description', 'created_at'
         ]
 
@@ -568,7 +580,7 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'test_case', 'test_case_name', 'project', 'project_name',
             'test_suite', 'test_suite_name', 'execution_source', 'status',
-            'engine', 'browser', 'headless', 'execution_logs', 'error_message',
+            'engine', 'browser', 'headless',             'execution_logs', 'step_results', 'error_message',
             'screenshots', 'execution_time', 'started_at', 'finished_at',
             'created_by', 'created_by_name', 'created_at'
         ]
@@ -933,4 +945,50 @@ class UiTaskNotificationSettingSerializer(serializers.ModelSerializer):
         if 'webhook' in types:
             type_names.append('Webhook机器人')
         return ', '.join(type_names) if type_names else "无"
+
+
+# ==================== App 自动化序列化器 ====================
+
+class AppDeviceSerializer(serializers.ModelSerializer):
+    """移动设备序列化器"""
+    platform_display = serializers.CharField(source='get_platform_display', read_only=True)
+    device_type_display = serializers.CharField(source='get_device_type_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = AppDevice
+        fields = [
+            'id', 'name', 'platform', 'platform_display', 'platform_version',
+            'device_type', 'device_type_display', 'udid', 'appium_server_url',
+            'adb_host',
+            'status', 'status_display', 'resolution', 'capabilities',
+            'last_heartbeat', 'notes', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['last_heartbeat', 'created_at', 'updated_at']
+
+
+class AppConfigSerializer(serializers.ModelSerializer):
+    """应用配置序列化器"""
+    platform_display = serializers.CharField(source='get_platform_display', read_only=True)
+    project_name = serializers.CharField(source='project.name', read_only=True, allow_null=True)
+    ai_project_name = serializers.CharField(source='ai_project.name', read_only=True, allow_null=True)
+    # 统一展示的项目名称（优先UiProject，其次AI Project）
+    display_project_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AppConfig
+        fields = [
+            'id', 'name', 'platform', 'platform_display', 'package_name',
+            'app_activity', 'app_path', 'version', 'project', 'project_name',
+            'ai_project', 'ai_project_name', 'display_project_name',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def get_display_project_name(self, obj):
+        if obj.project:
+            return obj.project.name
+        if obj.ai_project:
+            return obj.ai_project.name
+        return None
 

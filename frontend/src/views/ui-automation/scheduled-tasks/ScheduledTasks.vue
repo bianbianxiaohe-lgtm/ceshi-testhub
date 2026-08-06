@@ -154,12 +154,12 @@
 
         <el-form-item label="关联项目" required>
           <el-select v-model="taskForm.project" placeholder="请选择项目" @change="onProjectChange">
-            <el-option
-              v-for="project in projects"
-              :key="project.id"
-              :label="project.name"
-              :value="project.id"
-            />
+            <el-option-group label="UI自动化项目">
+              <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+            </el-option-group>
+            <el-option-group label="AI用例项目">
+              <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+            </el-option-group>
           </el-select>
         </el-form-item>
 
@@ -307,6 +307,7 @@
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, ArrowDown } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 import {
   getScheduledTasks,
   createScheduledTask,
@@ -315,7 +316,6 @@ import {
   runScheduledTask,
   pauseScheduledTask,
   resumeScheduledTask,
-  getUiProjects,
   getTestSuites,
   getTestCases,
   getUiUsers
@@ -323,7 +323,7 @@ import {
 
 // 数据状态
 const tasks = ref([])
-const projects = ref([])
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
 const testSuites = ref([])
 const testCases = ref([])
 const users = ref([])
@@ -395,12 +395,7 @@ const loadTasks = async () => {
 
 // 加载项目列表
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects()
-    projects.value = response.data.results
-  } catch (error) {
-    console.error('加载项目列表失败:', error)
-  }
+  await loadAllProjects()
 }
 
 // 加载用户列表
@@ -422,13 +417,16 @@ const loadUsers = async () => {
 const onProjectChange = async (projectId) => {
   if (!projectId) return
 
+  const realId = await resolveUiProjectId(projectId)
+  if (!realId) return
+
   try {
     // 加载测试套件
-    const suitesResponse = await getTestSuites({ project: projectId })
+    const suitesResponse = await getTestSuites({ project: realId })
     testSuites.value = suitesResponse.data.results
 
     // 加载测试用例
-    const casesResponse = await getTestCases({ project: projectId })
+    const casesResponse = await getTestCases({ project: realId })
     testCases.value = casesResponse.data.results
   } catch (error) {
     console.error('加载项目数据失败:', error)
@@ -485,10 +483,11 @@ const resetFilters = () => {
 const submitTaskForm = async () => {
   submitting.value = true
   try {
+    const realProjectId = await resolveUiProjectId(taskForm.project)
     const submitData = {
       name: taskForm.name,
       description: taskForm.description,
-      project: taskForm.project,
+      project: realProjectId,
       task_type: taskForm.task_type,
       trigger_type: taskForm.trigger_type,
       engine: taskForm.engine,

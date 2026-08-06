@@ -315,6 +315,14 @@
             @click="batchDiscard">
             ❌ 一键弃用 ({{ selectedCases.length }})
           </button>
+          <button 
+            class="batch-convert-btn" 
+            :disabled="selectedCases.length === 0"
+            @click="convertToUiAutomation(selectedCases)"
+            title="将勾选的用例转为UI自动化AI用例（可只选一条）"
+            style="background:#409eff;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;">
+            🚀 转UI自动化 ({{ selectedCases.length }})
+          </button>
         </div>
       </div>
 
@@ -356,6 +364,13 @@
                 <button class="view-btn" @click="viewCaseDetail(testCase, index)">📖 查看详情</button>
                 <button class="adopt-btn" @click="adoptSingleCase(testCase, index)">✅ 采纳</button>
                 <button class="discard-btn" @click="discardSingleCase(testCase, index)">❌ 弃用</button>
+                <button
+                  class="convert-btn"
+                  @click="convertToUiAutomation([testCase])"
+                  title="仅将这一条用例转为UI自动化AI用例"
+                  style="background:#409eff;color:#fff;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:12px;">
+                  🚀 转UI
+                </button>
               </div>
             </div>
           </div>
@@ -657,6 +672,7 @@
 
 <script>
 import api from '@/utils/api'
+import { importGeneratedToAICase } from '@/api/requirement-analysis'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { DocumentCopy } from '@element-plus/icons-vue'
 import * as XLSX from 'xlsx'
@@ -1546,6 +1562,51 @@ export default {
       } catch (error) {
         console.error('批量弃用失败:', error)
         ElMessage.error('批量弃用失败: ' + (error.response?.data?.error || error.message))
+      }
+    },
+
+    // 将选中的用例（1条或多条）转为UI自动化AI用例，转换后可在 AI用例管理页直接执行
+    async convertToUiAutomation(cases) {
+      if (!cases || cases.length === 0) {
+        ElMessage.warning('请先选择要转换的测试用例')
+        return
+      }
+
+      const caseCount = cases.length
+      try {
+        await ElMessageBox.confirm(
+          caseCount === 1
+            ? '确定将这 1 条用例转为UI自动化AI用例吗？转换后可在 AI 用例管理页直接执行。'
+            : `确定将选中的 ${caseCount} 条用例转为UI自动化AI用例吗？转换后可在 AI 用例管理页直接执行。`,
+          '转为UI自动化',
+          {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            type: 'info'
+          }
+        )
+      } catch {
+        return
+      }
+
+      try {
+        const res = await importGeneratedToAICase({
+          task_id: this.taskId,
+          cases: cases.map(c => ({
+            scenario: c.scenario || '',
+            precondition: c.precondition || '',
+            steps: c.steps || '',
+            expected: c.expected || '',
+            priority: c.priority || '',
+            caseId: c.caseId || ''
+          }))
+        })
+        ElMessage.success((res.data && res.data.message) || '导入成功，已转为UI自动化AI用例')
+        this.selectedCases = []
+        this.$router.push('/ai-intelligent-mode/cases')
+      } catch (error) {
+        console.error('转换失败:', error)
+        ElMessage.error('转换失败: ' + (error.response?.data?.error || error.message))
       }
     },
 

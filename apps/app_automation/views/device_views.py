@@ -1,0 +1,451 @@
+# -*- coding: utf-8 -*-
+"""APP设备管理视图"""
+import subprocess
+import base64
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django_filters.rest_framework import DjangoFilterBackend
+from django.utils import timezone
+import logging
+
+from .test_case_views import AppPagination
+from ..models import AppDevice
+from ..serializers import AppDeviceSerializer
+from ..managers.device_manager import DeviceManager
+
+logger = logging.getLogger(__name__)
+
+
+def get_adb_path() -> str:
+    """
+    获取 ADB 路径：优先使用数据库配置，否则使用默认值 'adb'
+    """
+    try:
+        from ..models import AppTestConfig
+        config = AppTestConfig.objects.first()
+        return config.adb_path if config else 'adb'
+    except Exception as e:
+        logger.warning(f"获取 ADB 配置失败，使用默认路径: {e}")
+        return 'adb'
+
+
+class AppDeviceViewSet(viewsets.ModelViewSet):
+    """APP设备管理 ViewSet"""
+    queryset = AppDevice.objects.all()
+    serializer_class = AppDeviceSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = AppPagination
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['status', 'connection_type']
+    search_fields = ['device_id', 'name']
+    
+    @action(detail=False, methods=['get'])
+    def discover(self, request):
+        """发现ADB设备（遍历所有已知 adb_host 的 ADB 服务）"""
+        try:
+            adb_path = get_adb_path()
+            logger.info(f"使用 ADB 路径: {adb_path}")
+            
+            # 收集所有已登记的 adb_host（去重）
+            known_hosts = list(
+                AppDevice.objects
+                .exclude(adb_host__isnull=True)
+                .exclude(adb_host='')
+                .values_list('adb_host', flat=True)
+                .distinct()
+            )
+            
+            # 如果没有任何 adb_host，也尝试默认连接（兼容旧场景）
+            if not known_hosts:
+                known_hosts = [None]
+                
+            logger.info(f"扫描 ADB 主机列表: {known_hosts}")
+            
+            # 逐个主机扫描，合并结果
+            all_devices = []
+            seen_device_ids = set()
+            
+            for host in known_hosts:
+                try:
+                    manager = DeviceManager(adb_path=adb_path, adb_host=host)
+                    devices_info = manager.list_devices()
+                    
+                    for device_info in devices_info:
+                        device_id = device_info['device_id']
+                        
+                        # 去重：同一设备只保留第一个发现的
+                        if device_id in seen_device_ids:
+                            continue
+                        seen_device_ids.add(device_id)
+                        
+                        # 判断连接类型和 IP 地址
+                        if ':' in device_id:
+                            connection_type = 'remote_emulator'
+                            ip_address = device_info.get('ip_address') or ''
+                        elif device_id.startswith('emulator-'):
+                            connection_type = 'emulator'
+                            ip_address = '127.0.0.1'
+                        else:
+                            connection_type = 'usb'
+                            ip_address = device_info.get('ip_address') or ''
+                        
+                        device, created = AppDevice.objects.update_or_create(
+                            device_id=device_id,
+                            defaults={
+                                'name': device_info.get('name') or '',
+                                'status': device_info.get('status') or 'offline',
+                                'android_version': device_info.get('android_version') or '',
+                                'ip_address': ip_address,
+                                'port': device_info.get('port') or 5555,
+                                'connection_type': connection_type,
+                                'adb_host': host,  # 记录从哪个主机发现
+                            }
+                        )
+                        all_devices.append(device)
+                        
+                except Exception as e:
+                    logger.warning(f"扫描主机 {host} 失败: {str(e)}")
+                    continue
+            
+            # 清理已无对应真实设备的占位主机记录（该主机下已发现真实设备时移除占位）
+            placeholder_hosts = list(
+                AppDevice.objects
+                .filter(device_id__startswith='adb-host:')
+                .values_list('device_id', 'adb_host')
+            )
+            for ph_id, ph_host in placeholder_hosts:
+                if ph_host and AppDevice.objects.filter(adb_host=ph_host).exclude(device_id=ph_id).exists():
+                    AppDevice.objects.filter(device_id=ph_id).delete()
+            
+            # 返回序列化后的数据库对象
+            return Response({
+                'success': True,
+                'message': f'发现 {len(all_devices)} 个设备',
+                'devices': AppDeviceSerializer(all_devices, many=True).data
+            })
+        except Exception as e:
+            logger.error(f"发现设备失败: {str(e)}")
+            return Response({
+                'success': False,
+                'message': f'发现设备失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'])
+    def lock(self, request, pk=None):
+        """锁定设备"""
+        device = self.get_object()
+        
+        if device.status == 'locked':
+            return Response({
+                'success': False,
+                'message': '设备已被锁定'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        device.lock(request.user)
+        
+        return Response({
+            'success': True,
+            'message': '设备锁定成功',
+            'device': AppDeviceSerializer(device).data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def unlock(self, request, pk=None):
+        """释放设备"""
+        device = self.get_object()
+        
+        if device.locked_by and device.locked_by != request.user:
+            return Response({
+                'success': False,
+                'message': '无权释放他人锁定的设备'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        device.unlock()
+        
+        return Response({
+            'success': True,
+            'message': '设备释放成功',
+            'device': AppDeviceSerializer(device).data
+        })
+    
+    @action(detail=True, methods=['post'])
+    def disconnect(self, request, pk=None):
+        """断开远程设备连接"""
+        device = self.get_object()
+        
+        # 只有远程设备可以断开
+        if device.connection_type not in ['remote', 'remote_emulator']:
+            return Response({
+                'success': False,
+                'message': '只能断开远程设备的连接'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            adb_path = get_adb_path()
+            manager = DeviceManager(adb_path=adb_path)
+            success = manager.disconnect_device(f'{device.ip_address}:{device.port}')
+            
+            if not success:
+                return Response({
+                    'success': False,
+                    'message': '断开设备失败'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            # 更新设备状态为离线
+            device.status = 'offline'
+            device.save()
+            
+            return Response({
+                'success': True,
+                'message': f'设备 {device.name or device.device_id} 已断开连接',
+                'device': AppDeviceSerializer(device).data
+            })
+            
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'断开设备失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def connect(self, request):
+        """连接远程设备"""
+        try:
+            ip_address = request.data.get('ip_address')
+            port = request.data.get('port', 5555)
+            adb_host = request.data.get('adb_host')  # ADB主机IP（可选）
+            
+            if not ip_address:
+                return Response({
+                    'success': False,
+                    'message': '请提供设备IP地址'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            adb_path = get_adb_path()
+            manager = DeviceManager(adb_path=adb_path, adb_host=adb_host)
+            device_info = manager.connect_device(ip_address, port)
+            
+            # 创建或更新设备记录
+            device, created = AppDevice.objects.update_or_create(
+                device_id=device_info['device_id'],
+                defaults={
+                    'name': device_info.get('name') or '',
+                    'status': 'online',
+                    'android_version': device_info.get('android_version', ''),
+                    'ip_address': ip_address,
+                    'port': port,
+                    'connection_type': 'remote_emulator',
+                    'adb_host': adb_host or None,
+                }
+            )
+            
+            return Response({
+                'success': True,
+                'message': '设备连接成功',
+                'device': AppDeviceSerializer(device).data
+            })
+        except ConnectionError as e:
+            # 网络不可达/连接被拒绝 → 400 客户端错误（IP/端口问题）
+            logger.warning(f"连接设备网络错误: {str(e)}")
+            return Response({
+                'success': False,
+                'message': str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            # 其他内部错误 → 500
+            logger.error(f"连接设备失败: {str(e)}")
+            return Response({
+                'success': False,
+                'message': f'连接设备失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def register_adb_host(self, request):
+        """
+        登记 ADB 主机（手机所插电脑的 IP）
+        登记后自动扫描该主机上的设备并入库；若暂时连不上 ADB 服务，
+        则保留一条占位主机记录，后续 discover 会自动重试扫描。
+        """
+        import ipaddress
+        adb_ip = (request.data.get('adb_host') or '').strip()
+        if not adb_ip:
+            return Response({
+                'success': False,
+                'message': '请提供 ADB 主机 IP'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            ipaddress.ip_address(adb_ip)
+        except ValueError:
+            return Response({
+                'success': False,
+                'message': 'IP 格式不正确，请填写有效的 IPv4 地址'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 解析自定义 ADB 端口（默认 5037）
+        try:
+            adb_port = int(request.data.get('adb_port') or 5037)
+        except (ValueError, TypeError):
+            adb_port = 5037
+        if not (1 <= adb_port <= 65535):
+            return Response({
+                'success': False,
+                'message': '端口号不正确，请填写 1-65535 之间的端口'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 存储格式：IP:PORT（DeviceManager 会自动解析端口）
+        adb_host = f'{adb_ip}:{adb_port}'
+        adb_path = get_adb_path()
+        placeholder_id = f'adb-host:{adb_host}'
+
+        try:
+            manager = DeviceManager(adb_path=adb_path, adb_host=adb_host)
+            devices_info = manager.list_devices()
+
+            all_devices = []
+            seen_device_ids = set()
+            for device_info in devices_info:
+                device_id = device_info['device_id']
+                if device_id in seen_device_ids:
+                    continue
+                seen_device_ids.add(device_id)
+
+                if ':' in device_id:
+                    connection_type = 'remote_emulator'
+                    ip_address = device_info.get('ip_address') or ''
+                elif device_id.startswith('emulator-'):
+                    connection_type = 'emulator'
+                    ip_address = '127.0.0.1'
+                else:
+                    connection_type = 'usb'
+                    ip_address = device_info.get('ip_address') or ''
+
+                device, created = AppDevice.objects.update_or_create(
+                    device_id=device_id,
+                    defaults={
+                        'name': device_info.get('name') or '',
+                        'status': device_info.get('status') or 'offline',
+                        'android_version': device_info.get('android_version') or '',
+                        'ip_address': ip_address,
+                        'port': device_info.get('port') or 5555,
+                        'connection_type': connection_type,
+                        'adb_host': adb_host,
+                    }
+                )
+                all_devices.append(device)
+
+            # 已发现真实设备，移除占位主机记录
+            AppDevice.objects.filter(device_id=placeholder_id).delete()
+
+            return Response({
+                'success': True,
+                'reachable': True,
+                'message': f'已在主机 {adb_host} 上发现 {len(all_devices)} 个设备',
+                'devices': AppDeviceSerializer(all_devices, many=True).data
+            })
+
+        except Exception as e:
+            # 暂时连不上（ADB 服务未起 / 防火墙未放行 / 网络不通），
+            # 登记占位主机，后续 discover 会自动重试扫描
+            logger.warning(f"登记主机 {adb_host} 时连接失败，保留占位记录: {str(e)}")
+            AppDevice.objects.update_or_create(
+                device_id=placeholder_id,
+                defaults={
+                    'name': f'ADB主机 {adb_host}',
+                    'status': 'offline',
+                    'connection_type': 'real_device',
+                    'adb_host': adb_host,
+                }
+            )
+            return Response({
+                'success': True,
+                'reachable': False,
+                'message': (
+                    f'已登记主机 {adb_host}，但暂时无法连接其 ADB 服务。'
+                    f'请确认该电脑已运行 "adb -a -P {adb_port} nodaemon server" '
+                    f'且防火墙已放行 {adb_port} 端口，刷新时会自动重试。'
+                )
+            })
+
+    @action(detail=True, methods=['post'], url_path='screenshot')
+    def screenshot(self, request, pk=None):
+        """
+        获取设备实时截图
+        
+        功能：
+        1. 使用 adb screencap 获取设备截图
+        2. 转换为 Base64
+        3. 返回 data URL 格式
+        """
+        device = self.get_object()
+        
+        if device.status == 'offline':
+            return Response({
+                'code': 400,
+                'msg': '设备离线，无法截图',
+                'success': False
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            adb_path = get_adb_path()
+            _adb_host = getattr(device, 'adb_host', None) or None
+            
+            # 使用 adb screencap 命令截图
+            cmd = [adb_path]
+            if _adb_host:
+                # adb_host 可能是 "IP" 或 "IP:PORT"，拆分出端口（默认 5037）
+                if ':' in str(_adb_host):
+                    _host, _, _port = str(_adb_host).partition(':')
+                else:
+                    _host, _port = str(_adb_host), '5037'
+                cmd.extend(['-H', _host, '-P', _port])
+            cmd.extend(['-s', device.device_id, 'exec-out', 'screencap', '-p'])
+            
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=10
+            )
+            
+            if not result.stdout:
+                return Response({
+                    'code': 500,
+                    'msg': '截图失败：无返回数据',
+                    'success': False
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            # 转换为 Base64
+            image_base64 = base64.b64encode(result.stdout).decode('utf-8')
+            
+            logger.info(f"设备 {device.device_id} 截图成功")
+            
+            return Response({
+                'code': 0,
+                'msg': '截图成功',
+                'success': True,
+                'data': {
+                    'filename': f"device_{device.id}_{int(timezone.now().timestamp())}.png",
+                    'content': f"data:image/png;base64,{image_base64}",
+                    'device_id': device.device_id,
+                    'timestamp': int(timezone.now().timestamp())
+                }
+            })
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"设备 {device.device_id} 截图超时")
+            return Response({
+                'code': 500,
+                'msg': '截图超时，请检查设备连接',
+                'success': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            logger.error(f"设备 {device.device_id} 截图失败: {str(e)}")
+            return Response({
+                'code': 500,
+                'msg': f'截图失败: {str(e)}',
+                'success': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

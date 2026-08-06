@@ -19,8 +19,10 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['priority', 'status', 'test_type', 'project']
     search_fields = ['title', 'description']
-    ordering_fields = ['created_at', 'updated_at', 'priority']
-    ordering = ['-created_at']
+    ordering_fields = ['created_at', 'updated_at', 'priority', 'sort_order']
+    # sort_order 升序优先（业务顺序：墨刀采纳的用例按生成顺序 1,2,3... 排列），
+    # 其次 created_at 升序（同 sort_order 时早创建的在前），保证用例库顺序与生成顺序一致。
+    ordering = ['sort_order', 'created_at', 'id']
     
     def get_serializer_class(self):
         if self.request.method == 'POST':
@@ -44,6 +46,11 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
         test_point = self.request.query_params.get('test_point', None)
         if test_point:
             qs = qs.filter(test_point_id=test_point)
+        
+        # 按标签筛选（如 tags=冒烟）
+        tag_filter = self.request.query_params.get('tags', None)
+        if tag_filter:
+            qs = qs.filter(tags__contains=[tag_filter])
         
         return qs.distinct()
     

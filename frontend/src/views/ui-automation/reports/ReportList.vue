@@ -4,7 +4,12 @@
       <h3>测试报告</h3>
       <div class="actions">
         <el-select v-model="selectedProject" placeholder="选择项目" style="width: 200px; margin-right: 15px" @change="onProjectChange">
-          <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
+          <el-option-group label="UI自动化项目">
+            <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
+          <el-option-group label="AI用例项目">
+            <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
         </el-select>
         <el-button type="primary" @click="refreshReports">
           <el-icon><Refresh /></el-icon>
@@ -294,15 +299,16 @@
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Document, Delete, WarningFilled } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 import {
-  getUiProjects,
   getTestExecutions,
   deleteTestExecution
 } from '@/api/ui_automation'
 
 const reports = ref([])
-const projects = ref([])
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
 const selectedProject = ref('')
+const realProjectId = ref(null)
 const loading = ref(false)
 const total = ref(0)
 const pagination = reactive({
@@ -321,13 +327,7 @@ const activeTab = ref('logs')
 
 // 加载项目列表
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    console.error('获取项目列表失败:', error)
-    ElMessage.error('获取项目列表失败')
-  }
+  await loadAllProjects()
 }
 
 // 加载报告列表
@@ -339,8 +339,8 @@ const loadReports = async () => {
       page_size: pagination.pageSize
     }
 
-    if (selectedProject.value) {
-      params.project = selectedProject.value
+    if (realProjectId.value) {
+      params.project = realProjectId.value
     }
 
     const response = await getTestExecutions(params)
@@ -363,6 +363,7 @@ const loadReports = async () => {
 // 项目切换
 const onProjectChange = async () => {
   pagination.currentPage = 1
+  realProjectId.value = await resolveUiProjectId(selectedProject.value)
   await loadReports()
 }
 
@@ -407,14 +408,25 @@ const viewCaseDetail = (caseData) => {
 const getActionText = (actionType) => {
   const actionMap = {
     'click': '点击',
+    'tap': '轻触',
+    'double_tap': '双击',
+    'long_press': '长按',
     'fill': '填写',
+    'input': '输入',
+    'clear': '清空',
     'getText': '获取文本',
     'waitFor': '等待元素',
     'hover': '悬停',
     'scroll': '滚动',
+    'swipe': '滑动',
     'screenshot': '截图',
     'assert': '断言',
-    'wait': '等待'
+    'wait': '等待',
+    'switchTab': '切换标签页',
+    'launch_app': '启动应用',
+    'close_app': '关闭应用',
+    'back': '返回',
+    'home': '主页'
   }
   return actionMap[actionType] || actionType
 }
@@ -505,8 +517,9 @@ const formatDuration = (seconds) => {
 
 onMounted(async () => {
   await loadProjects()
-  if (projects.value.length > 0) {
-    selectedProject.value = projects.value[0].id
+  if (allProjects.value.length > 0) {
+    selectedProject.value = allProjects.value[0].id
+    realProjectId.value = await resolveUiProjectId(selectedProject.value)
   }
   await loadReports()
 })

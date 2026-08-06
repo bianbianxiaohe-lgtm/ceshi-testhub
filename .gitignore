@@ -10,14 +10,17 @@ __pycache__/
 frontend/dist/
 # 忽略log文件
 logs/*
+*.log
+db.sqlite3
 !logs/.gitkeep
 # 忽略.env
 .env
+.env.dev
 
-# 忽略所有 app/*/migrations/ 目录下的所有内容 (包括文件和子目录)
-apps/*/migrations/*
-# 使用否定模式，例外地跟踪 __init__.py 文件
-!apps/*/migrations/__init__.py
+# # 忽略所有 app/*/migrations/ 目录下的所有内容 (包括文件和子目录)
+# apps/*/migrations/*
+# # 使用否定模式，例外地跟踪 __init__.py 文件
+# !apps/*/migrations/__init__.py
 
 # 忽略media下的子目录及文件，但保留.gitkeep文件
 media/allure-reports/*
@@ -36,6 +39,8 @@ frontend/*.log
 
 # 忽略临时调试脚本
 check_*.py
+!scripts/check_encoding.py
+!scripts/check_configuration.py
 debug_*.py
 tmp_*.py
 
@@ -48,3 +53,20 @@ backend/apps/
 
 # 忽略脚本输出文件
 scripts/*.txt
+
+# 本地 AI 助手每日流水（项目级约定统一维护在根目录 CODEBUDDY.md）
+.codebuddy/memory/
+
+# 根目录构建、部署与临时验证产物
+build*.txt
+build*.err
+docker_*.err
+docker_*.log
+check_proj.txt
+tmp_*.json
+tmp_*.txt
+test_fm.json
+_cmp_*
+_ws_db*.py
+$null
+webshare_test.html;

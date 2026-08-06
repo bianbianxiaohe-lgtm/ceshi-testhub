@@ -198,49 +198,58 @@
         <div v-if="moduleLoading" class="loading-wrapper">
           <el-loading />
         </div>
-        <div v-else-if="!modulesList.length" class="empty-modules">
+        <div v-else-if="!hasModules" class="empty-modules">
           <el-empty description="暂无功能模块，点击上方按钮创建" />
         </div>
         <div v-else class="modules-list">
-          <div v-for="module in modulesList" :key="module.id" class="module-card">
-            <div class="module-header" @click="toggleModule(module.id)">
-              <el-icon class="toggle-icon" :class="{ expanded: expandedModules.has(module.id) }">
-                <ArrowRight />
-              </el-icon>
-              <span class="module-name">{{ module.name }}</span>
-              <span class="module-project">{{ module.project?.name }}</span>
-              <el-tag size="small" type="info">{{ module.test_points_count || 0 }} 个测试点</el-tag>
-              <div class="module-actions" @click.stop>
-                <el-button size="small" text type="primary" @click="openEditModule(module)"><el-icon><Edit /></el-icon></el-button>
-                <el-button size="small" text type="danger" @click="deleteModule(module)"><el-icon><Delete /></el-icon></el-button>
-                <el-button size="small" text type="success" @click="openCreateTestPoint(module)"><el-icon><Plus /></el-icon>测试点</el-button>
+          <template v-for="grp in moduleGroups" :key="grp.label">
+            <div v-if="grp.modules.length" class="module-group">
+              <div class="module-group-header">
+                <span class="group-title">{{ grp.label }}</span>
+                <span class="group-count">{{ grp.modules.length }}</span>
+                <span v-if="grp.unassociated" class="group-hint">未关联版本，可在「编辑」中关联到本版本</span>
               </div>
-            </div>
-            <div v-show="expandedModules.has(module.id)" class="module-body">
-              <div v-if="module.testPointsLoading" class="loading-small">
-                <el-loading text="加载测试点中..." />
-              </div>
-              <div v-else-if="!module.testPoints?.length" class="no-testpoints">
-                暂无测试点，点击上方「+ 测试点」按钮创建
-              </div>
-              <div v-else class="testpoints-list">
-                <div v-for="tp in module.testPoints" :key="tp.id" class="testpoint-item">
-                  <span class="tp-name">{{ tp.name }}</span>
-                  <span v-if="tp.description" class="tp-desc">{{ tp.description }}</span>
-                  <div class="tp-actions" @click.stop>
-                    <el-button size="small" text type="primary" @click="openEditTestPoint(tp, module)"><el-icon><Edit /></el-icon></el-button>
-                    <el-button size="small" text type="danger" @click="deleteTestPoint(tp, module)"><el-icon><Delete /></el-icon></el-button>
+              <div v-for="module in grp.modules" :key="module.id" class="module-card">
+                <div class="module-header" @click="toggleModule(module.id)">
+                  <el-icon class="toggle-icon" :class="{ expanded: expandedModules.has(module.id) }">
+                    <ArrowRight />
+                  </el-icon>
+                  <span class="module-name">{{ module.name }}</span>
+                  <span class="module-project">{{ module.project?.name }}</span>
+                  <el-tag size="small" type="info">{{ module.test_points_count || 0 }} 个测试点</el-tag>
+                  <div class="module-actions" @click.stop>
+                    <el-button size="small" text type="primary" @click="openEditModule(module)"><el-icon><Edit /></el-icon></el-button>
+                    <el-button size="small" text type="danger" @click="deleteModule(module)"><el-icon><Delete /></el-icon></el-button>
+                    <el-button size="small" text type="success" @click="openCreateTestPoint(module)"><el-icon><Plus /></el-icon>测试点</el-button>
+                  </div>
+                </div>
+                <div v-show="expandedModules.has(module.id)" class="module-body">
+                  <div v-if="module.testPointsLoading" class="loading-small">
+                    <el-loading text="加载测试点中..." />
+                  </div>
+                  <div v-else-if="!module.testPoints?.length" class="no-testpoints">
+                    暂无测试点，点击上方「+ 测试点」按钮创建
+                  </div>
+                  <div v-else class="testpoints-list">
+                    <div v-for="tp in module.testPoints" :key="tp.id" class="testpoint-item">
+                      <span class="tp-name">{{ tp.name }}</span>
+                      <span v-if="tp.description" class="tp-desc">{{ tp.description }}</span>
+                      <div class="tp-actions" @click.stop>
+                        <el-button size="small" text type="primary" @click="openEditTestPoint(tp, module)"><el-icon><Edit /></el-icon></el-button>
+                        <el-button size="small" text type="danger" @click="deleteTestPoint(tp, module)"><el-icon><Delete /></el-icon></el-button>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
-          </div>
+          </template>
         </div>
       </div>
     </el-dialog>
 
     <!-- 新增/编辑功能模块弹窗 -->
-    <el-dialog v-model="createModuleVisible" :title="editingModuleId ? '编辑功能模块' : '新增功能模块'" width="450px" :close-on-click-modal="false">
+    <el-dialog v-model="createModuleVisible" :title="editingModuleId ? '编辑功能模块' : '新增功能模块'" width="500px" :close-on-click-modal="false">
       <el-form :model="moduleForm" ref="moduleFormRef" label-width="90px" :rules="moduleRules">
         <el-form-item label="所属项目" prop="project_id">
           <el-select v-model="moduleForm.project_id" placeholder="请选择项目" style="width: 100%">
@@ -257,6 +266,17 @@
         </el-form-item>
         <el-form-item label="模块描述">
           <el-input v-model="moduleForm.description" type="textarea" :rows="2" placeholder="可选填描述" />
+        </el-form-item>
+        <el-form-item label="关联版本">
+          <el-checkbox-group v-model="moduleForm.version_ids" style="width: 100%">
+            <el-checkbox
+              v-for="v in allVersionsForModule"
+              :key="v.id"
+              :label="v.id"
+              :value="v.id"
+            >{{ v.name }}</el-checkbox>
+          </el-checkbox-group>
+          <div style="color: #909399; font-size: 12px; margin-top: 4px">选择该功能模块所属的版本（可多选）</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -287,7 +307,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search, Delete, ArrowRight, Edit } from '@element-plus/icons-vue'
 import api from '@/utils/api'
@@ -328,6 +348,22 @@ const manageDialogVisible = ref(false)
 const manageVersion = ref(null)
 const modulesList = ref([])
 const moduleLoading = ref(false)
+// 模块管理弹窗中的分组：属于本版本的归「已关联」，未填写版本的归「未关联版本」
+const moduleGroups = computed(() => {
+  const vid = manageVersion.value?.id
+  const matched = []
+  const unassociated = []
+  for (const m of modulesList.value) {
+    const versions = m.versions || []
+    if (vid && versions.some(v => v.id === vid)) matched.push(m)
+    else if (versions.length === 0) unassociated.push(m)
+  }
+  return [
+    { label: `已关联「${manageVersion.value?.name || ''}」`, modules: matched, unassociated: false },
+    { label: '未关联版本', modules: unassociated, unassociated: true }
+  ]
+})
+const hasModules = computed(() => moduleGroups.value.some(g => g.modules.length))
 const expandedModules = ref(new Set())
 
 const fetchModulesForVersion = async () => {
@@ -341,7 +377,10 @@ const fetchModulesForVersion = async () => {
     const allModules = []
     for (const pid of projectIds) {
       try {
-        const res = await api.get(`/feature-modules/projects/${pid}/modules/`)
+        // 传 version_id 参数，只返回该版本关联的模块
+        const res = await api.get(`/feature-modules/projects/${pid}/modules/`, {
+          params: { version_id: manageVersion.value.id }
+        })
         allModules.push(...(res.data || []))
       } catch (e) {
         console.error(`加载项目 ${pid} 的模块失败:`, e)
@@ -407,28 +446,56 @@ const moduleSaving = ref(false)
 const moduleForm = reactive({
   name: '',
   description: '',
-  project_id: null
+  project_id: null,
+  version_ids: []
 })
 const moduleRules = {
   project_id: [{ required: true, message: '请选择所属项目', trigger: 'change' }],
   name: [{ required: true, message: '请输入模块名称', trigger: 'blur' }]
 }
+const allVersionsForModule = ref([])
 
-const openCreateModuleDialog = () => {
+const fetchAllVersionsForModule = async () => {
+  try {
+    const res = await api.get('/versions/')
+    const all = res.data.results || res.data || []
+    // 只保留与当前版本所属项目相关的版本
+    const projectIds = (manageVersion.value?.projects || []).map(p => p.id)
+    if (projectIds.length > 0) {
+      allVersionsForModule.value = all.filter(v => {
+        if (!v.projects || !Array.isArray(v.projects)) return false
+        return v.projects.some(p => projectIds.includes(p.id))
+      }).map((v) => ({ id: v.id, name: v.name }))
+    } else {
+      allVersionsForModule.value = all.map((v) => ({ id: v.id, name: v.name }))
+    }
+  } catch {}
+}
+
+const openCreateModuleDialog = async () => {
   editingModuleId.value = null
   moduleForm.name = ''
   moduleForm.description = ''
   moduleForm.project_id = manageVersion.value?.projects?.[0]?.id || null
+  moduleForm.version_ids = manageVersion.value ? [manageVersion.value.id] : []
   createModuleVisible.value = true
+  await fetchAllVersionsForModule()
   nextTick(() => moduleFormRef.value?.resetFields())
 }
 
-const openEditModule = (module) => {
+const openEditModule = async (module) => {
   editingModuleId.value = module.id
   moduleForm.name = module.name
   moduleForm.description = module.description || ''
   moduleForm.project_id = module.project?.id || module.project_id
+  // 编辑时从模块已有的版本列表中提取 id
+  if (module.versions && Array.isArray(module.versions)) {
+    moduleForm.version_ids = module.versions.map((v) => v.id || v)
+  } else {
+    moduleForm.version_ids = manageVersion.value ? [manageVersion.value.id] : []
+  }
   createModuleVisible.value = true
+  await fetchAllVersionsForModule()
   nextTick(() => moduleFormRef.value?.clearValidate())
 }
 
@@ -459,7 +526,9 @@ const saveModule = async () => {
     const payload = {
       name: moduleForm.name.trim(),
       description: moduleForm.description.trim(),
-      project_id: moduleForm.project_id
+      project_id: moduleForm.project_id,
+      // 使用用户在复选框中选择的版本
+      version_ids: moduleForm.version_ids
     }
     if (editingModuleId.value) {
       await api.put(`/feature-modules/${editingModuleId.value}/`, payload)
@@ -844,6 +913,36 @@ onMounted(() => {
     gap: 8px;
   }
 
+  .module-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .module-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 2px;
+    padding: 4px 8px;
+    background: var(--el-fill-color-light, #f5f7fa);
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--el-text-color-primary, #303133);
+  }
+
+  .module-group-header .group-count {
+    color: var(--el-color-primary, #409eff);
+  }
+
+  .module-group-header .group-hint {
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--el-text-color-secondary, #909399);
+  }
+
+
   .module-card {
     border: 1px solid #e4e7ed;
     border-radius: 6px;
@@ -935,5 +1034,22 @@ onMounted(() => {
 .no-data-text {
   color: #909399;
   font-size: 13px;
+}
+
+/* 关联已有模块弹窗 */
+.link-module-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  margin-bottom: 8px;
+
+  .link-module-project {
+    color: #909399;
+    font-size: 12px;
+    margin-left: auto;
+  }
 }
 </style>

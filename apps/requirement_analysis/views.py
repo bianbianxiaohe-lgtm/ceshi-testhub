@@ -32,7 +32,8 @@ from asgiref.sync import sync_to_async
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig, TestCaseGenerationTask,
-    GenerationConfig, GeneratedRequirementDoc, AIModelService
+    GenerationConfig, GeneratedRequirementDoc, RequirementAnalysisResult,
+    ClarificationQuestion, AIModelService
 )
 from apps.feature_modules.models import FeatureModule, TestPoint
 from .serializers import (
@@ -42,7 +43,9 @@ from .serializers import (
     TestCaseGenerationRequestSerializer, TestCaseReviewRequestSerializer,
     AIModelConfigSerializer, PromptConfigSerializer, TestCaseGenerationTaskSerializer,
     GenerationConfigSerializer,
-    GeneratedRequirementDocSerializer, GeneratedRequirementDocListSerializer
+    GeneratedRequirementDocSerializer, GeneratedRequirementDocListSerializer,
+    RequirementAnalysisResultSerializer, RequirementAnalysisResultListSerializer,
+    ClarificationQuestionSerializer
 )
 from .services import RequirementAnalysisService, DocumentProcessor
 
@@ -1059,7 +1062,8 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
             reviewer_prompt_path = os.path.join(settings.BASE_DIR, 'tester_pro.md')
             
             defaults = {}
-            
+
+            # 用例编写提示词
             try:
                 with open(writer_prompt_path, 'r', encoding='utf-8') as f:
                     defaults['writer'] = f.read()
@@ -1076,7 +1080,8 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
 5. 关注数据验证和错误处理
 
 请以结构化的格式输出测试用例。"""
-            
+
+            # 用例评审提示词
             try:
                 with open(reviewer_prompt_path, 'r', encoding='utf-8') as f:
                     defaults['reviewer'] = f.read()
@@ -1097,6 +1102,82 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
 2. 具体的改进建议
 3. 补充的测试场景（如有）
 4. 修改后的测试用例（如需要）"""
+
+            # 需求分析提示词
+            analyzer_prompt_path = os.path.join(settings.BASE_DIR, 'tester_analyzer.md')
+            try:
+                with open(analyzer_prompt_path, 'r', encoding='utf-8') as f:
+                    defaults['analyzer'] = f.read()
+            except FileNotFoundError:
+                defaults['analyzer'] = """你是一名资深的需求分析与拆解专家（Test Architect）。
+
+你的唯一任务是：把用户提供的"人话/截图/零散描述"翻译成"机器和人都能看懂的结构化逻辑表"。
+
+## 核心能力
+
+1. **需求理解**：从模糊的自然语言中提取明确的业务规则和功能点
+2. **结构化拆解**：将复杂需求拆解为可验证的功能模块、用户故事、验收标准
+3. **补全隐含信息**：识别用户未明说但必需的前置条件、依赖关系、异常路径
+4. **输出标准化**：输出结构化的分析表，供后续步骤（如AI写用例）直接消费
+
+## 输入可能的形式
+
+- 一段自然语言需求描述
+- 产品原型/设计稿截图及说明
+- 几条零散的用户反馈或会议纪要
+- 已有的半成品文档
+
+## 输出格式要求
+
+请严格按以下 Markdown 表格格式输出：
+
+### 1. 需求概述
+| 字段 | 内容 |
+|------|------|
+| 需求名称 | （概括性名称） |
+| 优先级 | P0/P1/P2/P3 |
+| 涉及模块 | （涉及的系统/模块列表） |
+| 前置依赖 | （前置条件或依赖项） |
+
+### 2. 功能拆解表
+| 编号 | 功能点 | 详细描述 | 验收标准 | 优先级 |
+|------|--------|----------|----------|--------|
+| F-01 | ... | ... | ... | ... |
+
+### 3. 深度业务逻辑拆解与插接矩阵（核心输出）
+> 此表是测试设计的核心输入，每个功能点必须逐行展开。聚焦于：**数据流转、状态转换、边界条件、模块间联动**。
+
+| 模块 | 功能点 | 前置条件 | 触发动作 | 预期结果 | 测试关注点与数据边界(关键) | 插接/关联影响 |
+|------|--------|---------|---------|---------|---------------------------|-------------|
+| [模块名] | [功能名] | [环境/状态] | [操作] | [正常反馈] | 1. 输入值边界：如时长0~24h<br>2. 状态流转：A→B→C<br>3. 精度要求：秒级/毫秒级<br>4. 特殊场景：跨天/闰年 | [此处填写：是否联动其他模块？是否改变历史数据？] |
+
+**填写要求：**
+- 「测试关注点与数据边界」用**编号列表**列出至少3个关键测试维度（输入值边界、状态流转、精度/格式、特殊场景）
+- 「插接/关联影响」用方括号标注该功能对其他模块的副作用或数据一致性影响
+- 每个有业务价值的功能点都应有一行或多行，不要留空占位行
+
+### 4. 用户角色与权限矩阵（如适用）
+| 角色 | 可操作功能 | 数据可见范围 | 特殊约束 |
+|------|-----------|-------------|---------|
+| ... | ... | ... | ... |
+
+### 5. 异常场景清单
+| 编号 | 异常场景 | 触发条件 | 预期处理方式 |
+|------|---------|---------|-------------|
+| E-01 | ... | ... | ... |
+
+### 6. 待确认事项
+| 编号 | 问题 | 建议 | 阻塞风险 |
+|------|------|------|---------|
+| Q-01 | ... | ... | 高/中/低 |
+
+## 工作原则
+
+- 不做假设，不确定的标记为"待确认"
+- 保持颗粒度一致：每个功能点应在一个合理范围内可被独立测试
+- 使用用户能理解的业务语言，而非纯技术术语
+- 如输入含截图描述，将视觉元素映射到对应的功能交互
+- **插接矩阵是重点**：务必把每个功能的"上下游关系""数据边界""联动副作用"写清楚，这是测试用例设计的直接依据"""
             
             return Response({
                 'message': '默认提示词加载成功',
@@ -1255,6 +1336,87 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
         return queryset.order_by('-created_at')
     
     @action(detail=False, methods=['post'])
+    def analyze(self, request):
+        """需求拆解：把需求文本/截图翻译成结构化逻辑表（需求分析与拆解专家角色）
+
+        与 generate 不同，analyze 不创建生成任务、不写用例，仅即时返回
+        由 analyzer 提示词驱动的结构化拆解结果，供人工确认后再决定后续动作。
+        """
+        try:
+            requirement_text = (request.data.get('requirement_text') or '').strip()
+            project_id = request.data.get('project_id')
+            images = request.data.get('images') or []  # base64 data url 列表
+
+            if not requirement_text and not images:
+                return Response(
+                    {'error': '请提供需求文本或截图'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 取需求分析提示词（核心：需求分析与拆解专家角色）
+            analyzer_prompt = PromptConfig.get_active_config('analyzer')
+            if not analyzer_prompt:
+                return Response(
+                    {'error': '未找到可用的需求分析提示词配置，请先在「提示词配置」中创建并启用「需求分析提示词」'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 取模型：有图片优先视觉模型，否则 analyzer 角色，再 fallback writer
+            if images:
+                model_config = AIModelConfig.objects.filter(role='writer_vision', is_active=True).first()
+            else:
+                model_config = AIModelConfig.objects.filter(role='analyzer', is_active=True).first()
+            if not model_config:
+                model_config = AIModelConfig.objects.filter(role='writer', is_active=True).first()
+            if not model_config:
+                return Response(
+                    {'error': '未找到可用的AI模型配置（需求拆解专家/视觉分析专家/用例编写）'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 组装 user message（支持多模态：文本 + 截图）
+            if images:
+                user_content = [{
+                    "type": "text",
+                    "text": requirement_text or "请分析以下截图中的需求，并拆解为结构化逻辑表"
+                }]
+                for img in images:
+                    if isinstance(img, str) and img.startswith('data:'):
+                        url = img
+                    elif isinstance(img, str):
+                        url = f"data:image/png;base64,{img}"
+                    else:
+                        continue
+                    user_content.append({"type": "image_url", "image_url": {"url": url}})
+            else:
+                user_content = requirement_text
+
+            messages = [
+                {"role": "system", "content": analyzer_prompt.content},
+                {"role": "user", "content": user_content},
+            ]
+
+            # 同步执行 AI 调用（复用现有事件循环模式，即时返回结果）
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                api_result = loop.run_until_complete(
+                    AIModelService.call_openai_compatible_api(model_config, messages)
+                )
+            finally:
+                loop.close()
+
+            result_text = api_result['choices'][0]['message']['content']
+            return Response({'result': result_text}, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"需求拆解失败: {e}")
+            return Response(
+                {'error': f'需求拆解失败: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=False, methods=['post'])
     def generate(self, request):
         """创建新的测试用例生成任务"""
         try:
@@ -1333,6 +1495,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             # 处理生成模式
             generation_mode = validated_data.get('generation_mode', 'smart')
             task_data['generation_mode'] = generation_mode
+
+            # 处理需求拆解阶段确认的问答对（用于用例生成上下文注入）
+            confirmed_answers = request.data.get('confirmed_answers', '')
+            if confirmed_answers:
+                task_data['confirmed_answers'] = confirmed_answers
 
             # 处理输出模式：优先使用用户指定的，否则使用生成行为配置的默认值
             output_mode = request.data.get('output_mode')
@@ -2150,7 +2317,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                 )
                     
                     adopted_count = 0
-                    for test_case in test_cases:
+                    batch_time = timezone.now()  # 同一批采纳共享创建时间，保证整块排序
+                    for sort_idx, test_case in enumerate(test_cases, 1):
                         tc = TestCase.objects.create(
                             project=project,
                             author=task.created_by,
@@ -2161,7 +2329,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                             expected_result=test_case.get('expected', ''),
                             priority=self._map_priority(test_case.get('priority', '中')),
                             test_type='functional',
-                            status='draft'
+                            status='draft',
+                            sort_order=sort_idx,
+                            created_at=batch_time,
                         )
                         # 关联版本
                         if task.version_id:
@@ -2296,7 +2466,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                             )
                 
                 adopted_count = 0
-                for test_case in test_cases:
+                batch_time = timezone.now()  # 同一批采纳共享创建时间，保证整块排序
+                for sort_idx, test_case in enumerate(test_cases, 1):
                     tc = TestCase.objects.create(
                         project=project,  # 使用统一的项目选择逻辑
                         author=task.created_by,
@@ -2307,7 +2478,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                         expected_result=test_case.get('expected', ''),
                         priority=self._map_priority(test_case.get('priority', '中')),
                         test_type='functional',
-                        status='draft'
+                        status='draft',
+                        sort_order=sort_idx,
+                        created_at=batch_time,
                     )
                     # 关联版本
                     if task.version_id:
@@ -2398,7 +2571,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                             )
                 
                 adopted_count = 0
-                for case_data in test_cases_data:
+                batch_time = timezone.now()  # 同一批采纳共享创建时间，保证整块排序
+                for sort_idx, case_data in enumerate(test_cases_data, 1):
                     tc = TestCase.objects.create(
                         project=project,  # 使用统一的项目选择逻辑
                         author=task.created_by,
@@ -2409,7 +2583,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                         expected_result=case_data.get('expected_result', ''),
                         priority=case_data.get('priority', 'medium'),
                         test_type=case_data.get('test_type', 'functional'),
-                        status=case_data.get('status', 'draft')
+                        status=case_data.get('status', 'draft'),
+                        sort_order=sort_idx,
+                        created_at=batch_time,
                     )
                     # 关联版本
                     if task.version_id:
@@ -3524,6 +3700,140 @@ class GeneratedRequirementDocViewSet(viewsets.ModelViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+class RequirementAnalysisResultViewSet(viewsets.ModelViewSet):
+    """需求拆解结果历史记录"""
+    queryset = RequirementAnalysisResult.objects.all()
+    http_method_names = ['get', 'post', 'delete']
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return RequirementAnalysisResultListSerializer
+        return RequirementAnalysisResultSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.user.is_authenticated:
+            qs = qs.filter(created_by=self.request.user)
+        return qs.order_by('-created_at')
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=False, methods=['get'], url_path='by-docs')
+    def by_docs(self, request):
+        """
+        批量查询若干需求文档对应的最新拆解结果，用于前端重建 docAnalysisMap（刷新后持久化）。
+        请求：?doc_ids=1,2,3
+        返回：{ "map": { "1": {"id": ..., "title": ...}, ... } }
+        """
+        doc_ids_param = request.query_params.get('doc_ids', '')
+        ids = []
+        for x in doc_ids_param.split(','):
+            x = x.strip()
+            if x.isdigit():
+                ids.append(int(x))
+        if not ids:
+            return Response({'map': {}})
+        qs = self.get_queryset().filter(req_doc_id__in=ids)
+        result_map = {}
+        for r in qs.order_by('req_doc_id', '-created_at'):
+            if r.req_doc_id is not None and r.req_doc_id not in result_map:
+                result_map[str(r.req_doc_id)] = {'id': r.id, 'title': r.title}
+        return Response({'map': result_map})
+
+    @action(detail=False, methods=['post'], url_path='auto-fill-knowledge')
+    def auto_fill_knowledge(self, request):
+        """
+        基于需求拆解精炼阶段确认的问答对，自动将新知识回填到项目知识库。
+        
+        请求体：{
+            "confirmed_answers": [{"question": "...", "answer": "..."}],
+            "project_id": 1  （可选，不传则不创建）
+        }
+        返回：{"created_count": N, "skipped_count": M, "entries": [...]}
+        """
+        import json
+        confirmed_answers = request.data.get('confirmed_answers') or []
+        if isinstance(confirmed_answers, str):
+            try:
+                confirmed_answers = json.loads(confirmed_answers)
+            except json.JSONDecodeError:
+                confirmed_answers = []
+        
+        project_id = request.data.get('project_id')
+        if not project_id:
+            return Response({'created_count': 0, 'skipped_count': 0, 'entries': [], 'message': '缺少 project_id'})
+        
+        # 取 AI 模型配置（用于智能判断是否为新知识）
+        model_config = (
+            AIModelConfig.objects.filter(role='analyzer', is_active=True).first()
+            or AIModelConfig.objects.filter(role='writer', is_active=True).first()
+        )
+        
+        # 透传功能模块/版本标签（可选，用于知识条目标注同名功能，增强语义区分）
+        version_tag = (request.data.get('version') or '').strip()
+        module_tag = (request.data.get('module') or request.data.get('feature_module') or '').strip()
+        result = AIModelService.auto_fill_knowledge_from_confirmations(
+            confirmed_answers=confirmed_answers,
+            project_id=int(project_id),
+            user_id=request.user.id,
+            model_config=model_config,
+            version_tag=version_tag,
+            module_tag=module_tag,
+        )
+        return Response(result)
+
+
+class ClarificationQuestionViewSet(viewsets.ModelViewSet):
+    """需求拆解「深度追问清单」条目 CRUD + 批量保存"""
+    serializer_class = ClarificationQuestionSerializer
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete']
+
+    def get_queryset(self):
+        qs = ClarificationQuestion.objects.all()
+        result_id = self.request.query_params.get('analysis_result')
+        if result_id:
+            qs = qs.filter(analysis_result_id=result_id)
+        if self.request.user.is_authenticated:
+            qs = qs.filter(analysis_result__created_by=self.request.user)
+        return qs.order_by('order', 'id')
+
+    @action(detail=False, methods=['post'], url_path='save-all')
+    def save_all(self, request):
+        """
+        批量保存某拆解结果下的全部追问项：先删除旧条目，再整体重建。
+        请求体：{ analysis_result: int, items: [{question, answer, category, status}] }
+        """
+        analysis_result_id = request.data.get('analysis_result')
+        items = request.data.get('items', [])
+        if not analysis_result_id:
+            return Response({'error': '缺少 analysis_result'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(items, list):
+            return Response({'error': 'items 必须是数组'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = RequirementAnalysisResult.objects.get(id=analysis_result_id)
+        except RequirementAnalysisResult.DoesNotExist:
+            return Response({'error': '拆解结果不存在'}, status=status.HTTP_404_NOT_FOUND)
+        if request.user.is_authenticated and result.created_by_id != request.user.id:
+            return Response({'error': '无权限操作该拆解结果'}, status=status.HTTP_403_FORBIDDEN)
+
+        ClarificationQuestion.objects.filter(analysis_result_id=analysis_result_id).delete()
+        created_ids = []
+        for idx, it in enumerate(items):
+            if not isinstance(it, dict) or not str(it.get('question', '')).strip():
+                continue
+            cq = ClarificationQuestion.objects.create(
+                analysis_result=result,
+                question=str(it.get('question', '')).strip(),
+                answer=str(it.get('answer', '') or ''),
+                category=str(it.get('category', '') or '其他'),
+                status=str(it.get('status', 'pending') or 'pending'),
+                order=idx
+            )
+            created_ids.append(cq.id)
+        return Response({'saved': len(created_ids), 'ids': created_ids})
+
+
 @csrf_exempt
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -3539,6 +3849,7 @@ def generate_requirement_doc(request):
         raw_text = request.data.get('raw_text', '').strip()
         document_ids = request.data.get('document_ids', [])  # 图片型 PDF ID 列表
         text_document_ids = request.data.get('text_document_ids', [])  # 文字型文档 ID 列表
+        project_id = request.data.get('project_id')  # 关联项目 ID（用于读取知识库辅助生成）
 
         # 兼容旧的 document_id 单值
         document_id = request.data.get('document_id', None)
@@ -3565,6 +3876,18 @@ def generate_requirement_doc(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
         logger.info(f'需求文档生成 - 使用模型角色: {used_role}, 模型: {writer_model.model_name}')
+
+        # ── 项目知识库上下文（如指定了项目） ──
+        knowledge_section = ''
+        if project_id:
+            try:
+                from apps.projects.models import Project
+                project_obj = Project.objects.get(id=int(project_id))
+                knowledge_section = AIModelService.build_knowledge_context_from_project(project_obj)
+                if knowledge_section:
+                    logger.info(f'需求文档生成 - 已加载项目{project_id}知识库上下文 ({len(knowledge_section)}字符)')
+            except Exception as e:
+                logger.warning(f'需求文档生成 - 加载项目知识库失败: {e}')
 
         doc_structure_prompt = (
             "文档结构要求（按顺序输出，标题使用中文）：\n"
@@ -3606,7 +3929,14 @@ def generate_requirement_doc(request):
             if not combined_text:
                 return Response({'error': '无有效文字内容，请提供原始需求文本或上传有效的文档'}, status=status.HTTP_400_BAD_REQUEST)
 
-            system_prompt = "你是一位专业的需求分析师。请将用户提供的原始需求文本，整理成一份结构清晰、格式规范的Markdown需求文档。\n\n" + doc_structure_prompt
+            # 构建带知识库上下文的系统提示
+            kb_instruction = f"\n\n{knowledge_section}\n" if knowledge_section else ''
+            system_prompt = (
+                "你是一位专业的需求分析师。请将用户提供的原始需求文本，整理成一份结构清晰、格式规范的Markdown需求文档。\n\n"
+                + doc_structure_prompt
+                + kb_instruction
+                + ("\n（以上【项目业务知识库】为该项目的背景知识，生成文档时请参考其中的术语、约束和业务规则。）" if knowledge_section else '')
+            )
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"请将以下原始需求整理成结构化的Markdown需求文档：\n\n{combined_text}"}
@@ -3655,13 +3985,15 @@ def generate_requirement_doc(request):
             # 3. 构建 vision 指令
             total_pages = len(all_images)
             file_list = '、'.join(pdf_names)
+            kb_context_for_vision = f"\n\n{knowledge_section}\n（以上【项目业务知识库】为该项目的背景知识，生成文档时请参考其中的术语、约束和业务规则。）" if knowledge_section else ''
             vision_instruction = (
                 "你是一位专业的需求分析师。以下是一批需求文档的截图（共 {} 页，来自 {} 个文件：{}），"
                 "请按页码顺序识别所有图片中的文字、表格、示意图内容，结合下方文字信息，"
                 "整理成一份结构化的Markdown需求文档。\n\n"
                 "{}"
+                "{}"
                 "输出要求：仅输出Markdown内容，不加任何前言、解释或代码块包裹。"
-            ).format(total_pages, len(document_ids), file_list, doc_structure_prompt)
+            ).format(total_pages, len(document_ids), file_list, doc_structure_prompt, kb_context_for_vision)
 
             content_blocks = [{"type": "text", "text": vision_instruction}]
 
@@ -3727,11 +4059,21 @@ def generate_requirement_doc(request):
                 source_type = 'text'
                 source_detail = ''
 
+            # 解析项目对象（用于保存到文档记录）
+            _project_obj = None
+            if project_id:
+                try:
+                    from apps.projects.models import Project as _Proj
+                    _project_obj = _Proj.objects.get(id=int(project_id))
+                except Exception:
+                    pass
+
             doc = GeneratedRequirementDoc.objects.create(
                 title=title[:300],
                 markdown_content=markdown_content,
                 source_type=source_type,
                 source_detail=source_detail[:500],
+                project=_project_obj,
                 created_by=request.user if request.user.is_authenticated else None
             )
             doc_id = doc.id
@@ -4219,3 +4561,165 @@ def get_requirement_template(request):
 - **安全：** 需要登录态验证
 """
     return Response({'template': template})
+
+
+# ──────────────────────────────────────────────
+# 深度追问（流式 SSE）
+# ──────────────────────────────────────────────
+@csrf_exempt
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def deep_question(request):
+    """
+    基于需求拆解结果的流式深度追问。
+    接收 question + context（拆解结果） + history（对话历史），
+    返回 text/event-stream 流式响应。
+    """
+    from django.http import StreamingHttpResponse
+
+    question = request.data.get('question', '').strip()
+    context = request.data.get('context', '')
+    history = request.data.get('history', [])
+
+    if not question:
+        return Response({'error': '问题不能为空'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # 获取 writer/analyzer 模型
+    model_config = (
+        AIModelConfig.objects.filter(role='analyzer', is_active=True).first()
+        or AIModelConfig.objects.filter(role='writer', is_active=True).first()
+    )
+    if not model_config:
+        return Response({'error': '未配置可用的AI模型（需配置 analyzer 或 writer 角色）'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # 构造消息
+    system_msg = (
+        "你是一位资深的需求分析与测试专家。用户已经对一段需求进行了拆解分析，"
+        "现在会基于拆解结果向你提出深度追问。你的任务是：\n"
+        "1. 结合「上下文中的拆解结果」回答问题\n"
+        "2. 如果问题涉及边界条件、异常场景、数据依赖等，给出详细分析\n"
+        "3. 回答使用 Markdown 格式，结构清晰\n"
+        "4. 不要重复上下文中已有的内容，聚焦于问题的核心\n"
+        "5. 如果上下文信息不足以回答，明确指出缺失点并给出建议"
+    )
+    messages = [{'role': 'system', 'content': system_msg}]
+
+    # 截断上下文避免超长（保留最近 8000 字）
+    if len(context) > 8000:
+        context = context[:4000] + '\n...（中间省略）...\n' + context[-4000:]
+    messages.append({'role': 'user', 'content': f'【需求拆解结果】\n{context}\n'})
+
+    # 加入历史对话
+    for h in history[-8:]:  # 最近 8 轮
+        role = h.get('role', 'user')
+        content = h.get('content', '')
+        if content:
+            messages.append({'role': role, 'content': content})
+
+    messages.append({'role': 'user', 'content': question})
+
+    def event_stream():
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            gen = loop.run_until_complete(
+                __async_stream(model_config, messages)
+            )
+            for chunk in gen:
+                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        except Exception as e:
+            logger.error(f"[深度追问] 失败: {e}")
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            loop.close()
+
+    response = StreamingHttpResponse(
+        event_stream(),
+        content_type='text/event-stream'
+    )
+    response['Cache-Control'] = 'no-cache'
+    response['X-Accel-Buffering'] = 'no'
+    return response
+
+
+async def __async_stream(config, messages):
+    """异步生成器：调用流式 API 并逐块产出文本"""
+    async for chunk in AIModelService.call_openai_compatible_api_stream(
+        config, messages, max_tokens=4096
+    ):
+        if chunk:
+            yield chunk
+
+
+@csrf_exempt
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def refine_analysis(request):
+    """
+    基于人工确认回复，精炼需求拆解结果（对齐 AI 用例评审的 resolve_replies 闭环）。
+    接收 original_report（原始拆解结果）+ resolve_replies（人工确认回复列表），
+    返回精炼后的 report（已去除待确认标记、融入确认结论）。
+    """
+    original_report = request.data.get('original_report', '')
+    resolve_replies = request.data.get('resolve_replies') or []
+    if not original_report:
+        return Response({'error': '缺少 original_report'}, status=status.HTTP_400_BAD_REQUEST)
+
+    model_config = (
+        AIModelConfig.objects.filter(role='analyzer', is_active=True).first()
+        or AIModelConfig.objects.filter(role='writer', is_active=True).first()
+    )
+    if not model_config:
+        return Response({'error': '未配置可用的AI模型（需配置 analyzer 或 writer 角色）'}, status=status.HTTP_400_BAD_REQUEST)
+
+    replies_text = ''
+    for r in resolve_replies:
+        q = r.get('question', '')
+        a = r.get('answer', '') or r.get('context', '')
+        if q:
+            replies_text += f"- 问题：{q}\n  人工确认/回复：{a}\n"
+
+    system_msg = (
+        "你是一位资深的需求分析与测试专家。用户已经对一段需求做了拆解分析，"
+        "并在结果中标记了一些「待确认」项。现在用户针对这些待确认项给出了人工确认或回复。\n"
+        "你的任务：\n"
+        "1. 将人工确认的结论融入原拆解结果，修正相关内容\n"
+        "2. 去除所有「⚠️ 待确认」「[⚠️ 待确认: ...]」「待确认风险」等不确定标记\n"
+        "3. 保持原有的 Markdown 结构与表格格式（含插接矩阵 7 列表格）不变\n"
+        "4. 若某待确认项用户未给出回复，则基于上下文做出最合理假设并标注为已确认\n"
+        "5. 返回完整精炼后的拆解结果全文\n"
+        "6. 【关键】人工确认意味着这些不确定性已被人类关闭。输出中【严禁】再生成"
+        "「深度追问清单」「待确认事项」「追问」等章节——这些不确定性已由人工确认解决，"
+        "不要再列出任何需要人工确认的问题，直接输出已闭环的终稿。"
+    )
+    user_msg = f"【原始拆解结果】\n{original_report}\n\n"
+    if replies_text:
+        user_msg += f"【人工确认回复】\n{replies_text}\n\n"
+    else:
+        user_msg += "【人工确认回复】\n（用户未提供额外回复，请基于上下文消除所有待确认标记）\n\n"
+    user_msg += "请输出精炼后的完整拆解结果："
+
+    messages = [
+        {'role': 'system', 'content': system_msg},
+        {'role': 'user', 'content': user_msg},
+    ]
+
+    try:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                AIModelService.call_openai_compatible_api(model_config, messages, max_tokens=8192)
+            )
+        finally:
+            loop.close()
+        report = ''
+        try:
+            report = result['choices'][0]['message']['content']
+        except (KeyError, TypeError, IndexError):
+            report = str(result)
+        return Response({'report': report})
+    except Exception as e:
+        logger.error(f"[拆解精炼] 失败: {e}")
+        return Response({'error': f'精炼失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_ERROR)

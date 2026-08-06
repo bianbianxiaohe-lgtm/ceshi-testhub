@@ -4,7 +4,12 @@
       <h1 class="page-title">脚本列表</h1>
       <div class="header-actions">
         <el-select v-model="selectedProject" placeholder="选择项目" style="width: 200px; margin-right: 15px" @change="onProjectChange">
-          <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
+          <el-option-group label="UI自动化项目">
+            <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
+          <el-option-group label="AI用例项目">
+            <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
         </el-select>
         <el-button type="primary" @click="goToScriptEditor">
           <el-icon><Plus /></el-icon>
@@ -144,13 +149,13 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, View, Edit, Delete, EditPen } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 
 import {
-  getUiProjects,
   getTestScripts,
   updateTestScript,
   deleteTestScript
@@ -159,8 +164,9 @@ import {
 const router = useRouter()
 
 // 响应式数据
-const projects = ref([])
-const selectedProject = ref('')
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
+const selectedProject = ref('') // 格式: "ui_1" 或 "proj_2"
+const realProjectId = ref(null)
 const scripts = ref([])
 const currentPage = ref(1)
 const pageSize = ref(20)
@@ -184,18 +190,12 @@ const renameForm = reactive({
 
 // 加载项目列表
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    ElMessage.error('获取项目列表失败')
-    console.error('获取项目列表失败:', error)
-  }
+  await loadAllProjects()
 }
 
 // 加载脚本列表
 const loadScripts = async () => {
-  if (!selectedProject.value) {
+  if (!realProjectId.value) {
     scripts.value = []
     total.value = 0
     return
@@ -203,7 +203,7 @@ const loadScripts = async () => {
 
   try {
     const response = await getTestScripts({
-      project: selectedProject.value,
+      project: realProjectId.value,
       page: currentPage.value,
       page_size: pageSize.value
     })
@@ -225,6 +225,7 @@ const loadScripts = async () => {
 // 项目切换
 const onProjectChange = async () => {
   currentPage.value = 1
+  realProjectId.value = await resolveUiProjectId(selectedProject.value)
   await loadScripts()
 }
 
@@ -372,8 +373,9 @@ const formatTime = (timestamp) => {
 onMounted(async () => {
   await loadProjects()
 
-  if (projects.value.length > 0) {
-    selectedProject.value = projects.value[0].id
+  if (allProjects.value.length > 0) {
+    selectedProject.value = allProjects.value[0].id
+    realProjectId.value = await resolveUiProjectId(selectedProject.value)
     await loadScripts()
   }
 })

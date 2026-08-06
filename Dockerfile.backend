@@ -5,18 +5,35 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 安装系统依赖（MySQL客户端编译必需）
+# 安装系统依赖（MySQL客户端编译必需 + Airtest/OpenCV 运行库）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         default-libmysqlclient-dev \
         build-essential \
         pkg-config \
         gcc \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        wget \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# 安装 adb 客户端（真机被动触摸监听 getevent 需要；缺失时自动退化，不会中断构建）
+RUN (wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O /tmp/pt.zip \
+    && unzip -o /tmp/pt.zip -d /opt \
+    && rm -f /tmp/pt.zip \
+    && ln -sf /opt/platform-tools/adb /usr/local/bin/adb) \
+    || echo "adb install skipped (getevent 实时监听将不可用，录制仍可走镜像点击)"
 
 # 安装Python依赖（使用清华镜像加速）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+# 安装 Playwright Chromium（墨刀读取 / UI自动化 需要浏览器引擎）
+RUN playwright install chromium && playwright install-deps chromium || echo "playwright browser install partial"
 
 # 复制项目代码
 COPY . .

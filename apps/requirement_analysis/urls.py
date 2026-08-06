@@ -12,11 +12,22 @@ from .views import (
     TestCaseGenerationTaskViewSet,
     ConfigStatusViewSet,
     GeneratedRequirementDocViewSet,
+    RequirementAnalysisResultViewSet,
+    ClarificationQuestionViewSet,
     upload_and_analyze,
     analyze_text,
     generate_requirement_doc,
     get_requirement_template,
     generate_knowledge_base,
+    deep_question,
+    refine_analysis,
+)
+from .modao_views import (
+    modao_list, modao_create, modao_extract, modao_reset, modao_terminate, modao_struct, modao_clarify, modao_design,
+    modao_generate_cases, modao_approve_case_generation,
+    modao_confirm, modao_smoke, modao_detail, modao_excel,     modao_edit, modao_ask, modao_adopt,
+    modao_adopt_single,
+    modao_log_viewer, modao_log_raw,
 )
 
 # 创建DRF路由器
@@ -32,6 +43,8 @@ router.register(r'generation-config', GenerationConfigViewSet, basename='generat
 router.register(r'testcase-generation', TestCaseGenerationTaskViewSet, basename='testcasegenerationtask')
 router.register(r'config', ConfigStatusViewSet, basename='configstatus')
 router.register(r'req-docs', GeneratedRequirementDocViewSet, basename='generatedrequirementdoc')
+router.register(r'analysis-results', RequirementAnalysisResultViewSet, basename='requirementanalysisresult')
+router.register(r'clarifications', ClarificationQuestionViewSet, basename='clarificationquestion')
 
 app_name = 'requirement_analysis'
 
@@ -45,4 +58,28 @@ urlpatterns = [
     path('api/generate-req-doc/', generate_requirement_doc, name='generate-req-doc'),
     path('api/req-doc-template/', get_requirement_template, name='req-doc-template'),
     path('api/generate-knowledge-base/', generate_knowledge_base, name='generate-knowledge-base'),
+    path('api/deep-question/', deep_question, name='deep-question'),
+    path('api/refine-analysis/', refine_analysis, name='refine-analysis'),
+
+    # 墨刀技能：需求读取与用例生成（5 阶段引导式工作流）
+    path('api/modao/create/', modao_create, name='modao-create'),
+    path('api/modao/list/', modao_list, name='modao-list'),
+    path('api/modao/<int:pk>/extract/', modao_extract, name='modao-extract'),
+    path('api/modao/<int:pk>/reset/', modao_reset, name='modao-reset'),
+    path('api/modao/<int:pk>/terminate/', modao_terminate, name='modao-terminate'),
+    path('api/modao/<int:pk>/struct/', modao_struct, name='modao-struct'),
+    path('api/modao/<int:pk>/clarify/', modao_clarify, name='modao-clarify'),
+    path('api/modao/<int:pk>/design/', modao_design, name='modao-design'),
+    path('api/modao/<int:pk>/generate-cases/', modao_generate_cases, name='modao-generate-cases'),
+    path('api/modao/<int:pk>/approve-case-generation/', modao_approve_case_generation, name='modao-approve-case-generation'),
+    path('api/modao/<int:pk>/confirm/', modao_confirm, name='modao-confirm'),
+    path('api/modao/<int:pk>/smoke/', modao_smoke, name='modao-smoke'),
+    path('api/modao/<int:pk>/edit/', modao_edit, name='modao-edit'),
+    path('api/modao/<int:pk>/ask/', modao_ask, name='modao-ask'),
+    path('api/modao/<int:pk>/', modao_detail, name='modao-detail'),
+    path('api/modao/<int:pk>/excel/', modao_excel, name='modao-excel'),
+    path('api/modao/<int:pk>/adopt/', modao_adopt, name='modao-adopt'),
+    path('api/modao/<int:pk>/adopt-single/', modao_adopt_single, name='modao-adopt-single'),
+    path('api/modao/log-viewer/', modao_log_viewer, name='modao-log-viewer'),
+    path('api/modao/log-raw/', modao_log_raw, name='modao-log-raw'),
 ]

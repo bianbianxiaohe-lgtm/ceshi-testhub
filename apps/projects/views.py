@@ -220,8 +220,12 @@ def knowledge_fs_tree(request, project_id):
     def scan_dir(dir_path: str, rel_prefix: str = '') -> list:
         """递归扫描目录，返回文件/目录列表"""
         items = []
+        def _natural_key(s):
+            """自然排序：将数字部分转为整数比较，确保 1.9 < 1.10 < 1.11"""
+            return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', s)]
+
         try:
-            entries = sorted(os.scandir(dir_path), key=lambda e: e.name)
+            entries = sorted(os.scandir(dir_path), key=lambda e: _natural_key(e.name))
         except PermissionError:
             return items
 
@@ -261,12 +265,13 @@ def knowledge_fs_tree(request, project_id):
     })
 
 
-@api_view(['GET', 'PUT', 'DELETE'])
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @permission_classes([permissions.IsAuthenticated])
 def knowledge_fs_file(request, project_id, file_path):
     """
     GET    获取单个知识库 Markdown 文件的原始内容。
     PUT    保存（覆盖）单个知识库 Markdown 文件。请求体: { "content": "..." }
+    PATCH  重命名文件。请求体: { "new_name": "新文件名.md" }
     DELETE 删除单个知识库 Markdown 文件。
     """
     try:
@@ -324,6 +329,43 @@ def knowledge_fs_file(request, project_id, file_path):
         except Exception as e:
             logger.error(f'写入知识库文件失败 {full_path}: {e}')
             return Response({'error': f'写入文件失败: {str(e)}'}, status=500)
+
+    elif request.method == 'PATCH':
+        """重命名文件"""
+        if not full_path.endswith('.md'):
+            return Response({'error': '只允许重命名 .md 文件'}, status=403)
+        if not os.path.isfile(full_path):
+            return Response({'error': '文件不存在'}, status=404)
+
+        new_name = request.data.get('new_name', '').strip()
+        if not new_name:
+            return Response({'error': '新文件名不能为空'}, status=400)
+        if not new_name.endswith('.md'):
+            new_name += '.md'
+        # 安全检查：防止路径穿越
+        if '/' in new_name or '\\' in new_name or '..' in new_name:
+            return Response({'error': '文件名不能包含路径字符'}, status=400)
+
+        new_full_path = os.path.join(os.path.dirname(full_path), new_name)
+        if os.path.exists(new_full_path):
+            return Response({'error': f'文件「{new_name}」已存在'}, status=409)
+
+        try:
+            os.rename(full_path, new_full_path)
+            # 返回新的相对路径
+            dir_rel = os.path.dirname(file_path)
+            new_rel_path = f"{dir_rel}/{new_name}" if dir_rel else new_name
+            stat = os.stat(new_full_path)
+            return Response({
+                'path': new_rel_path,
+                'name': new_name,
+                'message': '重命名成功',
+                'size': stat.st_size,
+                'modified': stat.st_mtime,
+            })
+        except Exception as e:
+            logger.error(f'重命名知识库文件失败 {full_path} -> {new_name}: {e}')
+            return Response({'error': f'重命名失败: {str(e)}'}, status=500)
 
     elif request.method == 'DELETE':
         if not os.path.isfile(full_path) or not full_path.endswith('.md'):

@@ -3,7 +3,12 @@
     <div class="page-header" style="display: flex; align-items: center;">
       <h1 class="page-title" style="margin-right: 20px; margin-bottom: 0;">UI元素管理</h1>
       <el-select v-model="projectId" placeholder="选择项目" style="width: 200px; margin-right: 15px" @change="onProjectChange">
-        <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
+        <el-option-group label="UI自动化项目">
+          <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+        </el-option-group>
+        <el-option-group label="AI用例项目">
+          <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+        </el-option-group>
       </el-select>
       <el-button type="primary" @click="handleShowCreateDialog">
         <el-icon><Plus /></el-icon>
@@ -215,11 +220,11 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, onMounted, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search, View, Edit, Delete } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 import {
-  getUiProjects,
   getElements,
   createElement,
   updateElement,
@@ -229,8 +234,9 @@ import {
 } from '@/api/ui_automation'
 
 // 项目和元素数据
-const projects = ref([])
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
 const projectId = ref('')
+const realProjectId = ref(null)
 const elements = ref([])
 
 // 定位策略数据
@@ -311,13 +317,7 @@ const formatDate = (row, column, cellValue) => {
 
 // 加载项目列表
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    ElMessage.error('获取项目列表失败')
-    console.error('获取项目列表失败:', error)
-  }
+  await loadAllProjects()
 }
 
 // 加载定位策略
@@ -338,7 +338,7 @@ const handleShowCreateDialog = () => {
 
 // 加载元素列表
 const loadElements = async () => {
-  if (!projectId.value) {
+  if (!realProjectId.value) {
     elements.value = []
     total.value = 0
     return
@@ -347,7 +347,7 @@ const loadElements = async () => {
   loading.value = true
   try {
     const params = {
-      project: projectId.value,
+      project: realProjectId.value,
       page: pagination.currentPage,
       page_size: pagination.pageSize
     }
@@ -383,15 +383,16 @@ const loadElements = async () => {
 }
 
 // 项目变更处理
-const onProjectChange = () => {
+const onProjectChange = async () => {
   // 清空搜索和筛选条件
   searchText.value = ''
   strategyFilter.value = ''
   pageFilter.value = ''
   pagination.currentPage = 1
-  
+
+  realProjectId.value = await resolveUiProjectId(projectId.value)
   // 设置创建表单的项目
-  createForm.project = projectId.value
+  createForm.project = realProjectId.value
   
   // 重新加载元素
   loadElements()
@@ -500,7 +501,7 @@ const handleCreate = async () => {
       page: createForm.page,
       description: createForm.description,
       locator_value: createForm.locator_value,
-      project_id: projectId.value, // 使用当前选择的项目ID
+      project_id: realProjectId.value, // 使用当前选择的项目ID
       locator_strategy_id: createForm.strategy, // 直接使用整数ID，无需转换
       is_unique: createForm.is_unique, // 添加缺失的字段
       wait_timeout: createForm.wait_timeout // 添加缺失的字段
@@ -547,7 +548,7 @@ const handleEdit = async () => {
   
   try {
     // 确保project_id是有效的整数值
-    const projectIdInt = parseInt(editForm.project) || projectId.value;
+    const projectIdInt = parseInt(editForm.project) || realProjectId.value;
     
     // 构建API请求数据
     const apiFormData = {
@@ -587,9 +588,10 @@ onMounted(async () => {
   ])
 
   // 如果有项目，默认选择第一个
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
-    createForm.project = projectId.value
+  if (allProjects.value.length > 0) {
+    projectId.value = allProjects.value[0].id
+    realProjectId.value = await resolveUiProjectId(projectId.value)
+    createForm.project = realProjectId.value
     await loadElements()
   }
 })

@@ -164,9 +164,244 @@
             <button
               class="generate-manual-btn"
               @click="generateFromManualInput"
-              :disabled="!canGenerateManual || isGenerating">
+              :disabled="!canGenerateManual || isGenerating || (currentResultId && hasUnconfirmedItems)"
+              :title="(currentResultId && hasUnconfirmedItems) ? '请先在拆解结果中逐项确认所有待确认项' : ''">
               <span v-if="isGenerating">🔄 生成中...</span>
               <span v-else>🚀 生成测试用例</span>
+            </button>
+            <div v-if="currentResultId && hasUnconfirmedItems" class="gen-gate-hint">
+              ⚠️ 拆解结果有 {{ uncertainItems.filter(i => !i.confirmed).length }} 条待确认项未确认，请先在上方逐项确认后再生成测试用例
+            </div>
+
+            <button
+              class="analyze-btn"
+              @click="analyzeRequirement"
+              :disabled="analyzeLoading || (!manualInput.description.trim() && analyzeImages.length === 0)">
+              <span v-if="analyzeLoading">🔄 拆解中...</span>
+              <span v-else>🧩 需求拆解</span>
+            </button>
+
+            <!-- 需求截图上传（多模态分析） -->
+            <div class="form-group analyze-image-group" v-if="!analyzeResult">
+              <label>需求截图（可选，支持多模态分析）</label>
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                class="form-input"
+                @change="onAnalyzeImageChange">
+              <div class="analyze-image-list" v-if="analyzeImages.length">
+                <div class="analyze-image-item" v-for="(img, idx) in analyzeImages" :key="idx">
+                  <img :src="img" alt="需求截图" />
+                  <button class="analyze-image-remove" @click="removeAnalyzeImage(idx)" title="移除">×</button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <!-- 拆解结果（独立区域，不受输入区显隐控制） -->
+      <div class="analyze-result-card" v-if="analyzeResult">
+        <div class="analyze-result-header">
+          <h3>🧩 需求拆解结果</h3>
+          <div class="analyze-result-actions">
+            <button :class="['analyze-action-btn', { active: isEditingResult }]" @click="isEditingResult = !isEditingResult" :title="isEditingResult ? '预览模式' : '编辑内容'">
+              {{ isEditingResult ? '👁️ 预览' : '✏️ 编辑' }}
+            </button>
+            <button class="analyze-action-btn" @click="copyAnalyzeResult">📋 复制</button>
+            <button class="analyze-action-btn primary" @click="showMatrixModal = true" title="查看结构化插接矩阵">📊 插接矩阵</button>
+            <button class="analyze-action-btn primary" @click="toggleDeepQuestion">💬 深度追问</button>
+            <button class="analyze-action-btn close" @click="analyzeResult = ''">收起 ✕</button>
+          </div>
+        </div>
+        <div class="analyze-result-body">
+          <!-- 编辑模式：可编辑文本框 -->
+          <textarea v-if="isEditingResult"
+            v-model="analyzeResult"
+            class="result-edit-textarea"
+            spellcheck="false"
+            placeholder="在此编辑拆解结果..."></textarea>
+          <!-- 预览模式：Markdown 渲染 -->
+          <div v-else class="markdown-body" v-html="formatMarkdown(analyzeResult)"></div>
+        </div>
+
+        <!-- ⚠️ 待确认项确认弹窗（对齐 AI 用例评审 uncertain_items 逐项确认） -->
+        <div v-if="uncertainItems.length" class="analyze-uncertain-trigger">
+          <el-alert
+            :title="`⚠️ 拆解结果有 ${uncertainItems.length} 条待确认项，请逐项确认后再生成测试用例（已确认 ${uncertainItems.filter(i => i.confirmed).length}/${uncertainItems.length}）`"
+            type="warning"
+            :closable="false"
+            show-icon
+            @click="showUncertainDialog = true"
+            class="au-trigger-alert"
+            style="cursor:pointer"
+          />
+        </div>
+
+        <el-dialog
+          v-model="showUncertainDialog"
+          title="⚠️ 待确认项 — 逐一确认"
+          width="720px"
+          :close-on-click-modal="false"
+          append-to-body
+          destroy-on-close
+          class="au-dialog">
+          <template #header>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span>⚠️ 待确认项</span>
+              <el-tag type="warning" size="small">{{ uncertainItems.filter(i => !i.confirmed).length }} 条待确认</el-tag>
+              <el-tag type="success" size="small" v-if="uncertainItems.some(i => i.confirmed)">{{ uncertainItems.filter(i => i.confirmed).length }} 条已确认</el-tag>
+            </div>
+          </template>
+          <el-alert title="以下内容 AI 无法 100% 确定，请逐项确认后点击「✅ 全部确认并继续」" type="warning" :closable="false" style="margin-bottom:16px" />
+
+          <div class="au-list">
+            <div v-for="(item, idx) in uncertainItems" :key="item.id" :class="['au-item', { confirmed: item.confirmed }]">
+              <div class="au-header">
+                <el-tag :type="item.confirmed ? 'success' : 'warning'" size="small">待确认 {{ idx + 1 }}</el-tag>
+                <span class="au-question">{{ item.question }}</span>
+                <el-button v-if="!item.confirmed" type="primary" size="small" plain @click="item.confirmed = true">✓ 确认</el-button>
+                <el-tag v-else type="success" size="small">已确认 ✓</el-tag>
+              </div>
+              <div v-if="item.context" class="au-context"><strong>AI 推测：</strong>{{ item.context }}</div>
+              <el-input
+                v-model="item.answer"
+                type="textarea"
+                :rows="2"
+                placeholder="回复此问题（可选，留空则采纳 AI 推测）"
+                style="margin-top:8px"
+              />
+            </div>
+          </div>
+
+          <template #footer>
+            <el-button @click="showUncertainDialog = false">稍后处理</el-button>
+            <el-button
+              type="primary"
+              :loading="refining"
+              :disabled="!uncertainItems.some(i => i.confirmed)"
+              @click="refineAndClose">
+              ✅ {{ refining ? '精炼中...' : `确认并继续（${uncertainItems.filter(i => i.confirmed).length}/${uncertainItems.length}）` }}
+            </el-button>
+          </template>
+        </el-dialog>
+
+        <!-- 深度追问 Q&A 面板 -->
+        <div v-if="showDeepQuestion" class="deep-question-panel">
+          <!-- 模式切换 + 操作栏 -->
+          <div class="qa-toolbar">
+            <div class="qa-mode-tabs">
+              <button :class="['qa-tab', { active: qaMode === 'table' }]" @click="switchQAMode('table')">
+                📋 追问清单
+              </button>
+              <button :class="['qa-tab', { active: qaMode === 'chat' }]" @click="switchQAMode('chat')">
+                💬 对话模式
+              </button>
+            </div>
+            <div class="qa-actions">
+              <button class="qa-action-btn" @click="generateClarificationQuestions" :disabled="qaGenerating || !analyzeResult" title="AI 重新生成追问">
+                {{ qaGenerating ? '生成中...' : '🔄 重新生成' }}
+              </button>
+              <button class="qa-action-btn primary" @click="addManualQuestion" title="手动添加问题">+ 新增提问</button>
+            </div>
+          </div>
+
+          <!-- ===== 表格模式：结构化 Q&A ===== -->
+          <div v-if="qaMode === 'table'" class="qa-table-wrapper">
+            <!-- 加载态 -->
+            <div v-if="qaGenerating && clarificationItems.length === 0" class="qa-loading">
+              <i class="el-icon-loading"></i> AI 正在分析需求，生成深度追问...
+            </div>
+
+            <!-- 空状态 -->
+            <div v-else-if="clarificationItems.length === 0" class="qa-empty">
+              <p>暂无追问项。点击「🔄 重新生成」让 AI 基于拆解结果自动生成追问清单。</p>
+            </div>
+
+            <!-- Q&A 表格 -->
+            <div v-else class="qa-table">
+              <!-- 表头 -->
+              <div class="qa-table-header">
+                <span class="col-q"># 问题</span>
+                <span class="col-cat">分类</span>
+                <span class="col-ans">人工回复 / 确认</span>
+                <span class="col-status">状态</span>
+                <span class="col-action">操作</span>
+              </div>
+              <!-- 行 -->
+              <div v-for="(item, idx) in clarificationItems" :key="item.id"
+                   :class="['qa-row', { confirmed: item.status === 'confirmed' }]">
+                <!-- 问题列 -->
+                <div class="col-q">
+                  <span class="q-index">{{ idx + 1 }}</span>
+                  <span class="q-text">{{ item.question }}</span>
+                </div>
+                <!-- 分类标签 -->
+                <div class="col-cat">
+                  <span :class="['cat-tag', `cat-${item.category}`]">{{ item.category }}</span>
+                </div>
+                <!-- 回复输入 -->
+                <div class="col-ans">
+                  <textarea
+                    v-model="item.answer"
+                    class="qa-answer-input"
+                    placeholder="输入你的回复或确认..."
+                    rows="2"
+                    @input="item.status = item.answer.trim() ? 'answered' : 'pending'"
+                    @blur="saveClarifications()"
+                  ></textarea>
+                </div>
+                <!-- 状态 -->
+                <div class="col-status">
+                  <span :class="['status-dot', item.status]"></span>
+                  <span class="status-label">{{ statusText(item.status) }}</span>
+                </div>
+                <!-- 操作 -->
+                <div class="col-action">
+                  <button
+                    v-if="item.status !== 'confirmed'"
+                    class="qa-confirm-btn"
+                    :disabled="!item.answer.trim()"
+                    @click="confirmAnswer(item.id)"
+                    title="确认此回答"
+                  >✓ 确认</button>
+                  <span v-else class="confirmed-badge">已确认 ✓</span>
+                  <button class="qa-delete-btn" @click="removeQAItem(item.id)" title="删除">✕</button>
+                </div>
+              </div>
+
+              <!-- 统计栏 -->
+              <div class="qa-summary">
+                共 {{ clarificationItems.length }} 条追问 ·
+                已回复 {{ clarificationItems.filter(i => i.status !== 'pending').length }} 条 ·
+                已确认 {{ clarificationItems.filter(i => i.status === 'confirmed').length }} 条
+              </div>
+            </div>
+          </div>
+
+          <!-- ===== 聊天模式（保留原功能）===== -->
+          <div v-else class="deep-question-messages" ref="deepQuestionScroll">
+            <div v-for="(msg, idx) in deepChatMessages" :key="idx"
+              :class="['chat-msg', msg.role]">
+              <div class="chat-msg-avatar">{{ msg.role === 'user' ? '👤' : '🤖' }}</div>
+              <div class="chat-msg-content markdown-body" v-html="msg.role === 'assistant' ? formatMarkdown(msg.content) : escapeHtml(msg.content)"></div>
+            </div>
+            <div v-if="deepChatLoading" class="chat-msg assistant">
+              <div class="chat-msg-avatar">🤖</div>
+              <div class="chat-msg-content streaming">
+                <span class="typing-cursor"></span><span v-html="formatMarkdown(deepStreamingContent)"></span>
+              </div>
+            </div>
+          </div>
+          <div v-if="qaMode === 'chat'" class="deep-question-input-row">
+            <input type="text" v-model="deepQuestionInput" class="deep-q-input"
+              placeholder="输入追问问题..."
+              @keydown.enter.exact="sendDeepQuestion"
+              :disabled="deepChatLoading" />
+            <button class="deep-q-send-btn" @click="sendDeepQuestion" :disabled="deepChatLoading || !deepQuestionInput.trim()">
+              {{ deepChatLoading ? '思考中...' : '发送' }}
             </button>
           </div>
         </div>
@@ -247,10 +482,11 @@
               </div>
             </div>
 
-            <button 
-              class="generate-btn" 
+            <button
+              class="generate-btn"
               @click="generateFromDocument"
-              :disabled="!documentTitle || isGenerating">
+              :disabled="!documentTitle || isGenerating || (currentResultId && hasUnconfirmedItems)"
+              :title="(currentResultId && hasUnconfirmedItems) ? '请先在拆解结果中逐项确认所有待确认项' : ''">
               <span v-if="isGenerating">🔄 生成中...</span>
               <span v-else>🚀 生成测试用例</span>
             </button>
@@ -379,6 +615,21 @@
 
           <!-- 操作按钮（未生成时显示） -->
           <div class="req-doc-actions" v-if="!reqDoc.markdown">
+            <!-- 项目选择（上传文件/粘贴文字阶段就选好项目，用于读取知识库+后续回填） -->
+            <div class="req-doc-project-row">
+              <div class="form-group project-select-inline">
+                <label>关联项目</label>
+                <select v-model="reqDoc.selectedProject" class="form-select">
+                  <option value="">请选择项目（可选）</option>
+                  <option v-for="project in projects" :key="project.id" :value="project.id">
+                    {{ project.name }}
+                  </option>
+                </select>
+              </div>
+              <span class="req-doc-project-hint" v-if="reqDoc.selectedProject">
+                将读取该项目知识库辅助生成，确认后的问答可回填知识库
+              </span>
+            </div>
             <button
               class="req-doc-btn primary"
               @click="generateReqDoc"
@@ -388,6 +639,13 @@
               <span v-else-if="reqDoc.isGenerating">⏳ AI 生成中…</span>
               <span v-else-if="hasImagePdfFiles">👁️ AI 视觉识别并生成文档</span>
               <span v-else>✨ AI 自动生成文档</span>
+            </button>
+            <button
+              class="req-doc-btn analyze-doc-btn"
+              @click="analyzeFromReqDocInput"
+              :disabled="analyzeLoading || (!reqDoc.rawText.trim() && !reqDoc.markdown.trim() && !hasUploadedFiles())">
+              <span v-if="analyzeLoading">🔄 拆解中...</span>
+              <span v-else>🧩 先拆解需求</span>
             </button>
             <button
               class="req-doc-btn secondary"
@@ -449,9 +707,17 @@
                 </div>
               </div>
               <button
+                class="analyze-btn doc-analyze-btn"
+                @click="analyzeFromReqDocMarkdown"
+                :disabled="analyzeLoading || !reqDoc.markdown.trim()">
+                <span v-if="analyzeLoading">🔄 拆解中...</span>
+                <span v-else>🧩 拆解此文档</span>
+              </button>
+              <button
                 class="generate-manual-btn use-req-doc-btn"
                 @click="useReqDocForGeneration"
-                :disabled="!reqDoc.markdown.trim() || isGenerating">
+                :disabled="!reqDoc.markdown.trim() || isGenerating || (currentResultId && hasUnconfirmedItems)"
+                :title="(currentResultId && hasUnconfirmedItems) ? '请先在拆解结果中逐项确认所有待确认项' : ''">
                 🚀 用此文档生成测试用例
               </button>
             </div>
@@ -459,22 +725,28 @@
         </div>
       </div>
 
-      <!-- 历史文档面板 -->
+      <!-- 历史需求文档 面板 -->
       <div class="history-section" v-if="!isGenerating && !showResults">
         <div class="history-card">
           <div class="history-header">
-            <h2>📚 历史需求文档</h2>
-            <div class="history-version-row">
-              <span class="history-count" v-if="reqDocHistoryLoaded" style="margin-right:12px">{{ reqDocHistory.length }} 条记录</span>
-              <label style="font-size:0.8rem;color:#64748b;margin-right:6px;white-space:nowrap">关联版本：</label>
-              <select v-model="selectedVersion" class="form-select version-select" style="width:160px;font-size:0.8rem;padding:4px 8px">
-                <option value="">不关联版本</option>
-                <option v-for="ver in availableVersions" :key="ver.id" :value="ver.id">
-                  {{ ver.name }}{{ ver.is_baseline ? ' (基线)' : '' }}
-                </option>
-              </select>
-              <button class="quick-create-ver-btn" @click="openQuickCreateVersion(null)" title="快速新建版本" style="margin-left:4px">+</button>
+            <div class="history-tabs">
+              <button :class="['history-tab', { active: true }]" style="cursor:default">
+                📚 历史需求文档
+              </button>
             </div>
+          </div>
+
+          <!-- 历史需求文档 -->
+          <div class="history-version-row">
+            <span class="history-count" v-if="reqDocHistoryLoaded" style="margin-right:12px">{{ reqDocHistory.length }} 条记录</span>
+            <label style="font-size:0.8rem;color:#64748b;margin-right:6px;white-space:nowrap">关联版本：</label>
+            <select v-model="selectedVersion" class="form-select version-select" style="width:160px;font-size:0.8rem;padding:4px 8px">
+              <option value="">不关联版本</option>
+              <option v-for="ver in availableVersions" :key="ver.id" :value="ver.id">
+                {{ ver.name }}{{ ver.is_baseline ? ' (基线)' : '' }}
+              </option>
+            </select>
+            <button class="quick-create-ver-btn" @click="openQuickCreateVersion(null)" title="快速新建版本" style="margin-left:4px">+</button>
           </div>
           <!-- 加载中 -->
           <div v-if="!reqDocHistoryLoaded" class="history-loading">
@@ -513,7 +785,25 @@
                 <button class="history-btn edit" @click="editHistoryDoc(doc)" title="编辑文档">
                   ✏️ 编辑
                 </button>
-                <button class="history-btn generate" @click="generateFromHistoryDoc(doc)" title="一键提交生成测试用例">
+                <!-- 有拆解结果 → 查看拆解；无 → 执行拆解 -->
+                <button
+                  v-if="docAnalysisMap[doc.id]"
+                  class="history-btn analyze"
+                  @click="viewDocAnalysis(doc)"
+                  title="查看拆解结果">
+                  📋 查看拆解
+                </button>
+                <button
+                  v-else
+                  class="history-btn analyze"
+                  @click="analyzeFromHistoryDoc(doc)"
+                  :disabled="analyzeLoading"
+                  title="需求拆解">
+                  🧩 拆解
+                </button>
+                <button class="history-btn generate" @click="generateFromHistoryDoc(doc)"
+                  :disabled="docAnalysisMap[doc.id] && hasUnconfirmedItems"
+                  :title="(docAnalysisMap[doc.id] && hasUnconfirmedItems) ? '请先在拆解结果中逐项确认所有待确认项' : '一键提交生成测试用例'">
                   🚀 生成用例
                 </button>
                 <button class="history-btn del" @click="deleteReqDocHistory(doc)" title="删除此文档">
@@ -541,8 +831,22 @@
           </div>
           <div class="preview-actions">
             <template v-if="!isEditingDoc">
+              <button
+                v-if="viewingDoc && docAnalysisMap[viewingDoc.id]"
+                class="history-btn analyze"
+                @click="viewDocAnalysis(viewingDoc)"
+                title="查看拆解结果">
+                📋 查看拆解
+              </button>
+              <button
+                v-else
+                class="history-btn analyze"
+                @click="analyzeFromPreviewDoc"
+                :disabled="analyzeLoading">
+                🧩 需求拆解
+              </button>
               <button class="history-btn edit" @click="enterEditMode">✏️ 编辑修改</button>
-              <button class="generate-manual-btn" @click="generateFromPreviewDoc" style="width:auto;padding:10px 28px;">
+              <button class="generate-manual-btn" @click="generateFromPreviewDoc" :disabled="(currentResultId && hasUnconfirmedItems)" :title="(currentResultId && hasUnconfirmedItems) ? '请先在拆解结果中逐项确认所有待确认项' : ''" style="width:auto;padding:10px 28px;">
                 🚀 用此文档生成测试用例
               </button>
             </template>
@@ -606,9 +910,13 @@
               <label>功能模块</label>
               <select v-model="generateConfirmForm.feature_module_id" class="form-select" @change="onConfirmFeatureModuleChange">
                 <option :value="null">请选择功能模块</option>
-                <option v-for="fm in generateConfirmFeatureModules" :key="fm.id" :value="fm.id">
-                  {{ fm.name }}
-                </option>
+                <optgroup v-if="generateConfirmFeatureModuleGroups.version.length" :label="`已关联 ${generateConfirmVersionName}`">
+                  <option v-for="fm in generateConfirmFeatureModuleGroups.version" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+                </optgroup>
+                <optgroup v-if="generateConfirmFeatureModuleGroups.unassociated.length" label="未关联版本">
+                  <option v-for="fm in generateConfirmFeatureModuleGroups.unassociated" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+                </optgroup>
+                <option v-for="fm in generateConfirmFeatureModuleGroups.all" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
               </select>
               <button class="quick-create-ver-btn" style="margin-left:8px;vertical-align:middle" @click="openQuickCreateFeatureModule(generateConfirmForm.project_id)" title="快速新建功能模块">+</button>
             </div>
@@ -808,13 +1116,18 @@
           </div>
 
           <!-- 任务完成后的操作按钮 -->
-          <div v-if="showResults" class="completion-actions">
+          <div v-if="showResults && generationResult" class="completion-actions">
             <button class="download-btn" @click="downloadTestCases">
               <span>📥 下载测试用例</span>
             </button>
             <button class="save-btn" @click="saveToTestCaseRecords">
               <span>💾 保存到用例库</span>
             </button>
+            <button class="new-generation-btn" @click="resetGeneration">
+              <span>📝 生成新用例</span>
+            </button>
+          </div>
+          <div v-else-if="showResults" class="completion-actions">
             <button class="new-generation-btn" @click="resetGeneration">
               <span>📝 生成新用例</span>
             </button>
@@ -841,6 +1154,34 @@
         </div>
       </div>
     </div>
+
+    <!-- 插接矩阵弹窗 -->
+    <div v-if="showMatrixModal" class="matrix-modal-overlay" @click.self="showMatrixModal = false">
+      <div class="matrix-modal">
+        <div class="matrix-modal-header">
+          <h2>📊 深度业务逻辑拆解与插接矩阵</h2>
+          <button class="matrix-close-btn" @click="showMatrixModal = false">✕</button>
+        </div>
+        <div class="matrix-modal-body">
+          <div v-if="!analyzeResult" class="matrix-empty">
+            暂无拆解结果，请先进行需求拆解
+          </div>
+          <div v-else class="matrix-sections">
+            <!-- 需求概述 -->
+            <template v-for="(sec, idx) in matrixSections" :key="idx">
+              <div class="matrix-section" v-if="sec.html.trim()">
+                <h3 v-if="sec.title" class="matrix-section-title">{{ sec.title }}</h3>
+                <div class="matrix-section-body" v-html="sec.html"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+        <div class="matrix-modal-footer">
+          <button class="matrix-btn copy-btn" @click="copyMatrixToClipboard">📋 复制全部</button>
+          <button class="matrix-btn close-btn" @click="showMatrixModal = false">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -849,6 +1190,17 @@ import api from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as XLSX from 'xlsx'
 import { useUserStore } from '@/stores/user'
+import {
+  getAnalysisResults,
+  getAnalysisResultDetail,
+  createAnalysisResult,
+  deleteAnalysisResult as apiDeleteAnalysisResult,
+  getClarifications,
+  saveAllClarifications,
+  refineAnalysis,
+  getAnalysisResultsByDocs,
+  autoFillKnowledgeFromConfirmations
+} from '@/api/requirement-analysis'
 
 export default {
   name: 'RequirementAnalysisView',
@@ -917,6 +1269,34 @@ export default {
       ],
       pendingGeneratePayload: null,
       isDragOver: false,
+
+      // 需求拆解（需求分析与拆解专家）
+      analyzeLoading: false,
+      analyzeResult: '',
+      analyzeImages: [],
+
+      // 拆解结果编辑/追问
+      isEditingResult: false,
+      showDeepQuestion: false,
+      deepChatMessages: [],        // { role: 'user'|'assistant', content: string }
+      deepChatLoading: false,
+      deepStreamingContent: '',    // 流式输出中的内容
+      deepQuestionInput: '',
+
+      // 结构化追问 Q&A（表格模式）
+      qaMode: 'table',            // 'table' | 'chat'
+      clarificationItems: [],      // { id, question, answer, status: 'pending'|'answered'|'confirmed', category }
+      qaGenerating: false,         // 生成追问中
+      qaSaving: false,             // 保存回答中
+      currentResultId: null,       // 当前追问清单关联的拆解结果历史记录 ID
+      currentRequirementText: '',  // 当前拆解使用的需求文本（用于自动落库）
+      currentProjectId: null,      // 当前拆解关联的项目 ID
+      showMatrixModal: false,       // 插接矩阵弹窗
+      uncertainItems: [],           // 拆解结果中的待确认项（逐项人工确认，对齐 AI 用例评审）
+      refining: false,              // 精炼中
+      showUncertainDialog: false,   // 待确认弹窗
+      docAnalysisMap: {},           // 每条文档的最新拆解结果 { docId: { id, title, ... } }
+      currentAnalyzedDocId: null,   // 当前正在拆解的文档 ID（用于关联）
 
       // 生成状态
       isGenerating: false,
@@ -989,6 +1369,14 @@ export default {
       viewingDoc: null,
       // 编辑模式
       isEditingDoc: false,
+
+      // 历史拆解结果
+      analysisResults: [],
+      analysisResultsLoaded: false,
+      analysisResultsError: false,
+      viewingResult: null,
+      showResultPreview: false,
+      historyTab: 'docs',  // 'docs' | 'results'
       editingMarkdown: '',
       editingTitle: '',
       editingSaving: false,
@@ -1041,6 +1429,34 @@ export default {
     flatFiles() {
       return this.reqDoc.files.filter(f => !f.folder)
     },
+    // 是否还有未确认的待确认项（用于拦截「生成测试用例」下一步）
+    hasUnconfirmedItems() {
+      return this.uncertainItems.some(i => !i.confirmed)
+    },
+    // 解析插接矩阵：将 markdown 文本拆成结构化 section（表格转为 HTML table）
+    matrixSections() {
+      if (!this.analyzeResult) return []
+      const text = this.analyzeResult
+      const sections = []
+      // 按 ### 拆分 section
+      const parts = text.split(/(?=^#{1,3}\s)/m)
+      for (const part of parts) {
+        const trimmed = part.trim()
+        if (!trimmed) continue
+        // 提取标题行
+        const titleMatch = trimmed.match(/^(#{1,3})\s+(.+)/m)
+        const title = titleMatch ? titleMatch[2].trim() : ''
+        let body = titleMatch ? trimmed.substring(titleMatch[0].length).trim() : trimmed
+        // 检查 body 中是否包含 markdown 表格，如果有则转为 HTML table
+        if (/\|.*\|/.test(body) && body.includes('---')) {
+          body = this.convertMarkdownTablesToHtml(body)
+        } else {
+          body = this.formatMarkdown(body)
+        }
+        sections.push({ title, html: body })
+      }
+      return sections
+    },
     availableVersions() {
       return this.allVersions
     },
@@ -1060,6 +1476,31 @@ export default {
       if (!this.allFeatureModules) return []
       return this.allFeatureModules.filter(fm => fm.project?.id === this.generateConfirmForm.project_id)
     },
+    generateConfirmVersionName() {
+      if (!this.generateConfirmForm.version_id) return ''
+      const v = this.generateConfirmVersions.find(v => v.id === Number(this.generateConfirmForm.version_id))
+      return v ? v.name : ''
+    },
+    // 生成确认弹窗功能模块下拉分组：已关联选中版本 + 未关联版本
+    generateConfirmFeatureModuleGroups() {
+      if (!this.generateConfirmForm.project_id) {
+        return { version: [], unassociated: [], all: this.allFeatureModules || [] }
+      }
+      if (!this.allFeatureModules) return { version: [], unassociated: [], all: [] }
+      const base = this.allFeatureModules.filter(fm => fm.project?.id === this.generateConfirmForm.project_id)
+      if (this.generateConfirmForm.version_id) {
+        const vid = Number(this.generateConfirmForm.version_id)
+        const versionMods = []
+        const unassociated = []
+        for (const fm of base) {
+          const versions = fm.versions || []
+          if (versions.some(v => v.id === vid)) versionMods.push(fm)
+          else if (versions.length === 0) unassociated.push(fm)
+        }
+        return { version: versionMods, unassociated, all: [] }
+      }
+      return { version: [], unassociated: [], all: base }
+    },
     generateConfirmTestPoints() {
       if (!this.generateConfirmForm.feature_module_id) return []
       return this.moduleTestPoints || []
@@ -1076,6 +1517,7 @@ export default {
     this.loadFeatureModules()
     this.checkConfigStatus()
     this.loadReqDocHistory()
+    this.loadAnalysisResults()
   },
 
   activated() {
@@ -1102,7 +1544,26 @@ export default {
     const userStore = useUserStore()
     userStore.stopAutoRefresh()
   },
-  
+
+  // 解析 AI 返回的 markdown 拆解结果为结构化表格数据
+  parsedAnalyzeSections() {
+    if (!this.analyzeResult) return []
+    try {
+      const result = this.parseAnalyzeMarkdown(this.analyzeResult)
+      // 确保每个 section 都有 rows/headers 默认数组，避免模板访问 .length 崩溃
+      return (result || []).map(s => ({
+        title: s.title || '',
+        type: s.type || 'text',
+        rows: Array.isArray(s.rows) ? s.rows : [],
+        headers: Array.isArray(s.headers) ? s.headers : [],
+        text: s.text || ''
+      }))
+    } catch (e) {
+      console.error('需求拆解结果解析失败:', e)
+      return []  // 降级为原始 markdown 渲染
+    }
+  },
+
   methods: {
     async loadProjects() {
       try {
@@ -1483,11 +1944,29 @@ export default {
         const response = await api.get('/requirement-analysis/api/req-docs/')
         this.reqDocHistory = response.data.results || response.data || []
         this.reqDocHistoryLoaded = true
+        // 重建 docAnalysisMap（从后端持久化的 req_doc 关联恢复，刷新后不丢失）
+        await this.rebuildDocAnalysisMap()
       } catch (error) {
         console.error('加载历史文档失败:', error)
         this.reqDocHistoryError = true
         this.reqDocHistoryLoaded = true
         this.reqDocHistory = []
+      }
+    },
+
+    /** 根据历史需求文档列表，从后端批量查询每条文档的最新拆解结果，重建 docAnalysisMap */
+    async rebuildDocAnalysisMap() {
+      const ids = (this.reqDocHistory || []).map(d => d.id).filter(Boolean)
+      if (!ids.length) {
+        this.docAnalysisMap = {}
+        return
+      }
+      try {
+        const res = await getAnalysisResultsByDocs(ids)
+        this.docAnalysisMap = (res.data && res.data.map) || {}
+      } catch (e) {
+        console.error('重建拆解关联失败:', e)
+        this.docAnalysisMap = {}
       }
     },
 
@@ -1652,7 +2131,14 @@ export default {
     // 确认后开始生成
     async confirmStartGeneration() {
       if (!this.canConfirmGenerate) return
-      
+
+      // 拦截：仅当有拆解结果且存在未确认待确认项时才拦截
+      // 没做拆解的用户可以直接走后续用例评审流程
+      if (this.currentResultId && this.hasUnconfirmedItems) {
+        ElMessage.warning(`请先在拆解结果中逐项确认所有待确认项（还剩 ${this.uncertainItems.filter(i => !i.confirmed).length} 条未确认）`)
+        return
+      }
+
       const payload = this.pendingGeneratePayload
       if (!payload) return
       
@@ -1687,6 +2173,110 @@ export default {
       }
     },
     // ────── END 历史文档面板 ──────
+
+    // ────── 历史拆解结果面板 ──────
+    async loadAnalysisResults() {
+      this.analysisResultsError = false
+      try {
+        const response = await getAnalysisResults()
+        this.analysisResults = response.data.results || response.data || []
+        this.analysisResultsLoaded = true
+      } catch (error) {
+        console.error('加载拆解结果历史失败:', error)
+        this.analysisResultsError = true
+        this.analysisResultsLoaded = true
+        this.analysisResults = []
+      }
+    },
+
+    async saveAnalysisResult(resultContent, requirementText, projectId) {
+      try {
+        // 用需求文本首行作为标题
+        const firstLine = (requirementText || '').split('\n')[0].trim()
+        const title = firstLine ? firstLine.slice(0, 100) : '需求拆解结果'
+        const preview = resultContent.slice(0, 200)
+        // 解析关联的需求文档 ID：优先取当前正在拆解的文档；
+        // 精炼场景下 currentAnalyzedDocId 已被清空，则从 docAnalysisMap 反查当前结果对应的文档
+        let reqDocId = this.currentAnalyzedDocId || null
+        if (!reqDocId && this.currentResultId) {
+          const found = Object.entries(this.docAnalysisMap).find(
+            ([, v]) => v && v.id === this.currentResultId
+          )
+          if (found) reqDocId = Number(found[0])
+        }
+        const response = await createAnalysisResult({
+          title,
+          requirement_text: requirementText || '',
+          result_content: resultContent,
+          content_preview: preview,
+          project: projectId || null,
+          req_doc: reqDocId
+        })
+        // 记录当前拆解结果 ID，供追问清单持久化关联
+        if (response.data && response.data.id) {
+          this.currentResultId = response.data.id
+          // 关联到当前文档（每条文档只保留最新拆解）
+          if (reqDocId) {
+            this.docAnalysisMap[reqDocId] = {
+              id: response.data.id,
+              title: response.data.title || title
+            }
+          }
+        }
+        this.currentAnalyzedDocId = null
+        // 静默刷新历史列表（不阻塞用户）
+        this.loadAnalysisResults()
+      } catch (error) {
+        console.error('保存拆解结果历史失败:', error)
+        this.currentAnalyzedDocId = null
+      }
+    },
+
+    async viewAnalysisResult(result) {
+      try {
+        const response = await getAnalysisResultDetail(result.id)
+        this.analyzeResult = response.data.result_content || ''
+        this.extractAllUncertainItems()
+        if (this.uncertainItems.length > 0) {
+          this.$nextTick(() => { this.showUncertainDialog = true })
+        }
+        this.currentResultId = result.id
+        this.currentRequirementText = response.data.requirement_text || ''
+        this.currentProjectId = response.data.project || null
+        this.clarificationItems = []
+        this.showResultPreview = false
+        ElMessage.success('已加载历史拆解结果')
+        // 滚动到结果区域
+        this.$nextTick(() => {
+          const el = this.$el.querySelector('.analyze-result-card')
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        })
+        // 加载该拆解结果下已保存的追问清单
+        await this.loadClarifications()
+      } catch (error) {
+        ElMessage.error('加载拆解结果详情失败')
+      }
+    },
+
+    async deleteAnalysisResult(result) {
+      try {
+        await ElMessageBox.confirm('确定删除这条拆解结果记录吗？', '删除确认', {
+          confirmButtonText: '删除',
+          cancelButtonText: '取消',
+          type: 'warning'
+        })
+      } catch (e) {
+        return  // 用户取消
+      }
+      try {
+        await apiDeleteAnalysisResult(result.id)
+        this.analysisResults = this.analysisResults.filter(r => r.id !== result.id)
+        ElMessage.success('已删除')
+      } catch (error) {
+        ElMessage.error('删除失败: ' + (error.response?.data?.error || error.message))
+      }
+    },
+    // ────── END 历史拆解结果面板 ──────
 
     // ────── 需求文档生成（后门流程）──────
     async generateReqDoc() {
@@ -1725,8 +2315,14 @@ export default {
             payload = { raw_text: this.reqDoc.rawText }
           }
         }
+        // 附加项目 ID（用于后端读取该项目知识库辅助生成）
+        if (this.reqDoc.selectedProject) {
+          payload.project_id = Number(this.reqDoc.selectedProject)
+        }
         const response = await api.post('/requirement-analysis/api/generate-req-doc/', payload, { timeout: 300000 })
         this.reqDoc.markdown = response.data.markdown
+        // 记录刚生成的需求文档 ID，供后续「拆解此文档」时关联到该文档（否则历史列表按钮不会变「查看拆解」）
+        this.currentAnalyzedDocId = response.data.doc_id || null
         ElMessage.success('需求文档生成成功，请检查并编辑后使用')
         // 刷新历史文档列表
         this.loadReqDocHistory()
@@ -1758,6 +2354,7 @@ export default {
       this.reqDoc.rawText = ''
       this.reqDoc.files = []
       this.reqDoc.isExtracting = false
+      this.currentAnalyzedDocId = null  // 重置关联文档
       if (this.$refs.reqDocFileInput) this.$refs.reqDocFileInput.value = ''
       if (this.$refs.reqDocFolderInput) this.$refs.reqDocFolderInput.value = ''
     },
@@ -1943,6 +2540,779 @@ export default {
       this.showGenerateConfirm = true
     },
 
+    // 通用拆解核心：接受任意文本+图片，结果写入 this.analyzeResult
+    async callAnalyzeAPI(requirement_text, project_id = null, images = []) {
+      if (!requirement_text.trim() && images.length === 0) {
+        ElMessage.error('请提供需求内容（文本或截图）')
+        return false
+      }
+      this.analyzeLoading = true
+      this.analyzeResult = ''
+      this.clarificationItems = []
+      this.currentResultId = null
+      this.showDeepQuestion = false
+      this.currentRequirementText = requirement_text || ''
+      this.currentProjectId = project_id || null
+      try {
+        const response = await api.post('/requirement-analysis/api/testcase-generation/analyze/', {
+          requirement_text,
+          project_id,
+          images
+        })
+        // 兼容多种返回结构：{result: '...'} / 直接字符串 / 其他
+        let result = response.data && response.data.result
+        if (result === undefined || result === null) {
+          result = (typeof response.data === 'string') ? response.data : JSON.stringify(response.data)
+        }
+        if (!result || !String(result).trim()) {
+          ElMessage.error('需求拆解返回为空，请检查提示词配置或重试')
+          return false
+        }
+        this.analyzeResult = String(result)
+        ElMessage.success('需求拆解完成')
+        // 拆解成功后自动保存到历史记录
+        this.saveAnalysisResult(String(result), requirement_text, project_id)
+        // 提取待确认项，供人工逐项确认（对齐 AI 用例评审闭环）
+        this.extractAllUncertainItems()
+        // 自动弹出确认对话框
+        if (this.uncertainItems.length > 0) {
+          this.$nextTick(() => { this.showUncertainDialog = true })
+        }
+        return true
+      } catch (error) {
+        console.error('需求拆解失败:', error)
+        ElMessage.error('需求拆解失败: ' + (error.response?.data?.error || error.message))
+        return false
+      } finally {
+        this.analyzeLoading = false
+      }
+    },
+
+    async analyzeRequirement() {
+      const requirement_text = `需求标题: ${this.manualInput.title}\n\n需求描述:\n${this.manualInput.description}`
+      await this.callAnalyzeAPI(
+        requirement_text,
+        this.manualInput.selectedProject ? Number(this.manualInput.selectedProject) : null,
+        this.analyzeImages
+      )
+    },
+
+    hasUploadedFiles() {
+      return this.reqDoc.files && this.reqDoc.files.length > 0
+    },
+
+    async analyzeFromReqDocInput() {
+      // 优先取手动输入文本，其次取 AI 已生成的 markdown（上传文件→生成文档后 rawText 会被清空）
+      const text = (this.reqDoc.rawText || this.reqDoc.markdown || '').trim()
+      let images = []
+      if (!text && !this.hasUploadedFiles()) {
+        ElMessage.error('请先粘贴文字、上传文件或生成需求文档')
+        return
+      }
+      await this.callAnalyzeAPI(
+        text,
+        this.reqDoc.selectedProject ? Number(this.reqDoc.selectedProject) : null,
+        images
+      )
+    },
+
+    async analyzeFromReqDocMarkdown() {
+      const text = (this.reqDoc.markdown || '').trim()
+      if (!text) { ElMessage.error('文档内容为空'); return }
+      await this.callAnalyzeAPI(
+        text,
+        this.reqDoc.selectedProject ? Number(this.reqDoc.selectedProject) : null
+      )
+    },
+
+    async analyzeFromHistoryDoc(doc) {
+      // 列表接口只返回 content_preview（前200字），不含完整 markdown_content，
+      // 若列表项无完整内容，先拉详情接口获取完整文档
+      let text = (doc.markdown_content || doc.content || '').trim()
+      if (!text) {
+        try {
+          const res = await api.get(`/requirement-analysis/api/req-docs/${doc.id}/`)
+          text = (res.data.markdown_content || res.data.content || '').trim()
+        } catch (e) {
+          // 拉取失败则用 preview 兜底
+          text = (doc.content_preview || '').trim()
+        }
+      }
+      if (!text) { ElMessage.error('文档内容为空，请先查看并保存该文档'); return }
+      this.currentAnalyzedDocId = doc.id
+      await this.callAnalyzeAPI(text, doc.project_id ? Number(doc.project_id) : null)
+    },
+
+    async analyzeFromPreviewDoc() {
+      if (!this.viewingDoc) return
+      const text = (this.viewingDoc.markdown_content || this.editingMarkdown || '').trim()
+      if (!text) { ElMessage.error('文档内容为空'); return }
+      this.currentAnalyzedDocId = this.viewingDoc.id
+      await this.callAnalyzeAPI(text)
+    },
+
+    /** 查看某文档的拆解结果（回填到主结果区） */
+    async viewDocAnalysis(doc) {
+      const cached = this.docAnalysisMap[doc.id]
+      if (!cached || !cached.id) return
+      try {
+        const response = await getAnalysisResultDetail(cached.id)
+        this.analyzeResult = response.data.result_content || ''
+        this.currentResultId = cached.id
+        this.currentRequirementText = response.data.requirement_text || ''
+        this.extractAllUncertainItems()
+        // 滚动到结果区并显示
+        this.showResults = true
+        this.isGenerating = false
+        if (this.uncertainItems.length > 0) {
+          this.$nextTick(() => { this.showUncertainDialog = true })
+        }
+      } catch (e) {
+        ElMessage.error('加载拆解结果失败')
+      }
+    },
+
+    onAnalyzeImageChange(e) {
+      const files = e.target.files
+      if (!files || !files.length) return
+      Array.from(files).forEach(file => {
+        const reader = new FileReader()
+        reader.onload = () => {
+          this.analyzeImages.push(reader.result)
+        }
+        reader.readAsDataURL(file)
+      })
+      e.target.value = ''
+    },
+
+    removeAnalyzeImage(idx) {
+      this.analyzeImages.splice(idx, 1)
+    },
+
+    copyAnalyzeResult() {
+      const text = this.analyzeResult
+      if (navigator.clipboard && text) {
+        navigator.clipboard.writeText(text).then(
+          () => ElMessage.success('已复制到剪贴板'),
+          () => ElMessage.error('复制失败')
+        )
+      }
+    },
+
+    copyMatrixToClipboard() {
+      if (navigator.clipboard && this.analyzeResult) {
+        navigator.clipboard.writeText(this.analyzeResult).then(
+          () => ElMessage.success('插接矩阵已复制到剪贴板'),
+          () => ElMessage.error('复制失败')
+        )
+      }
+    },
+
+    // ── 深度追问（流式 SSE） ──
+    async sendDeepQuestion() {
+      const question = this.deepQuestionInput.trim()
+      if (!question) return
+      // 注意：先不立即清空输入框，等发送成功后再清空；失败则保留内容以便重试
+      // 加入用户消息（用于上下文历史）
+      this.deepChatMessages.push({ role: 'user', content: question })
+      this.deepChatLoading = true
+      this.deepStreamingContent = ''
+      this.$nextTick(() => this.scrollToDeepBottom())
+
+      try {
+        const token = localStorage.getItem('access_token') || ''
+        const baseUrl = (api.defaults.baseURL || '/api').replace(/\/$/, '')
+        const resp = await fetch(`${baseUrl}/requirement-analysis/api/deep-question/`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({
+            question,
+            context: this.analyzeResult,
+            history: this.deepChatMessages.slice(0, -1).map(m => ({ role: m.role, content: m.content }))
+          })
+        })
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          // 处理 SSE 行
+          const lines = buf.split('\n')
+          buf = lines.pop() || ''
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim()
+              if (data === '[DONE]') continue
+              try {
+                const j = JSON.parse(data)
+                if (j.content !== undefined) {
+                  this.deepStreamingContent += j.content
+                  this.$nextTick(() => this.scrollToDeepBottom())
+                }
+                if (j.error) throw new Error(j.error)
+              } catch (e) {
+                if (e.message !== 'Unexpected end of JSON input') console.warn('SSE parse:', e)
+              }
+            }
+          }
+        }
+        // 完成
+        this.deepChatMessages.push({ role: 'assistant', content: this.deepStreamingContent })
+        this.deepStreamingContent = ''
+        this.deepQuestionInput = ''  // 仅发送成功后才清空输入框
+      } catch (err) {
+        console.error('深度追问失败:', err)
+        const errMsg = err.message || '追问失败，请重试'
+        this.deepChatMessages.push({ role: 'assistant', content: `⚠️ ${errMsg}` })
+        // 回滚：移除本次失败临时加入的用户消息，并保留输入框内容以便重试
+        if (this.deepChatMessages[this.deepChatMessages.length - 2]?.role === 'user') {
+          this.deepChatMessages.splice(this.deepChatMessages.length - 2, 1)
+        }
+        this.deepQuestionInput = question
+      } finally {
+        this.deepChatLoading = false
+        this.$nextTick(() => this.scrollToDeepBottom())
+      }
+    },
+
+    scrollToDeepBottom() {
+      const el = this.$refs.deepQuestionScroll
+      if (el) el.scrollTop = el.scrollHeight
+    },
+
+    // ── 结构化追问 Q&A（表格模式） ──
+
+    /** 从服务端加载当前拆解结果关联的追问清单，成功返回 true */
+    async loadClarifications() {
+      if (!this.currentResultId) return false
+      try {
+        const response = await getClarifications({ analysis_result: this.currentResultId })
+        const items = response.data.results || response.data || []
+        if (Array.isArray(items) && items.length > 0) {
+          this.clarificationItems = items.map((it, i) => ({
+            id: Date.now() + i,
+            question: it.question,
+            answer: it.answer || '',
+            status: it.status || 'pending',
+            category: it.category || '其他'
+          }))
+          this.qaMode = 'table'
+          return true
+        }
+      } catch (e) {
+        console.error('加载追问清单失败:', e)
+      }
+      return false
+    },
+
+    /** 将当前追问清单整体持久化到服务端（关联 currentResultId） */
+    async saveClarifications() {
+      // 若尚未有关联的拆解结果历史，先自动落库
+      if (!this.currentResultId && this.analyzeResult) {
+        await this.saveAnalysisResult(
+          this.analyzeResult,
+          this.currentRequirementText || '',
+          this.currentProjectId || null
+        )
+      }
+      if (!this.currentResultId) return
+      try {
+        const items = this.clarificationItems.map(it => ({
+          question: it.question,
+          answer: it.answer || '',
+          category: it.category || '其他',
+          status: it.status || 'pending'
+        }))
+        await saveAllClarifications({ analysis_result: this.currentResultId, items })
+      } catch (e) {
+        console.error('保存追问清单失败:', e)
+      }
+    },
+
+    /** 切换追问面板时，优先加载已保存的追问，否则自动生成 */
+    async toggleDeepQuestion() {
+      this.showDeepQuestion = !this.showDeepQuestion
+      if (this.showDeepQuestion) {
+        const loaded = await this.loadClarifications()
+        if (!loaded && this.clarificationItems.length === 0) {
+          await this.generateClarificationQuestions()
+        }
+      }
+    },
+
+    /** AI 生成结构化追问清单 */
+    async generateClarificationQuestions() {
+      if (!this.analyzeResult || this.qaGenerating) return
+      this.qaGenerating = true
+      try {
+        const token = localStorage.getItem('access_token') || ''
+        const baseUrl = (api.defaults.baseURL || '/api').replace(/\/$/, '')
+        const resp = await fetch(`${baseUrl}/requirement-analysis/api/deep-question/`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({
+            question: '请基于上述需求拆解结果，重点提取其中的「待确认事项」表格（Q-01、Q-02…每一行）以及所有「⚠️ 待确认」「待确认风险」标记的内容，把它们【逐条】作为需要人工确认的追问项，原样保留问题描述。然后再补充其他边界条件、异常场景、数据依赖或业务规则的不明确点。\n\n以 JSON 数组格式返回，每项包含：\n- question（问题文本，若是待确认事项请保留原描述，如「Q-01: xxx」）\n- category（分类：待确认项/边界条件/异常场景/数据依赖/业务规则/其他）\n返回 5-10 个高质量追问，待确认事项必须排在前面。',
+            context: this.analyzeResult,
+            history: []
+          })
+        })
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        // 读完整响应
+        const reader = resp.body.getReader()
+        const decoder = new TextDecoder()
+        let fullText = ''
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          fullText += decoder.decode(value, { stream: true })
+        }
+        this.parseClarificationQuestions(fullText)
+      } catch (err) {
+        console.error('生成追问失败:', err)
+        // fallback: 从拆解结果中用正则提取编号问题
+        this.extractQuestionsFromResult()
+      } finally {
+        this.qaGenerating = false
+      }
+      // 生成后持久化
+      if (this.clarificationItems.length > 0) {
+        this.qaMode = 'table'
+        this.saveClarifications()
+      }
+    },
+
+    /** 解析 AI 返回的追问为结构化数组 */
+    parseClarificationQuestions(text) {
+      // 尝试提取 JSON 数组
+      const jsonMatch = text.match(/\[[\s\S]*?\]/)
+      if (jsonMatch) {
+        try {
+          const items = JSON.parse(jsonMatch[0])
+          if (Array.isArray(items) && items.length > 0) {
+            this.clarificationItems = items.map((item, i) => ({
+              id: Date.now() + i,
+              question: item.question || String(item),
+              answer: '',
+              status: 'pending',
+              category: item.category || '其他'
+            }))
+            return
+          }
+        } catch (e) { /* 不是有效 JSON，走 fallback */ }
+      }
+      // fallback: 按编号列表解析
+      this.extractQuestionsFromText(text)
+    },
+
+    /** 从文本中提取编号问题（fallback） */
+    extractQuestionsFromText(text) {
+      const lines = text.split('\n')
+      const questions = []
+      const re = /^\s*(\d+)[\.、．]\s*(.+)/
+      for (const line of lines) {
+        const m = line.match(re)
+        if (m) {
+          questions.push({
+            id: Date.now() + questions.length,
+            question: m[2].trim(),
+            answer: '',
+            status: 'pending',
+            category: '待分类'
+          })
+        }
+      }
+      if (questions.length > 0) {
+        this.clarificationItems = questions
+        this.qaMode = 'table'  // 提取成功后切到表格模式
+      } else {
+        // 最后的 fallback: 从拆解结果中提取
+        this.extractQuestionsFromResult()
+      }
+    },
+
+    /** 从拆解结果 markdown 中提取可能的追问点 */
+    extractQuestionsFromResult() {
+      const text = this.analyzeResult || ''
+      const questions = []
+
+      // ① 优先提取「待确认事项」表格（Q-01 / Q-02 ... 行）
+      const secMatch = text.split(/(?=^#{1,6}\s*.*待确认)/m)
+      for (const sec of secMatch) {
+        if (!/待确认/.test(sec)) continue
+        const rows = sec.split('\n')
+        for (const line of rows) {
+          const cells = line.split('|').map(c => c.trim()).filter(c => c !== '')
+          // 形如 Q-01 | 问题 | 建议 | 阻塞风险
+          if (cells.length >= 2 && /^Q-?\d+/i.test(cells[0])) {
+            questions.push({
+              id: Date.now() + questions.length,
+              question: `${cells[0]}: ${cells[1]}`,
+              answer: '',
+              status: 'pending',
+              category: '待确认项'
+            })
+          }
+        }
+      }
+
+      // ② 没提取到则退化为全文疑问特征扫描
+      if (questions.length === 0) {
+        const qRe = /(?:是否|如何|什么|哪个|多少|能否|会不会|\?|？|边界|限制|条件|规则|异常).{5,100}/
+        for (const line of text.split('\n')) {
+          const trimmed = line.replace(/^#{1,6}\s*/, '').trim()
+          if (trimmed.length > 15 && trimmed.length < 200 && qRe.test(trimmed)) {
+            questions.push({
+              id: Date.now() + questions.length,
+              question: trimmed,
+              answer: '',
+              status: 'pending',
+              category: '自动提取'
+            })
+          }
+        }
+      }
+
+      // 去重并限制数量
+      const seen = new Set()
+      this.clarificationItems = questions.filter(q => {
+        if (seen.has(q.question)) return false
+        seen.add(q.question)
+        return true
+      }).slice(0, 10)
+      // 提取到追问后自动切换到表格模式
+      if (this.clarificationItems.length > 0) {
+        this.qaMode = 'table'
+      }
+    },
+
+    /** 从拆解结果中【全面】提取所有待确认项（对齐 AI 用例评审 uncertain_items） */
+    extractAllUncertainItems(excludeList) {
+      const text = this.analyzeResult || ''
+      const items = []
+      const seen = new Set()
+      const exclude = new Set((excludeList || []).map(s => String(s).trim()).filter(Boolean))
+      const push = (question, context) => {
+        const key = String(question).trim()
+        if (!key || seen.has(key) || exclude.has(key)) return
+        seen.add(key)
+        items.push({
+          id: Date.now() + items.length,
+          question: question.trim(),
+          context: context || '',
+          answer: '',
+          confirmed: false
+        })
+      }
+
+      // ① 待确认事项表格（Q-01 / Q-02 ... 每一行）
+      const secParts = text.split(/(?=^#{1,6}\s*.*待确认)/m)
+      for (const sec of secParts) {
+        if (!/待确认/.test(sec)) continue
+        for (const line of sec.split('\n')) {
+          const cells = line.split('|').map(c => c.trim()).filter(c => c !== '')
+          if (cells.length >= 2 && /^Q-?\d+/i.test(cells[0])) {
+            push(`${cells[0]}: ${cells[1]}`, cells.slice(2).join(' | '))
+          }
+        }
+      }
+
+      // ② 行内 ⚠️ 待确认 标记（⚠️ 待确认：xxx），排除方括号形式避免重复
+      const warnRe = /(?<!\[)⚠️\s*待确认[：:]\s*(.+?)(?=\n|$)/g
+      let m
+      while ((m = warnRe.exec(text)) !== null) {
+        push(`⚠️ 待确认：${m[1].trim()}`, '')
+      }
+      // ③ 方括号形式 [⚠️ 待确认: xxx]
+      const bracketRe = /\[\s*⚠️\s*待确认[：:]\s*(.+?)\s*\]/g
+      while ((m = bracketRe.exec(text)) !== null) {
+        push(`⚠️ 待确认：${m[1].trim()}`, '')
+      }
+
+      // ④ ★ 深度追问清单 / 追问清单（编号列表：1. **关于xxx**：问题描述...）
+      const dqSections = text.split(/(?=^#{1,6}\s*.*(?:深度)?追问)/m)
+      for (const sec of dqSections) {
+        if (!/(深度)?追问/.test(sec)) continue
+        // 匹配编号行：1. **关于"xxx"**：描述内容   或   1. **主题**：描述
+        const numRe = /^\s*(\d+)[\.、．)\]]\s*\*\*(.+?)\*\*[：:：]\s*(.+)/
+        for (const line of sec.split('\n')) {
+          const nm = line.match(numRe)
+          if (nm) {
+            push(`${nm[1]}. ${nm[2].trim()}`, nm[3].trim())
+          }
+        }
+      }
+
+      this.uncertainItems = items
+    },
+
+    /** 基于已确认项精炼拆解结果（对齐 AI 用例评审 resolve_replies 闭环） */
+    async refineAndContinue() {
+      const confirmedItems = this.uncertainItems.filter(i => i.confirmed)
+      if (confirmedItems.length === 0) {
+        ElMessage.warning('请先逐项确认（可留空表示采纳 AI 推测）')
+        return
+      }
+      const replies = confirmedItems.map(i => ({
+        question: i.question,
+        answer: i.answer || i.context || '',
+        context: i.context || ''
+      }))
+      // 已确认的问题文本，精炼后重新提取时跳过，避免重复弹出造成死循环
+      const confirmedTexts = confirmedItems.map(i => i.question.trim())
+      this.refining = true
+      try {
+        const res = await refineAnalysis({
+          original_report: this.analyzeResult,
+          resolve_replies: replies
+        })
+        if (res.data && res.data.report) {
+          this.analyzeResult = res.data.report
+          this.saveAnalysisResult(this.analyzeResult, this.currentRequirementText, this.currentProjectId)
+          // 精炼成功后，自动将确认的问答回填到项目知识库（非阻塞，避免影响用户体验）
+          if (this.selectedProject && confirmedItems.length > 0) {
+            autoFillKnowledgeFromConfirmations(
+              Number(this.selectedProject),
+              confirmedItems.map(i => ({ question: i.question, answer: i.answer || i.context || '' }))
+            ).then(res => {
+              if (res.data && res.data.created_count > 0) {
+                ElMessage.success(`已自动补充 ${res.data.created_count} 条知识到项目知识库`)
+              }
+            }).catch(() => {})  // 静默失败，不影响主流程
+          }
+          this.extractAllUncertainItems(confirmedTexts)
+          if (this.uncertainItems.length === 0) {
+            ElMessage.success('所有待确认项已消除，可继续生成测试用例')
+          } else {
+            ElMessage.success('已根据确认精炼拆解结果，仍有待确认项请继续确认')
+          }
+        } else if (res.data && res.data.error) {
+          ElMessage.error(res.data.error)
+        }
+      } catch (e) {
+        ElMessage.error(e.response?.data?.error || '精炼失败')
+      } finally {
+        this.refining = false
+      }
+    },
+
+    /** 确认并精炼后关闭弹窗 */
+    async refineAndClose() {
+      await this.refineAndContinue()
+      if (this.uncertainItems.length === 0) {
+        this.showUncertainDialog = false
+      }
+    },
+
+    /** 回答某条追问 */
+    answerQuestion(id, answer) {
+      const item = this.clarificationItems.find(i => i.id === id)
+      if (item) {
+        item.answer = answer
+        item.status = 'answered'
+      }
+    },
+
+    /** 确认某条回答（标记已确认） */
+    confirmAnswer(id) {
+      const item = this.clarificationItems.find(i => i.id === id)
+      if (item) {
+        item.status = 'confirmed'
+        this.saveClarifications()
+      }
+    },
+
+    /** 追加手动提问 */
+    addManualQuestion() {
+      const q = prompt('输入新的追问问题:')
+      if (q && q.trim()) {
+        this.clarificationItems.push({
+          id: Date.now(),
+          question: q.trim(),
+          answer: '',
+          status: 'pending',
+          category: '手动'
+        })
+        this.saveClarifications()
+      }
+    },
+
+    /** 切换表格/聊天模式 */
+    switchQAMode(mode) {
+      this.qaMode = mode
+    },
+
+    statusText(status) {
+      return { pending: '待回复', answered: '已回复', confirmed: '已确认' }[status] || status
+    },
+
+    removeQAItem(id) {
+      this.clarificationItems = this.clarificationItems.filter(i => i.id !== id)
+      this.saveClarifications()
+    },
+
+    escapeHtml(text) {
+      if (!text) return ''
+      return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    },
+
+    // ── Markdown 表格解析器：将 AI 返回的 markdown 拆解为结构化 section 数组 ──
+    parseAnalyzeMarkdown(md) {
+      const sections = []
+      const lines = md.split('\n')
+      let i = 0
+
+      while (i < lines.length) {
+        const line = lines[i].trim()
+
+        // 跳过空行
+        if (!line) { i++; continue }
+
+        // 匹配标题 ### 1. xxx 或 ## xxx
+        const headingMatch = line.match(/^(#{1,4})\s+(.+)/)
+        if (headingMatch) {
+          const title = headingMatch[2].replace(/^\d+\.\s*/, '').trim()
+          i++
+
+          // 收集后续非空行直到下一个同级或更高级标题
+          const contentLines = []
+          while (i < lines.length) {
+            const cl = lines[i].trim()
+            // 遇到同级别或更高级标题就停止
+            if (cl.match(/^#{1,4}\s+/)) break
+            contentLines.push(lines[i])
+            i++
+          }
+
+          // 解析内容区域中的表格和文本
+          const parsed = this.parseContentBlock(contentLines)
+          sections.push({ title, ...parsed })
+          continue
+        }
+
+        // 无标题的普通段落
+        const paraLines = []
+        while (i < lines.length && lines[i].trim() && !lines[i].trim().match(/^#{1,4}\s+/)) {
+          paraLines.push(lines[i])
+          i++
+        }
+        if (paraLines.length) {
+          sections.push({ type: 'text', text: paraLines.join('\n').trim() })
+        }
+      }
+
+      return sections
+    },
+
+    parseContentBlock(lines) {
+      // 找出所有表格行（以 | 开头和结尾的行）
+      const tableRanges = []
+      let tableStart = -1
+
+      for (let j = 0; j < lines.length; j++) {
+        const l = lines[j].trim()
+        if (l.startsWith('|') && l.endsWith('|')) {
+          if (tableStart === -1) tableStart = j
+        } else if (l.match(/^\|[-:|]+\|$/)) {
+          // 分隔行，跳过，继续收集
+        } else {
+          if (tableStart !== -1) {
+            tableRanges.push({ start: tableStart, end: j })
+            tableStart = -1
+          }
+        }
+      }
+      if (tableStart !== -1) tableRanges.push({ start: tableStart, end: lines.length })
+
+      // 如果有表格且表格占内容主体 → 当作表格解析；否则当作 KV 对
+      let totalTableRows = 0
+      for (const range of tableRanges) {
+        for (let k = range.start; k < range.end; k++) {
+          if (!lines[k].trim().match(/^\|[-:|]+\|$/)) totalTableRows++
+        }
+      }
+
+      // 判断是 KV 表（2列）还是多列表格
+      if (totalTableRows >= 2) {
+        // 尝试解析为多列表格
+        const allRows = []
+        for (const range of tableRanges) {
+          for (let k = range.start; k < range.end; k++) {
+            const l = lines[k].trim()
+            if (!l || l.match(/^\|[-:|]+\|$/)) continue
+            allRows.push(this.splitTableRow(l))
+          }
+        }
+        if (allRows.length >= 2) {
+          const headers = allRows[0]
+          const dataRows = allRows.slice(1)
+          // 如果只有2列且第一列都是短标签名 → 也当 KV 处理
+          if (headers.length === 2 && dataRows.every(r => r[0] && r[0].length <= 15)) {
+            return { type: 'kv', rows: dataRows }
+          }
+          return { type: 'table', headers, rows: dataRows }
+        }
+      }
+
+      // KV 解析：找 |字段|内容| 格式的行
+      const kvRows = []
+      for (const range of tableRanges) {
+        for (let k = range.start; k < range.end; k++) {
+          const l = lines[k].trim()
+          if (!l || l.match(/^\|[-:|]+\|$/)) continue
+          const cells = this.splitTableRow(l)
+          if (cells.length === 2) kvRows.push(cells)
+        }
+      }
+      if (kvRows.length > 0) return { type: 'kv', rows: kvRows }
+
+      // 纯文本兜底
+      const text = lines.map(l => l.trim()).filter(Boolean).join('\n')
+      return { type: 'text', text }
+    },
+
+    splitTableRow(line) {
+      // 去掉首尾 | 再按 | 分割
+      return line.replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+    },
+
+    onCellEdit(sectionIdx, rowIdx, colIdx, event) {
+      const newVal = event.target.textContent.trim()
+      const section = this.parsedAnalyzeSections[sectionIdx]
+      if (!section || !section.rows) return
+      // 直接修改 rows 引用（Vue 响应式会追踪）
+      if (section.rows[rowIdx]) {
+        section.rows[rowIdx][colIdx] = newVal
+      }
+    },
+
+    exportAnalyzeToMarkdown() {
+      const sections = this.parsedAnalyzeSections
+      if (!sections.length) return this.analyzeResult
+
+      let md = ''
+      for (const s of sections) {
+        md += `\n### ${s.title}\n\n`
+        if (s.type === 'kv' && s.rows && s.rows.length) {
+          md += '| 字段 | 内容 |\n|------|------|\n'
+          for (const r of s.rows) {
+            md += `| ${r[0] || ''} | ${r[1] || ''} |\n`
+          }
+        } else if (s.type === 'table' && s.headers && s.headers.length) {
+          md += '| ' + s.headers.join(' | ') + ' |\n'
+          md += '|' + s.headers.map(() => '------').join('|') + '|\n'
+          for (const r of s.rows) {
+            md += '| ' + r.map(c => c || '').join(' | ') + ' |\n'
+          }
+        } else if (s.type === 'text') {
+          md += s.text + '\n'
+        }
+      }
+      return md.trim()
+    },
+
     async generateFromDocument() {
       if (!this.selectedFile || !this.documentTitle) {
         ElMessage.error('请选择文件并输入文档标题')
@@ -2028,6 +3398,17 @@ export default {
           use_reviewer_model: this.showReviewStep,
           output_mode: outputMode,  // 添加输出模式参数
           generation_mode: generationMode  // 生成模式
+        }
+
+        // 将需求拆解阶段确认的问答对传入，供用例生成时作为上下文注入（让AI基于确认结论精准出例）
+        const confirmedItems = (this.uncertainItems || []).filter(i => i.confirmed)
+        if (confirmedItems.length > 0) {
+          requestData.confirmed_answers = JSON.stringify(
+            confirmedItems.map(i => ({
+              question: i.question || '',
+              answer: i.answer || i.context || ''
+            }))
+          )
         }
 
         // 如果选择了项目，添加到请求中
@@ -2327,6 +3708,10 @@ export default {
     // 下载测试用例为xlsx文件
     async downloadTestCases() {
       try {
+        if (!this.generationResult || !this.generationResult.task_id) {
+          ElMessage.warning('没有可下载的生成结果，请先完成用例生成')
+          return
+        }
         // 解析最终测试用例内容
         const finalTestCases = this.generationResult.final_test_cases;
         const taskId = this.generationResult.task_id;
@@ -2425,6 +3810,10 @@ export default {
     // 保存到用例记录
     async saveToTestCaseRecords() {
       try {
+        if (!this.generationResult || !this.generationResult.task_id) {
+          ElMessage.warning('没有可保存的生成结果，请先完成用例生成')
+          return
+        }
         // 调用后端API保存到记录
         const response = await api.post(`/requirement-analysis/api/testcase-generation/${this.generationResult.task_id}/save_to_records/`)
 
@@ -2521,6 +3910,72 @@ export default {
       html = html.replace(/\n/g, '<br>');
 
       return html;
+    },
+
+    // 将 markdown 中的表格转为 HTML <table>（用于插接矩阵弹窗）
+    convertMarkdownTablesToHtml(text) {
+      if (!text) return ''
+      let html = text
+      // 匹配连续的表格行（|...| 开头的行）
+      const tableRegex = /^((?:\|.+\|\n?)+)/gm
+      html = html.replace(tableRegex, (tableBlock) => {
+        const lines = tableBlock.trim().split('\n').filter(l => l.trim())
+        if (lines.length < 2) return tableBlock // 至少需要表头+分隔行
+        // 解析表头（第一行）
+        const headers = this.parseTableRow(lines[0])
+        // 跳过分隔行（第二行，---|---）
+        const dataLines = lines.slice(2)
+        if (dataLines.length === 0 && lines.length === 2) return '' // 只有表头无数据则跳过
+        // 构建 HTML table
+        let tableHtml = '<div class="matrix-table-wrapper"><table class="matrix-table"><thead><tr>'
+        for (const h of headers) {
+          tableHtml += `<th>${this.escapeCell(h)}</th>`
+        }
+        tableHtml += '</tr></thead><tbody>'
+        for (let i = 0; i < dataLines.length; i++) {
+          const cells = this.parseTableRow(dataLines[i])
+          // 如果单元格数少于表头数，补空
+          while (cells.length < headers.length) cells.push('')
+          tableHtml += '<tr'
+          if (i % 2 === 1) tableHtml += ' class="alt-row"'
+          tableHtml += '>'
+          for (const c of cells) {
+            tableHtml += `<td>${this.formatCellContent(c)}</td>`
+          }
+          tableHtml += '</tr>'
+        }
+        tableHtml += '</tbody></table></div>'
+        return tableHtml
+      })
+      // 处理剩余非表格文本：标题 + 粗体 + 换行
+      html = html.replace(/^#{1,3}\s+(.+)$/gm, '<h4>$1</h4>')
+      html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      html = html.replace(/\n{2,}/g, '</p><p>')
+      html = html.replace(/\n/g, '<br>')
+      if (html && !html.startsWith('<')) html = '<p>' + html + '</p>'
+      return html
+    },
+    parseTableRow(line) {
+      return line.split('|').map(c => c.trim()).filter((c, i, arr) => {
+        // 过滤首尾空元素，但保留中间空单元格
+        if (i === 0 || i === arr.length - 1) return c !== ''
+        return true
+      })
+    },
+    escapeCell(text) {
+      if (!text) return ''
+      return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    },
+    formatCellContent(text) {
+      if (!text) return ''
+      let cell = this.escapeCell(text)
+      // 处理编号列表: **1. xxx** → 编号加粗
+      cell = cell.replace(/\*\*(\d+[.、．]\s*.+?)\*\*/g, '<span class="matrix-item-num">$1</span>')
+      // 处理剩余粗体
+      cell = cell.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      // 处理 <br> 标签（AI 输出中可能含有的）
+      cell = cell.replace(/<br\s*\/?>/gi, '<br>')
+      return cell
     },
 
     // 将HTML的<br>标签转换为换行符（用于Excel导出）
@@ -3179,6 +4634,525 @@ export default {
 .generate-manual-btn:disabled, .generate-btn:disabled {
   background: #bdc3c7;
   cursor: not-allowed;
+}
+
+/* 需求拆解按钮 */
+.analyze-btn {
+  background: #6366f1;
+  color: white;
+  border: none;
+  padding: 15px 30px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 1.1rem;
+  transition: background 0.3s ease;
+  width: 100%;
+  margin-top: 10px;
+}
+
+.analyze-btn:hover:not(:disabled) {
+  background: #4f46e5;
+}
+
+.analyze-btn:disabled {
+  background: #c7c9f0;
+  cursor: not-allowed;
+}
+
+/* 需求截图上传 */
+.analyze-image-group {
+  margin-top: 14px;
+}
+
+.analyze-image-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.analyze-image-item {
+  position: relative;
+  width: 90px;
+  height: 90px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.analyze-image-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.analyze-image-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  cursor: pointer;
+  line-height: 18px;
+  font-size: 14px;
+}
+
+/* 拆解结果卡片 */
+.analyze-result-card {
+  margin-top: 18px;
+  border: 1px solid #e0e0ff;
+  border-radius: 10px;
+  background: #fafaff;
+  overflow: hidden;
+}
+
+.analyze-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #eef0ff;
+  border-bottom: 1px solid #e0e0ff;
+}
+
+.analyze-result-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  color: #4f46e5;
+}
+
+.analyze-result-actions button {
+  border: 1px solid #c7c9f0;
+  background: #fff;
+  color: #4f46e5;
+  border-radius: 6px;
+  padding: 4px 12px;
+  margin-left: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.analyze-result-actions button:hover {
+  background: #4f46e5;
+  color: #fff;
+}
+
+.analyze-result-body {
+  padding: 16px;
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+/* 拆解结果操作按钮（新版） */
+.analyze-action-btn {
+  border: 1px solid #c7c9f0;
+  background: #fff;
+  color: #4f46e5;
+  border-radius: 6px;
+  padding: 4px 12px;
+  margin-left: 6px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: all .2s;
+}
+.analyze-action-btn:hover { background: #eef0ff; }
+.analyze-action-btn.active { background: #4f46e5; color: #fff; }
+.analyze-action-btn.primary { background: #4f46e5; color: #fff; }
+.analyze-action-btn.primary:hover { background: #4338ca; }
+.analyze-action-btn.close { color: #94a3b8; border-color: #e2e8f0; }
+.analyze-action-btn.close:hover { background: #fee2e2; color: #dc2626; border-color: #fecaca; }
+
+/* 编辑模式文本框 */
+.result-edit-textarea {
+  width: 100%;
+  min-height: 400px;
+  max-height: 520px;
+  padding: 14px 16px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 0.88rem;
+  line-height: 1.7;
+  color: #334155;
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+  background: #fefefe;
+}
+.result-edit-textarea:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,.12); }
+
+/* ── Markdown 渲染样式（美化版） ── */
+.markdown-body {
+  font-size: 0.9rem;
+  line-height: 1.85;
+  color: #334155;
+  word-wrap: break-word;
+}
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  margin: 16px 0 8px;
+  font-weight: 600;
+  color: #1e293b;
+  line-height: 1.35;
+}
+.markdown-body h1 { font-size: 1.45rem; border-bottom: 2px solid #e2e8f0; padding-bottom: 6px; }
+.markdown-body h2 { font-size: 1.22rem; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; }
+.markdown-body h3 { font-size: 1.08rem; color: #4f46e5; }
+.markdown-body strong { color: #111827; font-weight: 600; }
+.markdown-body em { color: #6b7280; }
+.markdown-body code {
+  background: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.84rem;
+  color: #e11d48;
+  font-family: Consolas, Monaco, monospace;
+}
+.markdown-body pre {
+  background: #1e293b;
+  color: #e2e8f0;
+  padding: 14px 18px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 10px 0;
+  font-size: 0.84rem;
+  line-height: 1.6;
+}
+.markdown-body pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+.markdown-body p { margin: 6px 0; }
+.markdown-body br + br { display: block; content: ''; margin-top: 8px; }
+
+/* ── 深度追问 Q&A 面板 ── */
+.deep-question-panel {
+  border-top: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+/* 工具栏 */
+.qa-toolbar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid #e2e8f0; background: #fff;
+}
+.qa-mode-tabs { display: flex; gap: 4px; }
+.qa-tab {
+  padding: 5px 14px; border: 1px solid #e2e8f0; border-radius: 6px;
+  background: #fff; font-size: 12.5px; color: #64748b; cursor: pointer;
+  transition: all .15s;
+  &:hover { border-color: #94a3b8; color: #334155; }
+  &.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+}
+.qa-actions { display: flex; gap: 6px; }
+.qa-action-btn {
+  padding: 4px 12px; border: 1px solid #e2e8f0; border-radius: 6px;
+  background: #fff; font-size: 12px; cursor: pointer; transition: all .15s;
+  &:hover:not(:disabled) { border-color: #4f46e5; color: #4f46e5; }
+  &:disabled { opacity: .5; cursor: not-allowed; }
+  &.primary { background: #4f46e5; color: #fff; border-color: #4f46e5; &:hover:not(:disabled) { background: #4338ca; } }
+}
+
+/* Q&A 表格 */
+.qa-table-wrapper { padding: 12px 16px; }
+.qa-loading, .qa-empty {
+  padding: 30px; text-align: center; color: #94a3b8; font-size: 13px;
+}
+.qa-table { display: flex; flex-direction: column; gap: 0; }
+
+/* 表头 */
+.qa-table-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; background: #f1f5f9; border-radius: 6px 6px 0 0;
+  font-size: 11.5px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .3px;
+}
+
+/* 行 */
+.qa-row {
+  display: flex; align-items: stretch; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid #f1f5f9;
+  background: #fff; transition: background .15s;
+  &:nth-child(even) { background: #fafbfc; }
+  &:hover { background: #f8fafc; }
+  &.confirmed { background: #f0fdf4; border-left: 3px solid #22c55e; }
+}
+
+/* 列宽 */
+.col-q      { flex: 2.5; min-width: 200px; display: flex; gap: 8px; align-items: flex-start; }
+.col-cat    { width: 80px; flex-shrink: 0; display: flex; align-items: flex-start; padding-top: 2px; }
+.col-ans    { flex: 2; min-width: 180px; }
+.col-status { width: 72px; flex-shrink: 0; display: flex; align-items: center; gap: 4px; }
+.col-action { width: 90px; flex-shrink: 0; display: flex; align-items: center; gap: 4px; }
+
+/* 问题列 */
+.q-index {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: #e0e7ff; color: #4f46e5; font-size: 11px; font-weight: 700;
+  flex-shrink: 0; margin-top: 2px;
+}
+.q-text {
+  font-size: 13px; color: #334155; line-height: 1.55; word-break: break-word;
+}
+
+/* 分类标签 */
+.cat-tag {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; white-space: nowrap;
+  &.cat-边界条件 { background: #fef3c7; color: #92400e; }
+  &.cat-异常场景 { background: #fee2e2; color: #991b1b; }
+  &.cat-数据依赖 { background: #dbeafe; color: #1e40af; }
+  &.cat-业务规则 { background: #dcfce7; color: #166534; }
+  &.cat-其他, &.cat-待分类, &.cat-自动提取, &.cat-手动 { background: #f1f5f9; color: #475569; }
+}
+
+/* 回复输入框 */
+.qa-answer-input {
+  width: 100%; min-height: 44px; max-height: 90px;
+  padding: 7px 10px; border: 1px solid #e2e8f0; border-radius: 6px;
+  font-size: 12.5px; line-height: 1.5; resize: vertical;
+  outline: none; transition: border-color .15s;
+  background: #fafbfc;
+  &:focus { border-color: #4f46e5; box-shadow: 0 0 0 2px rgba(79,70,229,.08); background: #fff; }
+  &::placeholder { color: #cbd5e1; }
+}
+
+/* 状态 */
+.status-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  &.pending   { background: #d1d5db; }
+  &.answered  { background: #f59e0b; }
+  &.confirmed { background: #22c55e; }
+}
+.status-label { font-size: 11px; color: #94a3b8; }
+
+/* 操作按钮 */
+.qa-confirm-btn {
+  padding: 3px 10px; border: 1px solid #22c55e; border-radius: 5px;
+  background: transparent; color: #22c55e; font-size: 11.5px; cursor: pointer;
+  transition: all .15s; white-space: nowrap;
+  &:hover:not(:disabled) { background: #22c55e; color: #fff; }
+  &:disabled { opacity: .35; cursor: not-allowed; border-color: #d1d5db; color: #9ca3af; }
+}
+.confirmed-badge { font-size: 11px; color: #22c55e; font-weight: 600; }
+.qa-delete-btn {
+  padding: 2px 6px; border: none; background: none; color: #9ca3af;
+  font-size: 13px; cursor: pointer; border-radius: 4px; transition: all .15s;
+  &:hover { background: #fef2f2; color: #ef4444; }
+}
+
+/* 统计栏 */
+.qa-summary {
+  padding: 8px 12px; margin-top: 4px;
+  font-size: 11.5px; color: #94a3b8; text-align: right;
+  border-top: 1px dashed #e2e8f0;
+}
+
+/* ===== 聊天模式样式（保留）===== */
+.deep-question-messages {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.chat-msg {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  animation: fadeInUp .25s ease-out;
+}
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.chat-msg-avatar {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: #e2e8f0;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.chat-msg.user .chat-msg-avatar { background: #dbeafe; }
+.chat-msg.assistant .chat-msg-avatar { background: #ede9fe; }
+.chat-msg-content {
+  max-width: 82%;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 0.87rem;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.chat-msg.user .chat-msg-content {
+  background: #4f46e5;
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+.chat-msg.assistant .chat-msg-content {
+  background: #fff;
+  color: #334155;
+  border: 1px solid #e2e8f0;
+  border-bottom-left-radius: 4px;
+}
+.chat-msg-content.streaming {
+  min-height: 24px;
+}
+.typing-cursor {
+  display: inline-block;
+  width: 7px; height: 15px;
+  background: #4f46e5;
+  animation: blink .7s step-end infinite;
+  vertical-align: text-bottom;
+  margin-right: 2px;
+  border-radius: 1px;
+}
+@keyframes blink { 50% { opacity: 0; } }
+.deep-question-input-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px 14px;
+  border-top: 1px solid #e2e8f0;
+  background: #fff;
+}
+.deep-q-input {
+  flex: 1;
+  border: 1px solid #cbd5e1;
+  border-radius: 20px;
+  padding: 8px 16px;
+  font-size: 0.87rem;
+  outline: none;
+  transition: border-color .2s;
+}
+.deep-q-input:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,.1); }
+.deep-q-send-btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 20px;
+  background: #4f46e5;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  transition: background .2s;
+}
+.deep-q-send-btn:hover:not(:disabled) { background: #4338ca; }
+.deep-q-send-btn:disabled { background: #a5b4fc; cursor: not-allowed; }
+
+/* ── 结构化拆解表格样式 ── */
+.analyze-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.analyze-section {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.analyze-section-title {
+  margin: 0;
+  padding: 10px 16px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #4f46e5;
+  background: linear-gradient(135deg, #f8f7ff 0%, #eef0ff 100%);
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.analyze-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+/* KV 键值对表（2列） */
+.kv-table td {
+  padding: 10px 14px;
+  border-bottom: 1px solid #f1f1f9;
+  vertical-align: top;
+}
+
+.kv-table tr:last-child td {
+  border-bottom: none;
+}
+
+.kv-key {
+  width: 140px;
+  font-weight: 600;
+  color: #6366f1;
+  background: #fafaff;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.kv-val {
+  color: #334155;
+  line-height: 1.6;
+  min-height: 24px;
+  outline: none;
+  transition: background 0.15s;
+}
+
+.kv-val:focus {
+  background: #fefefe;
+  box-shadow: inset 0 0 0 2px #c7d2fe;
+  border-radius: 3px;
+}
+
+/* 多列数据表 */
+.table-wrapper {
+  overflow-x: auto;
+}
+
+.data-table th {
+  padding: 10px 12px;
+  text-align: left;
+  font-weight: 600;
+  color: #4f46e5;
+  background: #f5f3ff;
+  border-bottom: 2px solid #ddd6fe;
+  white-space: nowrap;
+  font-size: 0.85rem;
+  user-select: none;
+}
+
+.data-table td {
+  padding: 9px 12px;
+  border-bottom: 1px solid #f1f1f9;
+  color: #334155;
+  line-height: 1.55;
+  vertical-align: top;
+  min-height: 28px;
+  outline: none;
+  transition: background 0.15s;
+}
+
+.data-table td:focus {
+  background: #fefefe;
+  box-shadow: inset 0 0 0 2px #c7d2fe;
+}
+
+.data-table tr:hover td {
+  background: #fafbff;
+}
+
+.data-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* 纯文本块 */
+.analyze-text-block {
+  margin: 0;
+  padding: 12px 16px;
+  color: #475569;
+  line-height: 1.7;
+  font-size: 0.88rem;
 }
 
 .divider {
@@ -3849,6 +5823,25 @@ export default {
   flex-wrap: wrap;
 }
 
+/* 上传/粘贴阶段的项目选择行 */
+.req-doc-project-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px dashed #cbd5e1;
+}
+.req-doc-project-row .form-group {
+  margin-bottom: 0;
+}
+.req-doc-project-hint {
+  font-size: 0.82rem;
+  color: #64748b;
+}
+
 .req-doc-btn {
   padding: 10px 22px;
   border-radius: 10px;
@@ -3878,6 +5871,17 @@ export default {
 
 .req-doc-btn.secondary:hover:not(:disabled) {
   background: #e2e8f0;
+}
+
+.req-doc-btn.analyze-doc-btn {
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  color: white;
+  box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+}
+
+.req-doc-btn.analyze-doc-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45);
 }
 
 .req-doc-btn:disabled {
@@ -3996,6 +6000,13 @@ export default {
   flex-shrink: 0;
   padding: 10px 28px;
   font-size: 1rem;
+}
+
+.doc-analyze-btn {
+  flex-shrink: 0;
+  padding: 10px 22px;
+  margin-right: 10px;
+  font-size: 0.95rem;
 }
 
 /* 输入方式 Tab */
@@ -4265,6 +6276,37 @@ export default {
   flex-shrink: 0;
 }
 
+.history-tabs {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.history-tab {
+  flex: 1;
+  padding: 10px 16px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #64748b;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.history-tab:hover {
+  background: #eef2ff;
+  color: #4f46e5;
+}
+
+.history-tab.active {
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+}
+
 .history-version-row {
   display: flex;
   align-items: center;
@@ -4419,6 +6461,18 @@ export default {
   background: #ffedd5;
   border-color: #fdba74;
   color: #9a3412;
+}
+
+.history-btn.analyze {
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  border-color: transparent;
+  color: white;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+}
+
+.history-btn.analyze:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
 }
 
 /* ── 历史文档预览弹窗 ── */
@@ -4743,5 +6797,170 @@ export default {
   display: flex;
   gap: 6px;
   align-items: center;
+}
+
+/* ========== 插接矩阵弹窗 ========== */
+.matrix-modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.55);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.matrix-modal {
+  background: #fff;
+  border-radius: 14px;
+  width: 95%;
+  max-width: 1400px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+}
+.matrix-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 28px;
+  border-bottom: 2px solid #e8ecf1;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 14px 14px 0 0;
+}
+.matrix-modal-header h2 {
+  margin: 0;
+  color: #fff;
+  font-size: 1.3rem;
+  letter-spacing: 0.5px;
+}
+.matrix-close-btn {
+  background: rgba(255,255,255,0.2);
+  color: #fff;
+  border: none;
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 16px;
+  transition: background 0.2s;
+}
+.matrix-close-btn:hover { background: rgba(255,255,255,0.4); }
+.matrix-modal-body {
+  padding: 24px 28px;
+  overflow-y: auto;
+  flex: 1;
+}
+.matrix-empty {
+  text-align: center;
+  color: #999;
+  padding: 80px 0;
+  font-size: 1rem;
+}
+.matrix-sections { display: flex; flex-direction: column; gap: 28px; }
+.matrix-section-title {
+  color: #2c3e50;
+  font-size: 1.15rem;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid #667eea;
+  display: inline-block;
+}
+.matrix-section-body p { line-height: 1.7; color: #444; }
+
+/* 插接矩阵表格 */
+.matrix-table-wrapper {
+  overflow-x: auto;
+  border-radius: 10px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  border: 1px solid #e2e8f0;
+}
+.matrix-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.matrix-table thead th {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  padding: 13px 14px;
+  text-align: left;
+  white-space: nowrap;
+  font-weight: 600;
+  font-size: 0.88rem;
+  letter-spacing: 0.3px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.matrix-table tbody td {
+  padding: 11px 14px;
+  border-bottom: 1px solid #edf2f7;
+  vertical-align: top;
+  color: #334155;
+  line-height: 1.65;
+}
+.matrix-table tbody tr.alt-row td { background: #f8fafc; }
+.matrix-table tbody tr:hover td { background: #eef2ff; }
+.matrix-item-num {
+  display: block;
+  color: #1e40af;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.matrix-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 28px;
+  border-top: 1px solid #e8ecf1;
+  background: #f8f9fb;
+  border-radius: 0 0 14px 14px;
+}
+.matrix-btn {
+  padding: 9px 22px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.92rem;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+.matrix-btn.copy-btn { background: #667eea; color: #fff; }
+.matrix-btn.copy-btn:hover { background: #5a6fd6; transform: translateY(-1px); }
+.matrix-btn.close-btn { background: #cbd5e1; color: #475569; }
+.matrix-btn.close-btn:hover { background: #94a3b8; }
+
+/* ========== 待确认项确认弹窗（对齐 AI 用例评审） ========== */
+.analyze-uncertain-trigger { margin-top: 14px; }
+.au-trigger-alert { border-radius: 10px !important; }
+.au-list { display: flex; flex-direction: column; gap: 14px; max-height: 50vh; overflow-y: auto; padding-right: 4px; }
+.au-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
+  padding: 14px 16px;
+  transition: all 0.25s;
+}
+.au-item.confirmed { border-color: #86efac; background: #f0fdf4; }
+.au-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.au-question { flex: 1; font-weight: 600; color: #1f2937; font-size: 0.92rem; line-height: 1.5; }
+.au-context {
+  margin-top: 8px;
+  font-size: 0.85rem;
+  color: #6b7280;
+  background: #f9fafb;
+  padding: 8px 12px;
+  border-radius: 6px;
+  line-height: 1.5;
+}
+.gen-gate-hint {
+  margin-top: 8px;
+  font-size: 0.82rem;
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px dashed #fcd34d;
+  border-radius: 6px;
+  padding: 6px 10px;
 }
 </style>

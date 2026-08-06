@@ -147,3 +147,118 @@ export function deletePromptConfig(id) {
     method: 'delete'
   })
 }
+
+// 将AI生成用例（需求分析模块）批量导入为UI自动化AI用例，导入后可直接执行
+export function importGeneratedToAICase(data) {
+  return request({
+    url: '/ui-automation/ai-cases/import-from-generated/',
+    method: 'post',
+    data
+  })
+}
+
+// 一键采纳墨刀流程生成的用例到用例库（按项目/版本/功能模块自动建模块，幂等）
+export function adoptModaoToLibrary(pk, data = {}) {
+  return request({
+    url: `/requirement-analysis/api/modao/${pk}/adopt/`,
+    method: 'post',
+    data
+  })
+}
+
+// 逐条采纳墨刀流程生成的单条测试用例到用例库（幂等）
+export function adoptModaoSingleCase(pk, caseIndex) {
+  return request({
+    url: `/requirement-analysis/api/modao/${pk}/adopt-single/`,
+    method: 'post',
+    data: { index: caseIndex }
+  })
+}
+
+// ==================== 需求拆解结果历史 ====================
+
+// 获取拆解结果历史列表
+export function getAnalysisResults(params) {
+  return request({
+    url: '/requirement-analysis/api/analysis-results/',
+    method: 'get',
+    params
+  })
+}
+
+// 获取单条拆解结果详情（含完整内容）
+export function getAnalysisResultDetail(id) {
+  return request({
+    url: `/requirement-analysis/api/analysis-results/${id}/`,
+    method: 'get'
+  })
+}
+
+// 保存拆解结果
+export function createAnalysisResult(data) {
+  return request({
+    url: '/requirement-analysis/api/analysis-results/',
+    method: 'post',
+    data
+  })
+}
+
+// 删除拆解结果
+export function deleteAnalysisResult(id) {
+  return request({
+    url: `/requirement-analysis/api/analysis-results/${id}/`,
+    method: 'delete'
+  })
+}
+
+// 批量查询若干需求文档对应的最新拆解结果（重建前端 docAnalysisMap，刷新后持久化）
+export function getAnalysisResultsByDocs(docIds) {
+  return request({
+    url: '/requirement-analysis/api/analysis-results/by-docs/',
+    method: 'get',
+    params: { doc_ids: (docIds || []).join(',') }
+  })
+}
+
+// 基于精炼确认的问答对自动回填项目知识库（去重，避免重复不确定问题）
+export function autoFillKnowledgeFromConfirmations(projectId, confirmedAnswers) {
+  return request({
+    url: '/requirement-analysis/api/analysis-results/auto-fill-knowledge/',
+    method: 'post',
+    data: {
+      project_id: projectId,
+      confirmed_answers: JSON.stringify(confirmedAnswers)
+    }
+  })
+}
+
+// ==================== 深度追问清单 ====================
+
+// 获取某拆解结果下的全部追问项
+export function getClarifications(params) {
+  return request({
+    url: '/requirement-analysis/api/clarifications/',
+    method: 'get',
+    params
+  })
+}
+
+// 批量保存某拆解结果下的全部追问项（整体替换）
+export function saveAllClarifications(data) {
+  return request({
+    url: '/requirement-analysis/api/clarifications/save-all/',
+    method: 'post',
+    data
+  })
+}
+
+// ==================== 拆解结果精炼（带人工确认回复） ====================
+
+// 基于人工确认回复精炼拆解结果（对齐 AI 用例评审的 resolve_replies 闭环）
+export function refineAnalysis(data) {
+  return request({
+    url: '/requirement-analysis/api/refine-analysis/',
+    method: 'post',
+    data
+  })
+}

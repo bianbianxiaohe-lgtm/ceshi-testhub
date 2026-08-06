@@ -51,6 +51,11 @@ const routes = [
         component: () => import('@/views/requirement-analysis/RequirementAnalysisView.vue')
       },
       {
+        path: 'modao-skill',
+        name: 'ModaoSkill',
+        component: () => import('@/views/requirement-analysis/ModaoSkillView.vue')
+      },
+      {
         path: 'projects',
         name: 'Projects',
         component: ProjectList
@@ -277,6 +282,140 @@ const routes = [
         path: 'notification-logs',
         name: 'UiNotificationLogs',
         component: () => import('@/views/ui-automation/notification/NotificationLogs.vue')
+      }
+    ]
+  },
+  {
+    path: '/app-automation',
+    component: Layout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        redirect: 'dashboard'
+      },
+      {
+        path: 'dashboard',
+        name: 'AppDashboard',
+        component: () => import('@/views/app-automation/dashboard/Dashboard.vue')
+      },
+      {
+        path: 'devices',
+        name: 'AppDevices',
+        component: () => import('@/views/app-automation/devices/DeviceList.vue')
+      },
+      {
+        path: 'projects',
+        name: 'AppProjects',
+        component: () => import('@/views/app-automation/projects/ProjectList.vue')
+      },
+      {
+        path: 'suites',
+        name: 'AppSuites',
+        component: () => import('@/views/app-automation/suites/SuiteList.vue')
+      },
+      {
+        path: 'test-cases',
+        name: 'AppTestCases',
+        component: () => import('@/views/app-automation/test-cases/TestCaseList.vue')
+      },
+      {
+        path: 'recorder',
+        name: 'AppRecorder',
+        component: () => import('@/views/ui-automation/test-cases/TestCaseManager.vue')
+      },
+      {
+        path: 'test-cases/scenes/:id?',
+        name: 'AppSceneBuilder',
+        component: () => import('@/views/app-automation/test-cases/SceneBuilder.vue')
+      },
+      {
+        path: 'elements',
+        name: 'AppElements',
+        component: () => import('@/views/app-automation/elements/ElementList.vue')
+      },
+      {
+        path: 'executions',
+        name: 'AppExecutions',
+        component: () => import('@/views/app-automation/executions/ExecutionList.vue')
+      },
+      {
+        path: 'reports',
+        name: 'AppReports',
+        component: () => import('@/views/app-automation/reports/ReportList.vue')
+      },
+      {
+        path: 'scheduled-tasks',
+        name: 'AppScheduledTasks',
+        component: () => import('@/views/app-automation/scheduled-tasks/ScheduledTasks.vue')
+      },
+      {
+        path: 'packages',
+        name: 'AppPackages',
+        component: () => import('@/views/app-automation/packages/PackageList.vue')
+      },
+      {
+        path: 'settings',
+        name: 'AppSettings',
+        component: () => import('@/views/app-automation/settings/AppSettings.vue')
+      },
+      {
+        path: 'notification',
+        name: 'AppNotification',
+        component: () => import('@/views/app-automation/notification/NotificationLogs.vue')
+      }
+    ]
+  },
+  {
+    path: '/defects',
+    component: Layout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        redirect: 'list'
+      },
+      {
+        path: 'list',
+        name: 'DefectList',
+        component: () => import('@/views/defects/DefectList.vue')
+      },
+      {
+        path: 'create',
+        name: 'CreateDefect',
+        component: () => import('@/views/defects/DefectForm.vue')
+      },
+      {
+        path: ':id',
+        name: 'DefectDetail',
+        component: () => import('@/views/defects/DefectDetail.vue')
+      },
+      {
+        path: ':id/edit',
+        name: 'EditDefect',
+        component: () => import('@/views/defects/DefectForm.vue')
+      },
+      {
+        path: 'dashboard',
+        name: 'DefectDashboard',
+        component: () => import('@/views/defects/DefectDashboard.vue')
+      },
+      {
+        path: 'report',
+        name: 'DefectReport',
+        component: () => import('@/views/defects/DefectReport.vue')
+      }
+    ]
+  },
+  {
+    path: '/data-factory',
+    component: Layout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        name: 'DataFactory',
+        component: () => import('@/views/data-factory/DataFactory.vue')
       }
     ]
   },

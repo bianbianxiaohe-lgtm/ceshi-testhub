@@ -1,0 +1,267 @@
+﻿========== 对比报告：本地 HEAD vs chenjigang4167/testhub_platform (main) ==========
+本地文件: 433 | 对方文件: 540 | 对方新增: 213 | 本地独有: 106
+
+===== 对方新增的 apps/ 文件（按 app 分组）=====
+  app_automation: 37
+  data_factory: 21
+  analytics: 9
+  defects: 9
+  users: 4
+  core: 3
+  testcases: 2
+  requirement_analysis: 1
+  api_testing: 1
+
+===== 对方新增的 frontend/ 文件（按目录分组）=====
+  locales: 40
+  views: 25
+  utils: 4
+  api: 3
+  assets: 2
+  nginx.conf: 1
+  tree-sitter-bash.wasm: 1
+  tree-sitter.wasm: 1
+  vite-env.d.ts: 1
+  stores: 1
+  components: 1
+  Dockerfile.dev: 1
+  PAGE_I18N_GUIDE.md: 1
+  Dockerfile: 1
+  .dockerignore: 1
+  .gitignore: 1
+  QUICK_START.md: 1
+  docker-compose.yml: 1
+  jsconfig.json: 1
+  docker-compose.dev.yml: 1
+  README.Docker.md: 1
+  deploy.sh: 1
+
+===== 本地独有文件（对方没有，需保护！）共 106 个 =====
+  .codebuddy/memory/2026-07-06.md
+  .codebuddy/memory/MEMORY.md
+  Dockerfile.backend
+  Dockerfile.frontend
+  "UI\350\207\252\345\212\250\345\214\226\346\265\213\350\257\225\346\211\247\350\241\214\350\257\264\346\230\216.md"
+  "WebDriver\351\251\261\345\212\250\347\256\241\347\220\206\344\274\230\345\214\226\350\257\264\346\230\216.md"
+  alter_app_configs.sql
+  apps/api_testing/migrations/0001_add_performance_indexes.py
+  apps/api_testing/migrations/0001_initial.py
+  apps/api_testing/migrations/0002_initial.py
+  apps/assistant/migrations/0001_initial.py
+  apps/assistant/migrations/0002_initial.py
+  apps/core/migrations/0001_initial.py
+  apps/core/migrations/0002_initial.py
+  apps/core/mixins.py
+  apps/core/pagination.py
+  apps/executions/migrations/0001_add_performance_indexes.py
+  apps/executions/migrations/0001_initial.py
+  apps/executions/migrations/0002_initial.py
+  apps/feature_modules/__init__.py
+  apps/feature_modules/admin.py
+  apps/feature_modules/apps.py
+  apps/feature_modules/migrations/0001_initial.py
+  apps/feature_modules/migrations/0002_testpoint.py
+  apps/feature_modules/migrations/__init__.py
+  apps/feature_modules/models.py
+  apps/feature_modules/serializers.py
+  apps/feature_modules/urls.py
+  apps/feature_modules/views.py
+  apps/projects/migrations/0001_initial.py
+  apps/projects/migrations/0002_initial.py
+  apps/projects/migrations/0003_add_project_knowledge.py
+  apps/projects/migrations/0004_add_knowledge_base_path.py
+  apps/projects/migrations/0005_project_owner_alter_project_description_and_more.py
+  apps/projects/migrations/0006_add_performance_indexes.py
+  apps/projects/migrations/0007_remove_project_idx_project_owner_and_more.py
+  apps/reports/migrations/0001_initial.py
+  apps/reports/migrations/0002_initial.py
+  apps/requirement_analysis/migrations/0001_initial.py
+  apps/requirement_analysis/migrations/0002_alter_aimodelconfig_role_generatedrequirementdoc.py
+  apps/requirement_analysis/migrations/0002_initial.py
+  apps/requirement_analysis/migrations/0003_testcasegenerationtask_version.py
+  apps/requirement_analysis/migrations/0004_testcasegenerationtask_feature_module.py
+  apps/requirement_analysis/migrations/0005_add_testcase_generation_mode.py
+  apps/requirement_analysis/migrations/0006_alter_testcasegenerationtask_generation_mode.py
+  apps/requirement_analysis/migrations/0007_testcasegenerationtask_test_point.py
+  apps/requirement_analysis/migrations/0008_add_human_feedback.py
+  apps/requirement_analysis/migrations/0009_testcasegenerationtask_kb_audit_result.py
+  apps/requirement_analysis/migrations/0010_add_review_count_and_review_updated_at.py
+  apps/requirement_analysis/tests.py
+  apps/reviews/migrations/0001_add_performance_indexes.py
+  apps/reviews/migrations/0001_initial.py
+  apps/reviews/migrations/0002_initial.py
+  apps/testcases/migrations/0001_initial.py
+  apps/testcases/migrations/0002_initial.py
+  apps/testcases/migrations/0002_testcase_feature_modules.py
+  apps/testcases/migrations/0003_testcase_test_points.py
+  apps/testcases/migrations/0004_remove_testcase_test_points_testcase_test_point.py
+  apps/testcases/migrations/0005_testcaseexecution.py
+  apps/testcases/migrations/0006_add_performance_indexes.py
+  apps/testcases/migrations/0007_remove_testcase_idx_testcase_project_and_more.py
+  apps/testsuites/migrations/0001_initial.py
+  apps/testsuites/migrations/0002_initial.py
+  apps/ui_automation/appium_engine.py
+  apps/ui_automation/migrations/0001_initial.py
+  apps/ui_automation/migrations/0002_initial.py
+  apps/users/migrations/0001_initial.py
+  apps/users/migrations/0002_alter_user_groups.py
+  apps/versions/migrations/0001_initial.py
+  create_app_tables.sql
+  deploy-frontend.bat
+  deploy.bat
+  docker-compose.yml
+  docker_start.py
+  fix_app_tables.py
+  fix_migrations.py
+  frontend/src/utils/useUnifiedProjects.js
+  frontend/src/views/ui-automation/app/AppConfigList.vue
+  frontend/src/views/ui-automation/app/AppDeviceList.vue
+  frontend/src/views/users/UserManagement.vue
+  media/ai_recording/.gitkeep
+  media/allure-reports/.gitkeep
+  media/allure-results/.gitkeep
+  media/allure-static/app.js
+  media/allure-static/app.js.LICENSE.txt
+  media/allure-static/favicon.ico
+  media/allure-static/styles.css
+  media/requirement_docs/.gitkeep
+  nginx.conf
+  scripts/create_xdrc_project.py
+  scripts/db_check.py
+  scripts/fix_migrations.py
+  scripts/gen_xdrc_kb.py
+  scripts/mig_check.py
+  scripts/set_kb_path.py
+  scripts/test_kb_injection.py
+  scripts/verify_convert_appium.py
+  scripts/verify_kb.py
+  tester.md
+  tester_new.md
+  tester_pro.md
+  update_writer_prompt.py
+  "\344\274\230\345\214\226\350\277\255\344\273\243\346\226\271\346\241\210.md"
+  "\345\217\230\346\233\264\350\257\264\346\230\216-P0\344\275\216\351\243\216\351\231\251\344\277\256\345\244\215.md"
+  "\347\224\250\344\276\213\350\257\204\345\256\241\347\256\241\347\220\206\345\212\237\350\203\275\350\257\264\346\230\216.md"
+  "\351\227\256\351\242\230\346\216\222\346\237\245\346\214\207\345\215\227.md"
+
+===== 对方新增文件完整清单（前120）=====
+  + AGENTS.md
+  + LICENSE
+  + apps/analytics/__init__.py
+  + apps/analytics/admin.py
+  + apps/analytics/apps.py
+  + apps/analytics/migrations/__init__.py
+  + apps/analytics/models.py
+  + apps/analytics/serializers.py
+  + apps/analytics/templates/admin/analytics/analyticsevent/change_list.html
+  + apps/analytics/urls.py
+  + apps/analytics/views.py
+  + apps/api_testing/variable_resolver.py
+  + apps/app_automation/Template/common/plus_sign.png
+  + apps/app_automation/Template/common/spin_button.png
+  + apps/app_automation/__init__.py
+  + apps/app_automation/admin.py
+  + apps/app_automation/apps.py
+  + apps/app_automation/constants.py
+  + apps/app_automation/consumers.py
+  + apps/app_automation/executors/__init__.py
+  + apps/app_automation/executors/test_executor.py
+  + apps/app_automation/managers/__init__.py
+  + apps/app_automation/managers/device_manager.py
+  + apps/app_automation/migrations/__init__.py
+  + apps/app_automation/models.py
+  + apps/app_automation/routing.py
+  + apps/app_automation/runners/__init__.py
+  + apps/app_automation/runners/ui_flow_runner.py
+  + apps/app_automation/serializers.py
+  + apps/app_automation/tasks.py
+  + apps/app_automation/tests/__init__.py
+  + apps/app_automation/tests/conftest.py
+  + apps/app_automation/tests/test_app_flow.py
+  + apps/app_automation/urls.py
+  + apps/app_automation/utils/__init__.py
+  + apps/app_automation/utils/airtest_base.py
+  + apps/app_automation/utils/image_helpers.py
+  + apps/app_automation/utils/ocr_helper.py
+  + apps/app_automation/views/__init__.py
+  + apps/app_automation/views/component_views.py
+  + apps/app_automation/views/config_views.py
+  + apps/app_automation/views/dashboard_views.py
+  + apps/app_automation/views/device_views.py
+  + apps/app_automation/views/element_views.py
+  + apps/app_automation/views/execution_views.py
+  + apps/app_automation/views/project_views.py
+  + apps/app_automation/views/scheduled_task_views.py
+  + apps/app_automation/views/suite_views.py
+  + apps/app_automation/views/test_case_views.py
+  + apps/core/management/commands/load_component_pack.py
+  + apps/core/management/commands/ui-component-pack.yaml
+  + apps/core/variable_resolver.py
+  + apps/data_factory/__init__.py
+  + apps/data_factory/admin.py
+  + apps/data_factory/apps.py
+  + apps/data_factory/migrations/__init__.py
+  + apps/data_factory/models.py
+  + apps/data_factory/serializers.py
+  + apps/data_factory/tests.py
+  + apps/data_factory/tool_list.py
+  + apps/data_factory/tools/__init__.py
+  + apps/data_factory/tools/china_bank_card.py
+  + apps/data_factory/tools/crontab_tools.py
+  + apps/data_factory/tools/encoding_tools.py
+  + apps/data_factory/tools/encryption_tools.py
+  + apps/data_factory/tools/image_tools.py
+  + apps/data_factory/tools/json_tools.py
+  + apps/data_factory/tools/random_tools.py
+  + apps/data_factory/tools/string_tools.py
+  + apps/data_factory/tools/test_data_tools.py
+  + apps/data_factory/tools/unified_credit_code.py
+  + apps/data_factory/urls.py
+  + apps/data_factory/views.py
+  + apps/defects/__init__.py
+  + apps/defects/admin.py
+  + apps/defects/apps.py
+  + apps/defects/migrations/__init__.py
+  + apps/defects/models.py
+  + apps/defects/serializers.py
+  + apps/defects/tests.py
+  + apps/defects/urls.py
+  + apps/defects/views.py
+  + apps/requirement_analysis/ai_models.py
+  + apps/testcases/services.py
+  + apps/testcases/tasks.py
+  + apps/users/captcha.py
+  + apps/users/redis_client.py
+  + apps/users/sms.py
+  + apps/users/test_views.py
+  + backend/celery.py
+  + "docs/APP/APP\350\207\252\345\212\250\345\214\226\345\256\214\346\225\264\351\233\206\346\210\220\346\212\245\345\221\212.md"
+  + "docs/APP/APP\350\207\252\345\212\250\345\214\226\345\277\253\351\200\237\345\274\200\345\247\213.md"
+  + "docs/APP/APP\350\207\252\345\212\250\345\214\226\351\233\206\346\210\220\345\256\214\346\210\220\346\212\245\345\221\212.md"
+  + "docs/APP/APP\350\207\252\345\212\250\345\214\226\351\233\206\346\210\220\350\257\264\346\230\216.md"
+  + docs/APP/PROD_DEPLOY_LINUX.md
+  + "docs/APP/\345\211\215\347\253\257\351\241\265\351\235\242\345\274\200\345\217\221\345\256\214\346\210\220\346\212\245\345\221\212.md"
+  + "docs/APP/\346\234\200\347\273\210\351\233\206\346\210\220\345\256\214\346\210\220\346\200\273\347\273\223.md"
+  + "docs/I18N\345\233\275\351\231\205\345\214\226\344\275\277\347\224\250\350\257\264\346\230\216.md"
+  + "docs/UI \350\207\252\345\212\250\345\214\226\346\265\213\350\257\225\347\224\250\346\210\267\344\275\277\347\224\250\346\211\213\345\206\214.md"
+  + "docs/UI\350\207\252\345\212\250\345\214\226\345\205\203\347\264\240order\345\255\227\346\256\265\350\277\201\347\247\273\350\257\264\346\230\216.md"
+  + "docs/UI\350\207\252\345\212\250\345\214\226\346\265\213\350\257\225\346\211\247\350\241\214\350\257\264\346\230\216.md"
+  + "docs/WebDriver\351\251\261\345\212\250\347\256\241\347\220\206\344\274\230\345\214\226\350\257\264\346\230\216.md"
+  + docs/demo_pyzbar.py
+  + docs/key.py
+  + docs/tester.md
+  + docs/tester_pro.md
+  + "docs/\346\225\260\346\215\256\345\267\245\345\216\202API\346\216\245\345\217\243\346\226\207\346\241\243.md"
+  + "docs/\346\225\260\346\215\256\345\267\245\345\216\202\344\275\277\347\224\250\350\257\264\346\230\216.md"
+  + "docs/\346\225\260\346\215\256\345\267\245\345\216\202\345\212\237\350\203\275\350\257\264\346\230\216.md"
+  + "docs/\346\225\260\346\215\256\345\267\245\345\216\202\345\277\253\351\200\237\345\274\200\345\247\213.md"
+  + "docs/\347\224\250\344\276\213\350\257\204\345\256\241\347\256\241\347\220\206\345\212\237\350\203\275\350\257\264\346\230\216.md"
+  + "docs/\351\227\256\351\242\230\346\216\222\346\237\245\346\214\207\345\215\227.md"
+  + frontend/.dockerignore
+  + frontend/.gitignore
+  + frontend/Dockerfile
+  + frontend/Dockerfile.dev
+  + frontend/PAGE_I18N_GUIDE.md
+  + frontend/QUICK_START.md
+  + frontend/README.Docker.md
+  + frontend/deploy.sh

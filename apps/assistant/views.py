@@ -160,3 +160,50 @@ class ChatViewSet(viewsets.ViewSet):
 def assistant_view(request):
     """智能助手页面视图 - 用于iframe内嵌"""
     return render(request, 'assistant/assistant.html')
+
+
+# ==================== Dify Agent 工具回调端点 ====================
+# 供 Dify 工作流中的 HTTP 工具调用，由 Dify 平台直接 POST 请求
+
+import json as _json
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+
+INTERNAL_KEY = "testhub-appium-2026"  # Dify HTTP 工具 Header 中携带
+
+
+@csrf_exempt
+def appium_tool_execute(request):
+    """
+    Dify Agent 工具回调端点
+    接收 Dify HTTP 工具的 POST 请求，在真机上执行 Appium 操作
+    """
+    # 内部 key 认证
+    if request.headers.get("X-Internal-Key", "") != INTERNAL_KEY:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+
+    if request.method != "POST":
+        return JsonResponse({"error": "method not allowed"}, status=405)
+
+    try:
+        body = _json.loads(request.body.decode("utf-8"))
+    except _json.JSONDecodeError:
+        return JsonResponse({"error": "invalid JSON"}, status=400)
+
+    tool_name = body.get("tool_name", "")
+    params = body.get("parameters", {})
+
+    if not tool_name:
+        return JsonResponse({"error": "missing tool_name"}, status=400)
+
+    try:
+        from .appium_tools import AppiumToolExecutor
+        executor = AppiumToolExecutor()
+        result = executor.execute(tool_name, params)
+        return JsonResponse({
+            "success": result.success,
+            "message": result.message,
+            "data": result.data,
+        })
+    except Exception as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=500)

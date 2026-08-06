@@ -52,6 +52,10 @@ LOCAL_APPS = [
     'apps.api_testing',
     'apps.ui_automation.apps.UiAutomationConfig',
     'apps.core',
+    'apps.defects',
+    'apps.data_factory',
+    'apps.analytics',
+    'apps.app_automation.apps.AppAutomationConfig',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -144,7 +148,7 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'DEFAULT_PAGINATION_CLASS': 'apps.core.pagination.StandardPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
@@ -261,6 +265,13 @@ SPECTACULAR_SETTINGS = {
 # Celery Configuration
 CELERY_BROKER_URL = config('REDIS_URL')
 CELERY_RESULT_BACKEND = config('REDIS_URL')
+
+# Channels (WebSocket) 配置 - 用于 APP自动化 实时进度推送
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    }
+}
 
 # Email Configuration
 EMAIL_BACKEND = 'apps.api_testing.custom_email_backend.CustomEmailBackend'

@@ -3,7 +3,12 @@
     <div class="page-header">
       <h1 class="page-title">测试套件管理</h1>
       <el-select v-model="projectId" placeholder="选择项目" style="width: 200px; margin-right: 15px" @change="onProjectChange">
-        <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
+        <el-option-group label="UI自动化项目">
+          <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+        </el-option-group>
+        <el-option-group label="AI用例项目">
+          <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+        </el-option-group>
       </el-select>
       <el-button type="primary" @click="handleNewSuite">
         <el-icon><Plus /></el-icon>
@@ -224,22 +229,50 @@
           <el-select v-model="runConfig.engine" placeholder="请选择测试引擎">
             <el-option label="Playwright" value="playwright" />
             <el-option label="Selenium" value="selenium" />
+            <el-option label="Appium (App自动化)" value="appium" />
           </el-select>
         </el-form-item>
-        <el-form-item label="浏览器">
-          <el-select v-model="runConfig.browser" placeholder="请选择浏览器">
-            <el-option label="Chrome" value="chrome" />
-            <el-option label="Firefox" value="firefox" />
-            <el-option label="Safari" value="safari" />
-            <el-option label="Edge" value="edge" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="执行模式">
-          <el-radio-group v-model="runConfig.headless">
-            <el-radio :label="false">有头模式</el-radio>
-            <el-radio :label="true">无头模式</el-radio>
-          </el-radio-group>
-        </el-form-item>
+        <!-- Web引擎配置 -->
+        <template v-if="runConfig.engine !== 'appium'">
+          <el-form-item label="浏览器">
+            <el-select v-model="runConfig.browser" placeholder="请选择浏览器">
+              <el-option label="Chrome" value="chrome" />
+              <el-option label="Firefox" value="firefox" />
+              <el-option label="Safari" value="safari" />
+              <el-option label="Edge" value="edge" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="执行模式">
+            <el-radio-group v-model="runConfig.headless">
+              <el-radio :label="false">有头模式</el-radio>
+              <el-radio :label="true">无头模式</el-radio>
+            </el-radio-group>
+          </el-form-item>
+        </template>
+        <!-- Appium 配置 -->
+        <template v-if="runConfig.engine === 'appium'">
+          <el-form-item label="测试设备" required>
+            <el-select v-model="runConfig.device_id" placeholder="请选择测试设备" filterable style="width: 100%">
+              <el-option
+                v-for="d in appDevices"
+                :key="d.device_id || d.id"
+                :label="`${d.name} (${d.platform}) - ${d.status}`"
+                :value="d.device_id"
+                :disabled="d.status !== 'online'"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="应用配置" required>
+            <el-select v-model="runConfig.app_config_id" placeholder="请选择被测应用" filterable style="width: 100%">
+              <el-option
+                v-for="a in appConfigs"
+                :key="a.id"
+                :label="`${a.name} (${a.platform})`"
+                :value="a.id"
+              />
+            </el-select>
+          </el-form-item>
+        </template>
       </el-form>
       <template #footer>
         <span class="dialog-footer">
@@ -258,12 +291,13 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Plus, Search, Edit, Delete, RefreshRight, Collection,
   ArrowRight, Top, Bottom
 } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 import {
   getUiProjects,
   getTestSuites,
@@ -275,12 +309,15 @@ import {
   addTestCaseToTestSuite,
   removeTestCaseFromTestSuite,
   updateTestCaseOrder,
-  runTestSuite
+  runTestSuite,
+  getAppDevices,
+  getAppConfigs
 } from '@/api/ui_automation'
 
 // 响应式数据
-const projects = ref([])
-const projectId = ref('')
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
+const projectId = ref('') // 格式: "ui_1" 或 "proj_2"
+const realProjectId = ref(null) // 实际传给 API 的 UiProject ID（纯数字）
 const suites = ref([])
 const loading = ref(false)
 const searchText = ref('')
@@ -317,9 +354,14 @@ const testCaseSearchText = ref('')
 const runConfig = reactive({
   engine: 'playwright',
   browser: 'chrome',
-  headless: false
+  headless: false,
+  device_id: null,
+  app_config_id: null
 })
 const currentRunningSuite = ref(null)
+// Appium 相关数据
+const appDevices = ref([])
+const appConfigs = ref([])
 
 // 计算属性 - 过滤后的可用测试用例
 const filteredAvailableTestCases = computed(() => {
@@ -332,20 +374,14 @@ const filteredAvailableTestCases = computed(() => {
   )
 })
 
-// 加载项目列表
+// 加载项目列表（使用统一接口）
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    console.error('获取项目列表失败:', error)
-    ElMessage.error('获取项目列表失败')
-  }
+  await loadAllProjects()
 }
 
 // 加载测试套件列表
 const loadSuites = async () => {
-  if (!projectId.value) {
+  if (!realProjectId.value) {
     suites.value = []
     total.value = 0
     return
@@ -354,7 +390,7 @@ const loadSuites = async () => {
   loading.value = true
   try {
     const response = await getTestSuites({
-      project: projectId.value,
+      project: realProjectId.value,
       page: pagination.currentPage,
       page_size: pagination.pageSize,
       search: searchText.value
@@ -377,11 +413,11 @@ const loadSuites = async () => {
 
 // 加载可用测试用例
 const loadAvailableTestCases = async () => {
-  if (!projectId.value) return
+  if (!realProjectId.value) return
 
   try {
     const response = await getTestCases({
-      project: projectId.value,
+      project: realProjectId.value,
       page_size: 1000  // 加载所有用例
     })
     availableTestCases.value = response.data.results || response.data
@@ -394,6 +430,8 @@ const loadAvailableTestCases = async () => {
 // 项目切换
 const onProjectChange = async () => {
   pagination.currentPage = 1
+  // 解析统一 ID，获取实际 UiProject ID
+  realProjectId.value = await resolveUiProjectId(projectId.value)
   await loadSuites()
 }
 
@@ -420,7 +458,7 @@ const handleCreate = async () => {
     return
   }
 
-  if (!projectId.value) {
+  if (!realProjectId.value) {
     ElMessage.warning('请先选择项目')
     return
   }
@@ -428,7 +466,7 @@ const handleCreate = async () => {
   saving.value = true
   try {
     const suiteData = {
-      project: projectId.value,
+      project: realProjectId.value,
       name: createForm.name,
       description: createForm.description
     }
@@ -523,7 +561,7 @@ const deleteSuite = async (id) => {
 }
 
 // 运行套件
-const runSuite = (suite) => {
+const runSuite = async (suite) => {
   // 检查是否包含测试用例
   if (!suite.test_case_count || suite.test_case_count === 0) {
     ElMessage.warning('该测试套件未包含任何测试用例，无法执行')
@@ -531,11 +569,49 @@ const runSuite = (suite) => {
   }
 
   currentRunningSuite.value = suite
+  // 重置运行配置
+  runConfig.engine = 'playwright'
+  runConfig.browser = 'chrome'
+  runConfig.headless = false
+  runConfig.device_id = null
+  runConfig.app_config_id = null
+  // 预加载设备和应用列表
+  await loadAppDevicesAndConfigs()
   showRunDialog.value = true
+}
+
+// 加载 Appium 相关数据
+const loadAppDevicesAndConfigs = async () => {
+  try {
+    const [devicesRes, configsRes] = await Promise.allSettled([
+      getAppDevices({ status: 'online', page_size: 999 }),
+      getAppConfigs({ page_size: 999 })
+    ])
+    if (devicesRes.status === 'fulfilled') {
+      appDevices.value = devicesRes.value.data.results || devicesRes.value.data || []
+    }
+    if (configsRes.status === 'fulfilled') {
+      appConfigs.value = configsRes.value.data.results || configsRes.value.data || []
+    }
+  } catch (error) {
+    // 加载失败不影响主流程
+  }
 }
 
 // 确认运行套件
 const confirmRunSuite = async () => {
+  // Appium 引擎校验
+  if (runConfig.engine === 'appium') {
+    if (!runConfig.device_id) {
+      ElMessage.warning('请选择测试设备')
+      return
+    }
+    if (!runConfig.app_config_id) {
+      ElMessage.warning('请选择应用配置')
+      return
+    }
+  }
+
   running.value = true
   try {
     const requestData = {
@@ -543,6 +619,11 @@ const confirmRunSuite = async () => {
       engine: runConfig.engine,
       browser: runConfig.browser,
       headless: runConfig.headless
+    }
+    // Appium 额外参数
+    if (runConfig.engine === 'appium') {
+      requestData.device_id = runConfig.device_id
+      requestData.app_config_id = runConfig.app_config_id
     }
 
     const response = await runTestSuite(currentRunningSuite.value.id, requestData)
@@ -738,8 +819,9 @@ const getCaseStatusText = (status) => {
 const originalShowCreateDialog = showCreateDialog
 onMounted(async () => {
   await loadProjects()
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
+  if (allProjects.value.length > 0) {
+    projectId.value = allProjects.value[0].id
+    realProjectId.value = await resolveUiProjectId(projectId.value)
     await loadSuites()
   }
 })

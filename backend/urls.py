@@ -2,6 +2,7 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from django.views.static import serve
 from django.views.decorators.csrf import csrf_exempt
 from drf_spectacular.views import (
     SpectacularAPIView,
@@ -30,7 +31,26 @@ urlpatterns = [
     path('api/ui-automation/', include('apps.ui_automation.urls')),
     path('api/', include('apps.api_testing.urls')),
     path('api/core/', include('apps.core.urls')),
+    path('api/defects/', include('apps.defects.urls')),
+    path('api/data-factory/', include('apps.data_factory.urls')),
+    path('api/analytics/', include('apps.analytics.urls')),
+    path('api/app-automation/', include('apps.app_automation.urls')),
 ]
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+# APP自动化 Template 目录静态访问
+import os
+urlpatterns += [
+    path('app-automation-templates/<path:path>',
+         serve,
+         {'document_root': os.path.join(settings.BASE_DIR, 'apps', 'app_automation', 'Template')}),
+]
+
+# APP自动化 Allure 报告访问
+urlpatterns += [
+    path('app-automation-reports/<path:path>',
+         serve,
+         {'document_root': os.path.join(settings.MEDIA_ROOT, 'app-automation', 'allure-reports')}),
+]

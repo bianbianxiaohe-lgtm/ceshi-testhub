@@ -22,6 +22,7 @@
               </template>
               <el-menu-item index="/ai-generation/requirement-analysis">AI用例生成</el-menu-item>
               <el-menu-item index="/ai-generation/generated-testcases">AI生成用例记录</el-menu-item>
+              <el-menu-item index="/ai-generation/modao-skill">墨刀需求用例</el-menu-item>
               <el-menu-item index="/ai-generation/prompt-config">提示词配置</el-menu-item>
             </el-sub-menu>
             <el-menu-item index="/ai-generation/projects">
@@ -147,6 +148,90 @@
             </el-menu-item>
           </template>
 
+          <!-- App自动化测试模块菜单 -->
+          <template v-else-if="currentModule === 'app-automation'">
+            <el-menu-item index="/app-automation/dashboard">
+              <el-icon><Odometer /></el-icon>
+              <span>数据看板</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/devices">
+              <el-icon><Iphone /></el-icon>
+              <span>设备管理</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/projects">
+              <el-icon><Folder /></el-icon>
+              <span>项目管理</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/suites">
+              <el-icon><Collection /></el-icon>
+              <span>套件管理</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/test-cases">
+              <el-icon><Document /></el-icon>
+              <span>用例管理</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/recorder">
+              <el-icon><Monitor /></el-icon>
+              <span>真机录制</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/elements">
+              <el-icon><Aim /></el-icon>
+              <span>元素管理</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/executions">
+              <el-icon><VideoPlay /></el-icon>
+              <span>执行记录</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/reports">
+              <el-icon><DataAnalysis /></el-icon>
+              <span>测试报告</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/scheduled-tasks">
+              <el-icon><AlarmClock /></el-icon>
+              <span>定时任务</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/packages">
+              <el-icon><Box /></el-icon>
+              <span>安装包管理</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/settings">
+              <el-icon><Setting /></el-icon>
+              <span>系统设置</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/notification">
+              <el-icon><Bell /></el-icon>
+              <span>通知日志</span>
+            </el-menu-item>
+          </template>
+
+          <!-- 缺陷管理模块菜单 -->
+          <template v-else-if="currentModule === 'defects'">
+            <el-menu-item index="/defects/list">
+              <el-icon><Document /></el-icon>
+              <span>缺陷列表</span>
+            </el-menu-item>
+            <el-menu-item index="/defects/create">
+              <el-icon><Plus /></el-icon>
+              <span>新建缺陷</span>
+            </el-menu-item>
+            <el-menu-item index="/defects/dashboard">
+              <el-icon><Odometer /></el-icon>
+              <span>数据看板</span>
+            </el-menu-item>
+            <el-menu-item index="/defects/report">
+              <el-icon><DataAnalysis /></el-icon>
+              <span>统计报告</span>
+            </el-menu-item>
+          </template>
+
+          <!-- 数据工厂模块菜单 -->
+          <template v-else-if="currentModule === 'data-factory'">
+            <el-menu-item index="/data-factory">
+              <el-icon><MagicStick /></el-icon>
+              <span>数据工厂</span>
+            </el-menu-item>
+          </template>
+
           <!-- AI 智能模式模块菜单 -->
           <template v-else-if="currentModule === 'ai-intelligent-mode'">
             <el-menu-item index="/ai-intelligent-mode/testing">
@@ -251,7 +336,8 @@ import { ElMessage } from 'element-plus'
 import { 
   Monitor, Folder, Document, Flag, Check, Collection, VideoPlay, 
   DataAnalysis, ChatDotRound, DocumentCopy, Link, MagicStick,
-  Odometer, Timer, Setting, AlarmClock, Bell, Aim, Edit, Cpu, User
+  Odometer, Timer, Setting, AlarmClock, Bell, Aim, Edit, Cpu, User,
+  Iphone, SetUp, Box, Plus
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
@@ -262,6 +348,9 @@ const currentModule = computed(() => {
   if (route.path.startsWith('/ai-generation')) return 'ai-generation'
   if (route.path.startsWith('/api-testing')) return 'api-testing'
   if (route.path.startsWith('/ui-automation')) return 'ui-automation'
+  if (route.path.startsWith('/app-automation')) return 'app-automation'
+  if (route.path.startsWith('/defects')) return 'defects'
+  if (route.path.startsWith('/data-factory')) return 'data-factory'
   if (route.path.startsWith('/ai-intelligent-mode')) return 'ai-intelligent-mode'
   if (route.path.startsWith('/configuration')) return 'configuration'
   return ''
@@ -272,6 +361,9 @@ const moduleName = computed(() => {
     'ai-generation': 'AI用例生成',
     'api-testing': '接口测试',
     'ui-automation': 'UI自动化测试',
+    'app-automation': 'App自动化测试',
+    'defects': '缺陷管理',
+    'data-factory': '数据工厂',
     'ai-intelligent-mode': 'AI 智能模式',
     'configuration': '配置中心'
   }
@@ -317,6 +409,30 @@ const breadcrumbTitle = computed(() => {
     '/ui-automation/reports': '测试报告',
     '/ui-automation/scheduled-tasks': '定时任务',
     '/ui-automation/notification-logs': '通知列表',
+    
+    // App自动化测试
+    '/app-automation/dashboard': '数据看板',
+    '/app-automation/devices': '设备管理',
+    '/app-automation/projects': '项目管理',
+    '/app-automation/suites': '套件管理',
+    '/app-automation/test-cases': '用例管理',
+    '/app-automation/recorder': '真机录制',
+    '/app-automation/elements': '元素管理',
+    '/app-automation/executions': '执行记录',
+    '/app-automation/reports': '测试报告',
+    '/app-automation/scheduled-tasks': '定时任务',
+    '/app-automation/packages': '安装包管理',
+    '/app-automation/settings': '系统设置',
+    '/app-automation/notification': '通知日志',
+
+    // 缺陷管理
+    '/defects/list': '缺陷列表',
+    '/defects/create': '新建缺陷',
+    '/defects/dashboard': '数据看板',
+    '/defects/report': '统计报告',
+
+    // 数据工厂
+    '/data-factory': '数据工厂',
     
     // AI 智能模式
     '/ai-intelligent-mode/testing': 'AI 智能测试',

@@ -63,3 +63,13 @@ export function getActiveNotificationConfigs() {
     method: 'get'
   })
 }
+
+// ==================== 项目管理 ====================
+
+// 获取所有项目（AI用例生成模块的 Project）
+export function getAllProjects() {
+  return request({
+    url: '/projects/all/',
+    method: 'get'
+  })
+}

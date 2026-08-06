@@ -37,13 +37,22 @@
           <p>高效的接口自动化测试与管理</p>
         </div>
 
-        <!-- UI自动化测试 -->
+        <!-- UI自动化测试（Web） -->
         <div class="nav-card" @click="handleNavigate('ui')" role="button" tabindex="0">
           <div class="card-icon ui-icon">
             <el-icon><Monitor /></el-icon>
           </div>
           <h3>UI自动化测试</h3>
-          <p>可视化的Web/App UI自动化测试</p>
+          <p>可视化的Web UI自动化测试</p>
+        </div>
+
+        <!-- App自动化测试 -->
+        <div class="nav-card" @click="handleNavigate('app')" role="button" tabindex="0">
+          <div class="card-icon app-icon">
+            <el-icon><Iphone /></el-icon>
+          </div>
+          <h3>App自动化测试</h3>
+          <p>真机/模拟器App自动化录制与执行</p>
         </div>
 
         <!-- 数据工厂 -->
@@ -87,7 +96,7 @@
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { MagicStick, Link, Monitor, DataLine, Cpu, Setting, ChatDotRound, UserFilled, ArrowDown } from '@element-plus/icons-vue'
+import { MagicStick, Link, Monitor, DataLine, Cpu, Setting, ChatDotRound, UserFilled, ArrowDown, Iphone } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -115,6 +124,7 @@ const handleNavigate = (type) => {
     'ai': '/ai-generation/requirement-analysis',
     'api': '/api-testing/dashboard',
     'ui': '/ui-automation/dashboard',
+    'app': '/app-automation/devices',
     'ai-intelligent': '/ai-intelligent-mode/testing',
     'assistant': '/ai-generation/assistant',
     'config': '/configuration/ai-model'
@@ -247,6 +257,11 @@ const handleNavigate = (type) => {
   &.ui-icon {
     background: #fdf6ec;
     color: #e6a23c;
+  }
+
+  &.app-icon {
+    background: #f0f5ff;
+    color: #2f54eb;
   }
 
   &.data-icon {

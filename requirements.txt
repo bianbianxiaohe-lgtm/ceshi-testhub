@@ -52,7 +52,7 @@ redis==5.0.1
 referencing==0.36.2
 requests==2.32.4
 rpds-py==0.26.0
-six==1.17.0
+six==1.16.0
 sniffio==1.3.1
 sqlparse==0.5.3
 typing_extensions==4.14.1
@@ -69,6 +69,26 @@ playwright>=1.40.0
 selenium==4.15.2
 webdriver-manager==4.0.1
 browser-use==0.10.1
+Appium-Python-Client>=4.0.0
+
+# 纯 Airtest 录制模式（直连设备 ADB，无需 Appium Server）
+airtest>=1.3.0
+pocoui>=1.0.85
+
+# 墨刀技能：向量存储（嵌入式，零新容器）+ 语义去重依赖
+chromadb>=0.5.0
+numpy>=1.26.0
 
 # JWT 安全机制
 djangorestframework-simplejwt==5.5.1
+
+# 移植应用依赖 (defects/data_factory/analytics/app_automation)
+channels==4.3.2
+daphne==4.2.2
+channels-redis==4.3.0
+fakerx==2.0.1
+Faker==40.31.0
+qrcode==8.2
+openpyxl==3.1.5
+loguru==0.7.3
+pyzbar==0.1.9

@@ -1,0 +1,45 @@
+/usr/local/lib/python3.12/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.7.0) or chardet (7.4.3)/charset_normalizer (3.4.2) doesn't match a supported version!
+  warnings.warn(
+============================================================
+用例: 4 月视图内通过月份选择器切换月份，渲染正确
+============================================================
+
+Step 1: action_type=click
+  description=1. 点击月份标题<br>2. 在弹出的月份选择器中选中3个月后的月份
+  input_value=
+  assert_type=
+  assert_value=
+  element id=5 name=1. 点击月份标题<br>2. 在弹出的月份选择器中选中3个月后的月份 locator=XPath=TODO_待补充控件定位器
+
+Step 2: action_type=assert
+  description=断言预期结果：1. 月视图跳转到目标月份，月份标题更新为“目标月份”<br>2. 日期网格内容与目标月份一致<br>3. 无原月份元素残留
+  input_value=
+  assert_type=textContains
+  assert_value=1. 月视图跳转到目标月份，月份标题更新为“目标月份”<br>2. 日期网格内容与目标月份一致<br>3. 无原月份元素残留
+  element id=6 name=断言_月视图内通过月份选择器切换月份，渲染正确 locator=XPath=TODO_待补充控件定位器
+
+Step 3: action_type=click
+  description=
+  input_value=
+  assert_type=textContains
+  assert_value=
+  element=None
+
+============================================================
+所有元素:
+  id=5 name=1. 点击月份标题<br>2. 在弹出的月份选择器中选中3个月后的月份 strategy=XPath value=TODO_待补充控件定位器
+  id=6 name=断言_月视图内通过月份选择器切换月份，渲染正确 strategy=XPath value=TODO_待补充控件定位器
+
+所有定位策略:
+  id=1 name=ID
+  id=2 name=CSS
+  id=3 name=XPath
+  id=4 name=name
+  id=5 name=class
+  id=6 name=tag
+  id=7 name=text
+  id=8 name=placeholder
+  id=9 name=role
+  id=10 name=label
+  id=11 name=title
+  id=12 name=test-id

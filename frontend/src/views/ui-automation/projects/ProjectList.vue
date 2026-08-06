@@ -41,6 +41,12 @@
             </el-link>
           </template>
         </el-table-column>
+        <el-table-column label="来源" width="100">
+          <template #default="{ row }">
+            <el-tag v-if="row.source === 'ai'" type="success" size="small">AI用例</el-tag>
+            <el-tag v-else type="primary" size="small">UI自动化</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="description" label="描述" min-width="300" show-overflow-tooltip />
         <el-table-column prop="status" label="状态" width="100">
           <template #default="{ row }">
@@ -57,11 +63,11 @@
               <el-icon><View /></el-icon>
               查看
             </el-button>
-            <el-button size="small" @click="editProject(row)">
+            <el-button size="small" :disabled="row.source === 'ai'" @click="editProject(row)">
               <el-icon><Edit /></el-icon>
               编辑
             </el-button>
-            <el-button size="small" type="danger" @click="deleteProject(row.id)">
+            <el-button size="small" type="danger" :disabled="row.source === 'ai'" @click="deleteProject(row.id)">
               <el-icon><Delete /></el-icon>
               删除
             </el-button>

@@ -4,7 +4,12 @@
       <h1 class="page-title">页面对象管理</h1>
       <div class="header-actions">
         <el-select v-model="projectId" placeholder="选择项目" style="width: 200px; margin-right: 15px" @change="onProjectChange">
-          <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
+          <el-option-group label="UI自动化项目">
+            <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
+          <el-option-group label="AI用例项目">
+            <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
         </el-select>
         <el-button type="primary" @click="showCreateDialog = true">
           <el-icon><Plus /></el-icon>
@@ -304,9 +309,9 @@ import {
   Plus, Search, Edit, Delete, Document,
   Operation, Folder, Warning
 } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 
 import {
-  getUiProjects,
   getPageObjects,
   createPageObject,
   updatePageObject,
@@ -320,8 +325,9 @@ import {
 } from '@/api/ui_automation'
 
 // 响应式数据
-const projects = ref([])
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
 const projectId = ref('')
+const realProjectId = ref(null)
 const pageObjects = ref([])
 const selectedPageObject = ref(null)
 const selectedCanvasElement = ref(null)
@@ -398,23 +404,17 @@ const filteredElements = computed(() => {
 
 // 方法定义
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    ElMessage.error('获取项目列表失败')
-    console.error('获取项目列表失败:', error)
-  }
+  await loadAllProjects()
 }
 
 const loadPageObjects = async () => {
-  if (!projectId.value) {
+  if (!realProjectId.value) {
     pageObjects.value = []
     return
   }
 
   try {
-    const response = await getPageObjects({ project: projectId.value })
+    const response = await getPageObjects({ project: realProjectId.value })
     pageObjects.value = response.data.results || response.data
   } catch (error) {
     console.error('获取页面对象列表失败:', error)
@@ -422,25 +422,26 @@ const loadPageObjects = async () => {
 }
 
 const loadAvailableElements = async () => {
-  if (!projectId.value) {
+  if (!realProjectId.value) {
     availableElements.value = []
     return
   }
 
   try {
-    const response = await getElements({ project: projectId.value })
+    const response = await getElements({ project: realProjectId.value })
     availableElements.value = response.data.results || response.data
   } catch (error) {
     console.error('获取可用元素失败:', error)
   }
 }
 
-const onProjectChange = () => {
+const onProjectChange = async () => {
   selectedPageObject.value = null
   selectedCanvasElement.value = null
   pageObjectElements.value = []
 
-  createForm.project = projectId.value
+  realProjectId.value = await resolveUiProjectId(projectId.value)
+  createForm.project = realProjectId.value
 
   loadPageObjects()
   loadAvailableElements()
@@ -721,8 +722,8 @@ const getElementTypeText = (type) => {
 onMounted(async () => {
   await loadProjects()
 
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
+  if (allProjects.value.length > 0) {
+    projectId.value = allProjects.value[0].id
     await onProjectChange()
   }
 })

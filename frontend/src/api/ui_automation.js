@@ -19,6 +19,34 @@ export function getUiProjects(params) {
   })
 }
 
+// 获取合并后的项目列表（UI自动化项目 + AI用例模块项目）
+export function getAllUiProjects() {
+  return request({
+    url: '/ui-automation/all-projects/',
+    method: 'get'
+  })
+}
+
+// 确保 AI项目有对应的 UiProject（自动创建映射）
+export function ensureUiProject(aiProjectId) {
+  return request({
+    url: '/ui-automation/ensure-ui-project/',
+    method: 'post',
+    data: { ai_project_id: aiProjectId }
+  })
+}
+
+// 导入 Airtest / Poco 录制脚本，解析为统一步骤并生成 TestCase
+// data 可传 { script, project_id, case_name, app_package }（JSON）
+// 或传 FormData（含 script_file 文件字段）以支持上传 .air/.py 文件
+export function importAirtestScript(data) {
+  return request({
+    url: '/ui-automation/airtest/import/',
+    method: 'post',
+    data
+  })
+}
+
 // 创建UI项目
 export function createUiProject(data) {
   return request({
@@ -719,6 +747,15 @@ export function getTestCaseExecutions(params) {
   })
 }
 
+// 获取单条执行记录的实时状态（用于异步执行轮询）
+export function getTestCaseExecution(id) {
+  return request({
+    url: `/ui-automation/test-case-executions/${id}/`,
+    method: 'get'
+  })
+}
+
+
 // 删除测试用例执行记录
 export function deleteTestCaseExecution(id) {
   return request({
@@ -997,6 +1034,24 @@ export function runAICase(id) {
   })
 }
 
+// 将用例库（apps.testcases.TestCase）中的用例批量导入为UI自动化AI用例，导入后可直接执行
+export function importTestcasesToAICase(data) {
+  return request({
+    url: '/ui-automation/ai-cases/import-from-testcases/',
+    method: 'post',
+    data
+  })
+}
+
+// 将用例库用例转换为 UI 自动化结构化用例（Appium App 自动化用），需指定目标 UI 自动化项目
+export function convertTestcasesToAppium(data) {
+  return request({
+    url: '/ui-automation/test-cases/convert-from-testcases/',
+    method: 'post',
+    data
+  })
+}
+
 // 获取 AI 执行记录列表
 export function getAIExecutionRecords(params) {
   return request({
@@ -1056,5 +1111,162 @@ export function exportAIExecutionReportPDF(id, params = {}) {
     method: 'get',
     params,
     responseType: 'blob'
+  })
+}
+
+// ==================== App 自动化相关API ====================
+
+// 获取设备列表
+export function getAppDevices(params) {
+  return request({
+    url: '/ui-automation/app-devices/',
+    method: 'get',
+    params
+  })
+}
+
+// 创建设备
+export function createAppDevice(data) {
+  return request({
+    url: '/ui-automation/app-devices/',
+    method: 'post',
+    data
+  })
+}
+
+// 获取设备详情
+export function getAppDeviceDetail(id) {
+  return request({
+    url: `/ui-automation/app-devices/${id}/`,
+    method: 'get'
+  })
+}
+
+// 更新设备
+export function updateAppDevice(id, data) {
+  return request({
+    url: `/ui-automation/app-devices/${id}/`,
+    method: 'patch',
+    data
+  })
+}
+
+// 删除设备
+export function deleteAppDevice(id) {
+  return request({
+    url: `/ui-automation/app-devices/${id}/`,
+    method: 'delete'
+  })
+}
+
+// 设备心跳上报
+export function deviceHeartbeat(id) {
+  return request({
+    url: `/ui-automation/app-devices/${id}/heartbeat/`,
+    method: 'post'
+  })
+}
+
+// 手动设置设备状态
+export function setDeviceStatus(id, status) {
+  return request({
+    url: `/ui-automation/app-devices/${id}/set_status/`,
+    method: 'post',
+    data: { status }
+  })
+}
+
+// 获取应用配置列表
+export function getAppConfigs(params) {
+  return request({
+    url: '/ui-automation/app-configs/',
+    method: 'get',
+    params
+  })
+}
+
+// 创建应用配置
+export function createAppConfig(data) {
+  return request({
+    url: '/ui-automation/app-configs/',
+    method: 'post',
+    data
+  })
+}
+
+// 获取应用配置详情
+export function getAppConfigDetail(id) {
+  return request({
+    url: `/ui-automation/app-configs/${id}/`,
+    method: 'get'
+  })
+}
+
+// 更新应用配置
+export function updateAppConfig(id, data) {
+  return request({
+    url: `/ui-automation/app-configs/${id}/`,
+    method: 'patch',
+    data
+  })
+}
+
+// 删除应用配置
+export function deleteAppConfig(id) {
+  return request({
+    url: `/ui-automation/app-configs/${id}/`,
+    method: 'delete'
+  })
+}
+
+// ==================== 页面元素探测 ====================
+
+export function dumpPageElements(data) {
+  return request({
+    url: '/ui-automation/learn-elements/',
+    method: 'post',
+    data
+  })
+}
+
+// ==================== 操作录制（自动生成用例） ====================
+
+export function startRecording(data) {
+  return request({
+    url: '/ui-automation/recording/start/',
+    method: 'post',
+    data
+  })
+}
+
+export function recordingPage(data) {
+  return request({
+    url: '/ui-automation/recording/page/',
+    method: 'post',
+    data
+  })
+}
+
+export function recordAction(data) {
+  return request({
+    url: '/ui-automation/recording/action/',
+    method: 'post',
+    data
+  })
+}
+
+export function stopRecording(data) {
+  return request({
+    url: '/ui-automation/recording/stop/',
+    method: 'post',
+    data
+  })
+}
+
+export function generateRecordingCase(data) {
+  return request({
+    url: '/ui-automation/recording/generate/',
+    method: 'post',
+    data
   })
 }

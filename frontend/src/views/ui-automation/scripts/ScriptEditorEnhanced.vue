@@ -4,7 +4,12 @@
       <h1 class="page-title">智能脚本生成</h1>
       <div class="header-actions">
         <el-select v-model="projectId" placeholder="选择项目" style="width: 200px; margin-right: 15px" @change="onProjectChange">
-          <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
+          <el-option-group label="UI自动化项目">
+            <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
+          <el-option-group label="AI用例项目">
+            <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+          </el-option-group>
         </el-select>
       </div>
     </div>
@@ -177,9 +182,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Search, Plus, View, Document, Check, Delete, Operation, Folder
 } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 
 import {
-  getUiProjects,
   createTestScript,
   getElementTree,
   getElementGroupTree,
@@ -187,8 +192,9 @@ import {
 } from '@/api/ui_automation'
 
 // 响应式数据
-const projects = ref([])
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
 const projectId = ref('')
+const realProjectId = ref(null)
 const scriptContent = ref('')
 const scriptLanguage = ref('python')
 const scriptFramework = ref('playwright')
@@ -209,17 +215,11 @@ const codeEditor = ref(null)
 
 // 方法定义
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects({ page_size: 100 })
-    projects.value = response.data.results || response.data
-  } catch (error) {
-    ElMessage.error('获取项目列表失败')
-    console.error('获取项目列表失败:', error)
-  }
+  await loadAllProjects()
 }
 
 const loadElementTree = async () => {
-  if (!projectId.value) {
+  if (!realProjectId.value) {
     elementTree.value = []
     return
   }
@@ -227,8 +227,8 @@ const loadElementTree = async () => {
   try {
     // 并行加载页面树和元素
     const [pageGroupResponse, elementsResponse] = await Promise.all([
-      getElementGroupTree({ project: projectId.value }),
-      getElementTree({ project: projectId.value })
+      getElementGroupTree({ project: realProjectId.value }),
+      getElementTree({ project: realProjectId.value })
     ])
 
     // 构建页面节点
@@ -325,7 +325,9 @@ const onProjectChange = async () => {
   executionLogs.value = []
   scriptContent.value = ''
 
+  realProjectId.value = await resolveUiProjectId(projectId.value)
   await loadElementTree()
+
 
   // 代码编辑器已更新(使用 textarea)
 }
@@ -436,7 +438,7 @@ const saveScript = async () => {
 
     await createTestScript({
       name: scriptName,
-      project: projectId.value,
+      project: realProjectId.value,
       script_type: 'CODE',
       content: scriptContent.value,
       language: scriptLanguage.value,
@@ -555,8 +557,8 @@ watch(scriptLanguage, (newLang) => {
 onMounted(async () => {
   await loadProjects()
 
-  if (projects.value.length > 0) {
-    projectId.value = projects.value[0].id
+  if (allProjects.value.length > 0) {
+    projectId.value = allProjects.value[0].id
     await onProjectChange()
   }
 

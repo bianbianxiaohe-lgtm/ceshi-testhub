@@ -9,6 +9,7 @@ import { useUserStore } from '@/stores/user'
 
 import App from './App.vue'
 import router from './router'
+import i18n from './locales'
 import './assets/css/global.scss'
 
 axios.defaults.xsrfCookieName = 'csrftoken';
@@ -34,6 +35,7 @@ async function init() {
   }
 
   app.use(router)
+  app.use(i18n)
   app.use(ElementPlus, {
     locale: zhCn,
   })

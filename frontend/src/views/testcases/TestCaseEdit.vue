@@ -100,8 +100,24 @@
                 filterable
                 @change="onFeatureModuleChange"
               >
+                <el-option-group v-if="featureModuleGroups.version.length" label="已关联选中版本">
+                  <el-option
+                    v-for="fm in featureModuleGroups.version"
+                    :key="fm.id"
+                    :label="fm.name"
+                    :value="fm.id"
+                  />
+                </el-option-group>
+                <el-option-group v-if="featureModuleGroups.unassociated.length" label="未关联版本">
+                  <el-option
+                    v-for="fm in featureModuleGroups.unassociated"
+                    :key="fm.id"
+                    :label="fm.name"
+                    :value="fm.id"
+                  />
+                </el-option-group>
                 <el-option
-                  v-for="fm in projectFeatureModules"
+                  v-for="fm in featureModuleGroups.all"
                   :key="fm.id"
                   :label="fm.name"
                   :value="fm.id"
@@ -177,7 +193,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '@/utils/api'
@@ -190,6 +206,22 @@ const submitting = ref(false)
 const projects = ref([])
 const projectVersions = ref([])
 const projectFeatureModules = ref([])
+// 功能模块下拉分组：已关联选中版本 + 未关联版本（多选版本时取并集）
+const featureModuleGroups = computed(() => {
+  const base = projectFeatureModules.value
+  const selectedVids = (form.version_ids || []).map(Number).filter(Boolean)
+  if (selectedVids.length) {
+    const versionMods = []
+    const unassociated = []
+    for (const fm of base) {
+      const versions = fm.versions || []
+      if (versions.some(v => selectedVids.includes(Number(v.id)))) versionMods.push(fm)
+      else if (versions.length === 0) unassociated.push(fm)
+    }
+    return { version: versionMods, unassociated, all: [] }
+  }
+  return { version: [], unassociated: [], all: base }
+})
 const projectTestPoints = ref([])
 
 const form = reactive({
@@ -368,7 +400,7 @@ const handleSubmit = async () => {
 
         await api.put(`/testcases/${route.params.id}/`, submitData)
         ElMessage.success('测试用例修改成功')
-        router.replace(`/ai-generation/testcases/${route.params.id}`)
+        router.replace({ path: `/ai-generation/testcases/${route.params.id}`, query: { ...route.query } })
       } catch (error) {
         ElMessage.error('测试用例修改失败')
         console.error('提交错误:', error)

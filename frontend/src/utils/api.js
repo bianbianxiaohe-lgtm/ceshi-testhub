@@ -166,6 +166,17 @@ api.interceptors.response.use(
       ElMessage.error(error.response.data.non_field_errors[0])
     } else if (error.response?.data?.detail) {
       ElMessage.error(error.response.data.detail)
+    } else if (error.response?.data?.message && typeof error.response.data.message === 'string') {
+      // 后端自定义格式 { success: false, message: "具体原因" }
+      ElMessage.error(error.response.data.message)
+    } else if (error.response?.data && typeof error.response.data === 'object') {
+      // 处理DRF字段级ValidationError（格式：{ "field_name": ["msg1", "msg2"] }）
+      const fieldErrors = Object.values(error.response.data)
+        .filter(v => typeof v === 'string' || (Array.isArray(v) && v.length > 0))
+        .flat()
+      if (fieldErrors.length > 0) {
+        ElMessage.error(fieldErrors[0])
+      }
     }
 
     return Promise.reject(error)

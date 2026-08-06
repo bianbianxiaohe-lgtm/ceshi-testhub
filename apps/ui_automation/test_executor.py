@@ -19,7 +19,7 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 
 from .models import (
     TestSuite, TestExecution, TestCase, TestCaseStep,
-    TestCaseExecution, Element
+    TestCaseExecution, Element, AppDevice, AppConfig
 )
 from .variable_resolver import resolve_variables
 
@@ -28,7 +28,8 @@ from .variable_resolver import resolve_variables
 class TestExecutor:
     """测试执行器基类"""
 
-    def __init__(self, test_suite, engine='playwright', browser='chrome', headless=False, executed_by=None):
+    def __init__(self, test_suite, engine='playwright', browser='chrome', headless=False, executed_by=None,
+                 device_id=None, app_config_id=None):
         self.test_suite = test_suite
         self.engine = engine
         self.browser = browser
@@ -37,6 +38,11 @@ class TestExecutor:
         self.execution = None
         self.test_cases = []
         self.results = []
+        # Appium 相关参数
+        self.device_id = device_id
+        self.app_config_id = app_config_id
+        self.app_device = None
+        self.app_config = None
 
     def create_execution_record(self):
         """创建测试执行记录"""
@@ -109,6 +115,8 @@ class TestExecutor:
             # 根据引擎选择执行方式
             if self.engine == 'playwright':
                 self.run_with_playwright()
+            elif self.engine == 'appium':
+                self.run_with_appium()
             else:
                 self.run_with_selenium()
 
@@ -1171,6 +1179,230 @@ class TestExecutor:
             print(f"   错误信息: {error_str[:500]}")  # 限制长度避免刷屏
 
         return step_result
+
+    def run_with_appium(self):
+        """使用 Appium 执行 App 自动化测试"""
+        start_time = time.time()
+        passed = 0
+        failed = 0
+        skipped = 0
+
+        # 加载设备配置
+        if self.device_id:
+            try:
+                self.app_device = AppDevice.objects.get(id=self.device_id)
+            except AppDevice.DoesNotExist:
+                error_msg = f"设备不存在 (ID: {self.device_id})"
+                self.update_execution_result('FAILED', error_msg=error_msg)
+                return
+
+        if self.app_config_id:
+            try:
+                self.app_config = AppConfig.objects.get(id=self.app_config_id)
+            except AppConfig.DoesNotExist:
+                error_msg = f"应用配置不存在 (ID: {self.app_config_id})"
+                self.update_execution_result('FAILED', error_msg=error_msg)
+                return
+
+        # 预先获取所有测试用例的步骤数据
+        test_cases_data = []
+        for test_case in self.test_cases:
+            case_data = {
+                'id': test_case.id,
+                'name': test_case.name,
+                'project_id': self.test_suite.project.id,
+                'steps': []
+            }
+
+            steps = test_case.steps.select_related('element', 'element__locator_strategy').order_by('step_number')
+            for step in steps:
+                step_data = {
+                    'id': step.id,
+                    'step_number': step.step_number,
+                    'action_type': step.action_type,
+                    'description': step.description,
+                    'input_value': step.input_value,
+                    'wait_time': step.wait_time,
+                    'assert_type': step.assert_type,
+                    'assert_value': step.assert_value,
+                    'element': None
+                }
+
+                if step.element:
+                    step_data['element'] = {
+                        'id': step.element.id,
+                        'name': step.element.name,
+                        'locator_value': step.element.locator_value,
+                        'locator_strategy': step.element.locator_strategy.name if step.element.locator_strategy else 'xpath',
+                        'center_x': step.center_x,
+                        'center_y': step.center_y,
+                    }
+
+                case_data['steps'].append(step_data)
+
+            test_cases_data.append(case_data)
+
+        # 预先创建用例执行记录
+        case_executions = {}
+        for case_data in test_cases_data:
+            case_execution = TestCaseExecution.objects.create(
+                test_case_id=case_data['id'],
+                project_id=case_data['project_id'],
+                test_suite=self.test_suite,
+                execution_source='suite',
+                status='pending',
+                engine=self.engine,
+                browser=self.browser,
+                headless=self.headless,
+                created_by=self.executed_by
+            )
+            case_executions[case_data['id']] = case_execution
+
+        # 初始化 Appium 引擎
+        from .appium_engine import AppiumTestEngine
+        appium_engine = None
+
+        try:
+            # 构建设备连接参数
+            device_config = {}
+            if self.app_device:
+                device_config['device_udid'] = self.app_device.udid
+                device_config['platform'] = self.app_device.platform
+                device_config['appium_server_url'] = self.app_device.appium_server_url
+                # 合并额外 capabilities
+                if self.app_device.capabilities:
+                    device_config.update(self.app_device.capabilities)
+
+            if self.app_config:
+                device_config['app_package'] = self.app_config.package_name
+                device_config['app_activity'] = self.app_config.app_activity
+                if self.app_config.app_path:
+                    device_config['app_path'] = self.app_config.app_path
+
+            # 连接设备
+            appium_engine = AppiumTestEngine(**device_config)
+            appium_engine.connect()
+            print(f"✓ Appium 引擎已连接: {appium_engine.get_device_info()}")
+
+            # 更新执行记录 - 标记引擎类型
+            self.execution.engine = 'appium'
+            self.execution.browser = device_config.get('platform', 'android')
+            self.execution.save()
+
+        except Exception as e:
+            error_msg = f"Appium 连接失败: {str(e)}"
+            print(f"✗ {error_msg}")
+            for case_data in test_cases_data:
+                self.results.append({
+                    'test_case_id': case_data['id'],
+                    'test_case_name': case_data['name'],
+                    'status': 'failed',
+                    'steps': [],
+                    'error': error_msg,
+                    'start_time': datetime.now().isoformat(),
+                    'end_time': datetime.now().isoformat(),
+                    'screenshots': []
+                })
+                failed += 1
+                ce = case_executions[case_data['id']]
+                ce.status = 'failed'
+                ce.error_message = error_msg
+                ce.finished_at = timezone.now()
+                ce.save()
+
+            self.update_execution_result('FAILED', 0, len(test_cases_data), 0, 0, error_msg)
+            return
+
+        # 执行每个测试用例
+        print(f"\n准备执行 {len(test_cases_data)} 个 App 测试用例")
+        try:
+            for i, case_data in enumerate(test_cases_data, 1):
+                print(f"\n{'='*60}")
+                print(f"正在执行第 {i}/{len(test_cases_data)} 个用例: {case_data['name']}")
+                print(f"{'='*60}")
+
+                case_execution = case_executions[case_data['id']]
+                case_execution.started_at = timezone.now()
+                case_execution.status = 'running'
+                case_execution.save()
+
+                case_result = {
+                    'test_case_id': case_data['id'],
+                    'test_case_name': case_data['name'],
+                    'status': 'passed',
+                    'steps': [],
+                    'error': None,
+                    'start_time': datetime.now().isoformat(),
+                    'screenshots': []
+                }
+
+                try:
+                    for step_data in case_data['steps']:
+                        step_result = appium_engine.execute_step(step_data)
+                        case_result['steps'].append(step_result)
+
+                        if not step_result['success']:
+                            case_result['status'] = 'failed'
+                            case_result['error'] = step_result.get('error',
+                                f"步骤 {step_data['step_number']} 执行失败")
+                            if step_result.get('screenshot'):
+                                case_result['screenshots'].append({
+                                    'url': step_result['screenshot'],
+                                    'description': f"步骤 {step_data['step_number']} 失败截图",
+                                    'step_number': step_data['step_number'],
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                            break
+
+                        # 步骤间短暂等待，确保 App 状态稳定
+                        time.sleep(0.3)
+
+                except Exception as e:
+                    case_result['status'] = 'failed'
+                    case_result['error'] = f"用例执行异常: {str(e)}"
+                    # 尝试捕获异常截图
+                    try:
+                        screenshot_base64 = appium_engine.driver.get_screenshot_as_base64()
+                        case_result['screenshots'].append({
+                            'url': f'data:image/png;base64,{screenshot_base64}',
+                            'description': f"异常截图: {str(e)}",
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    except:
+                        pass
+
+                case_result['end_time'] = datetime.now().isoformat()
+                self.results.append(case_result)
+
+                # 更新用例执行记录
+                case_execution.status = case_result['status']
+                case_execution.finished_at = timezone.now()
+                if case_execution.started_at:
+                    case_execution.execution_time = (
+                        case_execution.finished_at - case_execution.started_at
+                    ).total_seconds()
+                case_execution.execution_logs = json.dumps(case_result['steps'], ensure_ascii=False)
+                if case_result['error']:
+                    case_execution.error_message = case_result['error']
+                if case_result.get('screenshots'):
+                    case_execution.screenshots = case_result['screenshots']
+                case_execution.save()
+
+                if case_result['status'] == 'passed':
+                    passed += 1
+                    print(f"✓ 用例通过")
+                else:
+                    failed += 1
+                    print(f"✗ 用例失败: {case_result['error']}")
+
+        finally:
+            # 断开设备连接
+            if appium_engine:
+                appium_engine.disconnect()
+
+        duration = time.time() - start_time
+        status = 'SUCCESS' if failed == 0 else 'FAILED'
+        self.update_execution_result(status, passed, failed, skipped, duration)
 
     def run_with_selenium(self):
         """使用 Selenium 执行测试"""

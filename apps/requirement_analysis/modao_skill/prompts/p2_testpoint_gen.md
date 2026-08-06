@@ -1,0 +1,110 @@
+# Prompt P2: 测试点生成
+
+> **使用位置**：阶段3 Step 3.3
+> **输入**：单个模块的拆分信息（YAML）
+> **输出**：测试点清单（YAML）
+
+---
+
+## 🎯 角色
+
+你是一名 APP 端测试用例设计专家，需要为一个模块设计完整的测试点。
+
+## 📋 任务
+
+为以下模块生成 **全面的测试点**（test point），后续将基于这些测试点生成测试用例。
+
+## 🛡️ 硬约束
+
+1. **覆盖完整**：功能 + 边界 + 异常 + UI + 兼容（5 类都要有）
+2. **粒度适中**：1 个测试点 = 1 个可独立验证的检查项
+3. **可判定**：每个测试点都有明确的 Pass/Fail 标准
+4. **标注冒烟候选**：按"入口可达性 + 核心展示"原则标注
+5. **优先级合理**：P0/P1/P2 比例建议为 20%/50%/30%
+6. **🚫 严禁泛化**：测试点必须可追溯到模块的具体功能场景，但**不限于 features 列表**。除了 features 列出的新增/变更功能外，还要覆盖：① 该模块修改后可能影响的老功能回归验证；② 与本模块有交互的相邻模块联动场景（如切换模板影响分享/预览/贴纸展示）；③ 数据迁移/兼容性（老数据在新逻辑下的表现）。禁止生成与本模块完全无关的系统级通用模板（如"需求文档核查""输入框边界矩阵""多账号隔离"等脱离具体场景的套话）。
+
+## 📝 输出格式（YAML）
+6. **决策表逐行覆盖**：每个decision_table原始row至少被一个测试点引用
+7. **组合覆盖**：validation.expanded_rows中的对称展开组合也必须覆盖，可合并但不得静默遗漏
+8. **冲突不裁决**：重复组合结果冲突、shape_valid=false或rules_traceable=false时生成阻塞测试点并转PCI确认
+9. **可追溯**：矩阵测试点必须填写decision_table_ref、source_rows和covered_combinations
+10. **单元格为准**：测试条件和预期结果必须来自rows，不得根据derived_rules自行改写结果
+11. **状态逐项覆盖**：state_matrix中的每个state至少生成一个展示测试点；每个transition至少生成一个转换测试点
+12. **类型专项覆盖**：pricing_matrix覆盖套餐/价格/周期，permission_matrix覆盖每个角色平台组合，timeline覆盖每个时间边界，interaction_flow覆盖每一步和分支
+13. **未知结构阻塞**：unknown或structure_valid=false必须生成待确认测试点，不得自行补全业务规则
+
+## YAML schema
+
+```yaml
+module: <模块名>
+test_points:
+  - id: TP_<module>_001
+    title: <测试点标题，简洁明确>
+    type: 功能/边界/异常/UI/兼容/权限/性能  (必填，不得为空或"?"，必须7选1)
+    category: main_flow/branch_flow/boundary/exception/permission/UI/performance
+    priority: P0/P1/P2
+    description: |
+      <详细描述测试点要验证什么>
+    is_smoke_candidate: true/false
+    smoke_reason: |
+      <为什么是/不是冒烟候选，引用判定规则>
+    pass_criteria: |
+      <明确的 Pass 标准>
+    decision_table_ref: <source_artifact_id; empty only for non-matrix test points>
+    source_rows: [<original row numbers>]
+    covered_combinations:
+      - <complete input combination and expected results>
+    visual_evidence: <copy screenshot evidence without rewriting it>
+    visual_structure_ref: <artifact_id; empty only for non-visual test points>
+    source_states: [<state names>]
+    source_transitions: [<transition indexes>]
+    source_elements: [<element ids>]
+```
+
+## 🔍 冒烟候选判定规则
+| 满足以下任一条件 → `is_smoke_candidate: true` | 满足以下任一条件 → `is_smoke_candidate: false` |
+|------|------|
+| 涉及页面入口（首次打开、跳转） | 涉及异常场景（无权限/为空/超时/断网） |
+| 涉及核心数据加载展示 | 涉及删除/禁用/重置类操作 |
+| 涉及核心操作（提交/查询/导出/支付） | 涉及次要字段验证 |
+| 涉及主流程关键节点 | 涉及 UI 细节（颜色/字号/间距） |
+| | 涉及边界值（最大/最小/空字符串） |
+| | 涉及兼容性（多机型/多系统） |
+
+## 🎯 优先级判定
+
+- **P0**：核心业务主流程、关键入口、影响营收/合规/安全
+- **P1**：常用功能、影响体验但不阻塞主流程
+- **P2**：UI 优化、提示文案、边角功能
+
+## 💡 设计技巧
+
+1. **正向 + 反向**：每个功能点都要考虑正常路径和异常路径
+2. **数据多样性**：考虑空数据、单条数据、批量数据、特殊字符
+3. **状态机**：考虑各种状态之间的转换
+4. **权限矩阵**：考虑不同角色/不同登录态下的行为
+5. **中断场景**：考虑来电/锁屏/低电量/网络切换等中断
+6. **category 必填**：每个测试点必须填写 `category` 字段，取值按下表映射：
+
+| category | 适用场景 |
+|----------|---------|
+| `main_flow` | 核心业务主流程（每个 P0 模块至少 1 条，第 1 个 P0 测试点必须为 main_flow） |
+| `branch_flow` | 分支流程、可选路径、不同配置下的行为 |
+| `boundary` | 边界值测试（最大值/最小值/空值/特殊字符） |
+| `exception` | 异常场景（网络异常、超时、权限不足、数据异常） |
+| `permission` | 权限/角色/登录态相关 |
+| `UI` | UI 展示、交互响应、动效、适配 |
+| `performance` | 性能相关（加载速度、资源占用） |
+
+## 🚫 禁止
+
+- ❌ 生成 1-2 个测试点就结束
+- ❌ 所有测试点都是 P0
+- ❌ 冒烟候选全是 true（应控制在 10-15%）
+- ❌ 测试点描述模糊（"测试一下 XX 功能"）
+
+## 📥 输入
+
+{module_info_yaml}
+
+## 📤 输出（直接输出 YAML）

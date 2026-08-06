@@ -134,15 +134,18 @@
 
             <div class="form-group">
               <label>角色 <span class="required">*</span></label>
-              <select 
-                v-model="configForm.role" 
-                class="form-select" 
+              <select
+                v-model="configForm.role"
+                class="form-select"
                 required
                 @change="console.log('Role changed to:', configForm.role)">
                 <option value="">请选择角色</option>
+                <option value="analyzer">需求分析专家（结构化/澄清/拆分/测试点/风险/PCI/合并/冒烟）</option>
                 <option value="writer">测试用例编写专家</option>
-                <option value="writer_vision">视觉识别专家（图片型PDF）</option>
+                <option value="writer_vision">视觉识别专家（画布截图 OCR）</option>
+                <option value="writer_vision_ocr">OCR 专用视觉模型（可选，留空回退到 writer_vision）</option>
                 <option value="reviewer">测试评审专家</option>
+                <option value="embedder">文本向量化专家（去重 / 知识库检索）</option>
               </select>
             </div>
 

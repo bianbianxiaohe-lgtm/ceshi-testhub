@@ -1,0 +1,1 @@
+ALTER TABLE app_configs ADD COLUMN version VARCHAR(50) DEFAULT NULL;

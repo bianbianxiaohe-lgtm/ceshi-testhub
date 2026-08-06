@@ -5,12 +5,12 @@
       <div class="sidebar">
         <div class="sidebar-header">
           <el-select v-model="selectedProject" placeholder="选择项目" @change="onProjectChange">
-            <el-option
-              v-for="project in projects"
-              :key="project.id"
-              :label="project.name"
-              :value="project.id"
-            />
+            <el-option-group label="UI自动化项目">
+              <el-option v-for="project in uiProjects" :key="project.id" :label="project.name" :value="project.id" />
+            </el-option-group>
+            <el-option-group label="AI用例项目">
+              <el-option v-for="project in aiProjects" :key="project.id" :label="project.name" :value="project.id" />
+            </el-option-group>
           </el-select>
           <div class="header-actions">
             <el-button type="primary" size="small" @click="showCreatePageDialog = true" title="创建页面">
@@ -264,8 +264,8 @@ import {
   Plus, FolderAdd, Document, Search, Edit, Delete,
   Folder, Document as DocumentIcon, Operation, DocumentCopy, ArrowDown
 } from '@element-plus/icons-vue'
+import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 import {
-  getUiProjects,
   getElements,
   createElement,
   getElementDetail,
@@ -283,8 +283,9 @@ import {
 } from '@/api/ui_automation'
 
 // 响应式数据
-const projects = ref([])
+const { allProjects, uiProjects, aiProjects, loadProjects: loadAllProjects, resolveUiProjectId } = useUnifiedProjects()
 const selectedProject = ref('')
+const realProjectId = ref(null)
 const pages = ref([])
 const locatorStrategies = ref([])
 const treeData = ref([])
@@ -418,24 +419,19 @@ onMounted(async () => {
   await loadProjects()
   await loadLocatorStrategies()
 
-  console.log('项目数量:', projects.value.length)
+  console.log('项目数量:', allProjects.value.length)
   console.log('定位策略:', locatorStrategies.value.length)
 
-  if (projects.value.length > 0) {
-    console.log('设置初始项目为:', projects.value[0].id)
-    selectedProject.value = projects.value[0].id
+  if (allProjects.value.length > 0) {
+    console.log('设置初始项目为:', allProjects.value[0].id)
+    selectedProject.value = allProjects.value[0].id
     await onProjectChange()
   }
 })
 
 // 加载项目列表
 const loadProjects = async () => {
-  try {
-    const response = await getUiProjects()
-    projects.value = response.data?.results || response.data || []
-  } catch (error) {
-    console.error('获取项目列表失败:', error)
-  }
+  await loadAllProjects()
 }
 
 // 提供控制台调试帮助函数
@@ -484,10 +480,10 @@ const loadLocatorStrategies = async () => {
 
 // 加载页面（分组）
 const loadPages = async () => {
-  if (!selectedProject.value) return
+  if (!realProjectId.value) return
 
   try {
-    const response = await getElementGroups({ project: selectedProject.value })
+    const response = await getElementGroups({ project: realProjectId.value })
     pages.value = response.data?.results || response.data || []
   } catch (error) {
     console.error('获取页面失败:', error)
@@ -496,10 +492,10 @@ const loadPages = async () => {
 
 // 加载页面树结构
 const loadPageTree = async () => {
-  if (!selectedProject.value) return
+  if (!realProjectId.value) return
 
   try {
-    const response = await getElementGroupTree({ project: selectedProject.value })
+    const response = await getElementGroupTree({ project: realProjectId.value })
     // 构建完整的树形结构
     const buildTree = (groups) => {
       return groups.map(group => ({
@@ -518,7 +514,7 @@ const loadPageTree = async () => {
 
 // 加载元素树
 const loadElementTree = async () => {
-  if (!selectedProject.value) {
+  if (!realProjectId.value) {
     treeData.value = []
     return
   }
@@ -526,8 +522,8 @@ const loadElementTree = async () => {
   try {
     // 并行加载页面树和元素
     const [pageTreeResponse, elementsResponse] = await Promise.all([
-      getElementGroupTree({ project: selectedProject.value }),
-      getElementTree({ project: selectedProject.value })
+      getElementGroupTree({ project: realProjectId.value }),
+      getElementTree({ project: realProjectId.value })
     ])
 
     // 构建完整的树形结构
@@ -592,8 +588,9 @@ const onProjectChange = async () => {
   selectedElement.value = null
   suggestions.value = []
 
+  realProjectId.value = await resolveUiProjectId(selectedProject.value)
   console.log('=== 项目切换调试 ===')
-  console.log('当前项目ID:', selectedProject.value)
+  console.log('当前项目ID:', selectedProject.value, '实际ID:', realProjectId.value)
 
   await Promise.all([
     loadPages(),
@@ -640,7 +637,7 @@ const createPage = async () => {
     const pageData = {
       name: pageForm.name,
       description: pageForm.description,
-      project: selectedProject.value
+      project: realProjectId.value
     }
 
     // 只有当父页面ID存在且不为空时才添加parent_group字段
@@ -759,7 +756,7 @@ const saveElement = async () => {
         locator_value: selectedElement.value.locator_value,
         wait_timeout: selectedElement.value.wait_timeout,
         force_action: selectedElement.value.force_action,
-        project_id: selectedProject.value
+        project_id: realProjectId.value
       }
 
       // 如果元素有分组（页面），确保传递正确的 group_id
@@ -813,7 +810,7 @@ const saveElement = async () => {
       // 确保传递正确的字段名 project_id 而不是 project
       const elementData = {
         ...selectedElement.value,
-        project_id: selectedProject.value
+        project_id: realProjectId.value
       }
 
       // 如果元素有分组（页面），确保传递 group_id
@@ -1106,7 +1103,7 @@ const updatePage = async () => {
     const pageData = {
       name: editPageForm.name,
       description: editPageForm.description,
-      project: selectedProject.value
+      project: realProjectId.value
     }
 
     // 只有当父页面ID存在且不为空时才添加parent_group字段
