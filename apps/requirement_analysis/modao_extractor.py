@@ -21,10 +21,36 @@ import base64
 import hashlib
 import logging
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 from urllib.parse import urljoin, quote
 
 logger = logging.getLogger(__name__)
+
+# 并发视觉 OCR 的最大并行路数（受信号量限制）。
+OCR_CONCURRENCY = 8
+
+# OCR 缓存目录（按截图 sha256 文件名存储 JSON 结果，避免同一截图重复调用视觉模型）
+OCR_CACHE_DIR = os.path.join(os.environ.get('MEDIA_ROOT', 'media'), 'modao', '_ocr_cache')
+
+# 墨刀自适应 OCR 分类阈值：
+#   dom_text 超过此字符数且不含表格/大量图片时，跳过视觉 OCR（直接复用 DOM 文本）
+OCR_SKIP_DOM_TEXT_MIN = 400
+#   dom_text 超过此字符数时，即使有少量图片也跳过 OCR（DOM 信息已足够）
+OCR_SKIP_DOM_TEXT_RICH = 800
+
+# 用户手动终止信号：后台阶段任务在检查点轮询此标记，命中即中断。
+from apps.requirement_analysis.cancel_flags import TERMINATE_REQUESTED
+
+
+class ModaoTerminateError(Exception):
+    """用户在前端手动终止任务时抛出，被阶段线程捕获后写 status=failed。"""
+
+
+def _raise_if_terminated(prototype_id):
+    if prototype_id and TERMINATE_REQUESTED.get(prototype_id):
+        raise ModaoTerminateError(f'用户手动终止任务(id={prototype_id})')
+
 
 # 页面树常见选择器（按优先级尝试；命中其一即认为找到页面列表）。
 # 既兼容墨刀，也尽量覆盖 webshare / 通用原型 SPA 的左侧页面树（best-effort）。
@@ -159,6 +185,8 @@ class ModaoExtractor:
         source_type: str = 'modao',
         dual_fusion: bool = False,
         fusion_config=None,
+        ocr_vision_config=None,
+        prototype_id=None,
     ) -> Dict[str, Any]:
         """
         逐页提取墨刀原型需求内容。
@@ -171,6 +199,7 @@ class ModaoExtractor:
               'warnings': [...]
             }
         """
+        ocr_vision_config = ocr_vision_config or vision_config
         from playwright.async_api import async_playwright
 
         warnings: List[str] = []
@@ -215,8 +244,13 @@ class ModaoExtractor:
                 warnings.append('未识别到页面树，将把当前单页作为唯一页面提取')
                 page_items = [None]  # 单页模式
 
+            ocr_jobs: List[Dict[str, Any]] = []
+            _tlog_path = os.path.join(self.shot_dir, '_timing.log')
+            _nav_t0 = time.time()
+            _nav_count = 0
             for idx, item in enumerate(page_items[:max_pages], start=1):
                 try:
+                    _nav_count += 1
                     extraction_warnings: List[str] = []
                     page_name = f'第{idx}页'
                     if item is not None:
@@ -243,12 +277,16 @@ class ModaoExtractor:
 
                     dom_text = await self._extract_visible_text(page, retry=dual_fusion)
                     annotations = await self._extract_annotations(page, warnings)
-                    shot_path = os.path.join(self.shot_dir, f'page_{idx}.png')
+                    shot_path = os.path.join(self.shot_dir, f'page_{idx}.jpg')
                     try:
-                        await page.screenshot(path=shot_path, full_page=False)
+                        # 精准截图：裁剪到设备画布(rResCanvas) + 周边缓冲，提升画布内图片/插画 OCR 分辨率
+                        shot_path = await self._screenshot_canvas_roi(page, shot_path)
                     except Exception as e:
-                        shot_path = ''
-                        warnings.append(f'第{idx}页截图失败: {e}')
+                        try:
+                            await page.screenshot(path=shot_path, full_page=False, type='jpeg', quality=85)
+                        except Exception:
+                            shot_path = ''
+                            warnings.append(f'第{idx}页截图失败: {e}')
 
                     # 视觉 OCR 补充（按页面情况自动切换）：
                     # - 墨刀(modao)：画布用 canvas/SVG 渲染，文字/图片/表格根本不进入 DOM 文本，
@@ -257,50 +295,63 @@ class ModaoExtractor:
                     #   （文字段落 + 图片 + 表格）都识别出来，与左侧导航 DOM 文本合并。
                     # - 其他源(webshare 等)：沿用『文本<30字 或 页面含图片/表格』判定，
                     #   纯文本无图无表的页面不触发，避免无谓的视觉模型开销。
-                    vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                    # 性能优化：OCR 不在循环内串行调用，改为收集任务、循环结束后并发批量识别
+                    # （见 _run_ocr_batch），把 N 次串行视觉模型调用压成 ≈ N/OCR_CONCURRENCY 并行调用。
                     if source_type == 'modao':
+                        # 自适应 OCR 分类器：根据 DOM 特征判断是否需要视觉 OCR
                         need_vision = bool(shot_path and os.path.exists(shot_path))
+                        if need_vision:
+                            dom_len = len((dom_text or '').strip())
+                            has_img = await page.locator('img').count() > 2
+                            has_canvas = await page.locator('canvas').count() > 0
+                            has_svg = await page.locator('svg').count() > 10
+                            visual_heavy = has_img or has_canvas or has_svg
+
+                            if dom_len >= OCR_SKIP_DOM_TEXT_RICH:
+                                need_vision = False
+                                extraction_warnings.append(
+                                    f'DOM文字充足({dom_len}字)，跳过视觉OCR')
+                            elif dom_len >= OCR_SKIP_DOM_TEXT_MIN and not visual_heavy:
+                                need_vision = False
+                                extraction_warnings.append(
+                                    f'DOM文字足够({dom_len}字)且无大量视觉元素，跳过视觉OCR')
+                            # 其他情况：文字少或有大量 svg/canvas → 保持 need_vision=True
+                            # 跳过 OCR 时也标记为 vision_attempted=True，避免覆盖率检查误报
+                            if not need_vision:
+                                vision_skipped_by_classifier = True
+                            else:
+                                vision_skipped_by_classifier = False
                     else:
                         has_visual = await self._page_has_visual(page)
                         need_vision = len((dom_text or '').strip()) < 30 or has_visual
-                    vision_text = ''
                     vision_attempted = bool(
                         vision_config and shot_path and os.path.exists(shot_path) and need_vision
                     )
-                    if vision_config and shot_path and os.path.exists(shot_path) and need_vision:
-                        vision_result = await self._ocr_screenshot(vision_config, shot_path)
-                        vision_text = vision_result.get('ocr_text', '')
-                    vision_success = bool(
-                        vision_text
-                        or vision_result.get('visual_summary')
-                        or vision_result.get('visual_artifacts')
-                    )
-                    if vision_attempted and not vision_success:
-                        extraction_warnings.append('视觉识别未返回有效内容')
-                    # 兼容字段：DOM 文本 + 视觉 OCR 合并，维持 run_struct 既有消费方式
-                    text = (dom_text or '')
-                    if vision_text:
-                        text = text + '\n[视觉OCR补充]\n' + vision_text
-                    # 双路融合策略：DOM 路径与视觉路径作为独立输入分开保留
-                    page_vision_text = vision_text or ''
-                    if vision_result.get('visual_summary'):
-                        page_vision_text = (page_vision_text + '\n' + vision_result['visual_summary']).strip()
+                    # 分类器主动跳过 OCR 时也标记为已尝试+已成功（DOM文字足够，无需视觉识别）
+                    if not need_vision and shot_path and os.path.exists(shot_path):
+                        vision_attempted = True
+                        vision_skipped_by_classifier = True
 
                     pages.append({
                         'page_no': idx,
                         'page_name': page_name,
-                        'text': text,
+                        'text': dom_text,
                         'dom_text': dom_text,
-                        'vision_text': page_vision_text,
+                        'vision_text': '',
                         'dom_text_len': len(dom_text or ''),
                         'vision_attempted': vision_attempted,
-                        'vision_success': vision_success,
+                        'vision_success': False,
+                        'shot_path': shot_path,
                         'annotations': annotations,
                         'screenshot': os.path.relpath(shot_path, self.media_root) if shot_path else '',
-                        'visual_summary': vision_result.get('visual_summary', ''),
-                        'visual_artifacts': vision_result.get('visual_artifacts', []),
+                        'visual_summary': '',
+                        'visual_artifacts': [],
                         'extraction_warnings': extraction_warnings,
                     })
+                    if vision_attempted:
+                        ocr_jobs.append(pages[-1])
+                    # 手动终止检查点：用户在前端点「终止」后退出逐页读取
+                    _raise_if_terminated(prototype_id)
                 except Exception as e:
                     warnings.append(f'第{idx}页提取异常: {e}')
                     pages.append({
@@ -313,6 +364,30 @@ class ModaoExtractor:
                         'visual_summary': '',
                         'visual_artifacts': [],
                     })
+
+            # 并发批量视觉 OCR（核心提速点）：把每页串行的视觉模型调用改为限流并发，
+            # 整体耗时 ≈ 单页 OCR 耗时 × (页数 / OCR_CONCURRENCY)。
+            _nav_elapsed = time.time() - _nav_t0
+            with open(_tlog_path, 'a') as _tf:
+                _tf.write(f'[TIMING] 导航+截图循环: {_nav_count}页 耗时 {_nav_elapsed:.1f}s ({(_nav_elapsed/max(_nav_count,1)):.2f}s/页)\n')
+            _debug_path = os.path.join(self.shot_dir, '_ocr_debug.log')
+            _ocr_cfg_name = getattr(ocr_vision_config, 'model_name', '?') if ocr_vision_config else None
+            _dbg = f'[EXTRACT] ocr_jobs={len(ocr_jobs)} ocr_model={_ocr_cfg_name} type(ocr)={type(ocr_vision_config).__name__}\n'
+            print(_dbg, flush=True)
+            with open(_debug_path, 'a') as _df: _df.write(_dbg)
+            _ocr_t0 = time.time()
+            if ocr_jobs and ocr_vision_config:
+                await self._run_ocr_batch(ocr_jobs, ocr_vision_config, warnings, prototype_id)
+            else:
+                _dbg2 = f'[EXTRACT] OCR SKIPPED! jobs={len(ocr_jobs)} config={ocr_vision_config}\n'
+                print(_dbg2, flush=True)
+                with open(_debug_path, 'a') as _df: _df.write(_dbg2)
+            _ocr_elapsed = time.time() - _ocr_t0
+            with open(_tlog_path, 'a') as _tf:
+                _tf.write(f'[TIMING] 视觉OCR并发批次: {len(ocr_jobs)}页 耗时 {_ocr_elapsed:.1f}s ({(_ocr_elapsed/max(len(ocr_jobs),1)):.2f}s/页)\n')
+            # 清理内部临时字段（_run_ocr_batch 已对参与 OCR 的页面 pop，这里兜底全部页面）
+            for p in pages:
+                p.pop('shot_path', None)
 
             duplicate_groups = self._mark_duplicate_screenshots(pages)
             if duplicate_groups:
@@ -328,7 +403,7 @@ class ModaoExtractor:
         fused_requirements: List[Dict[str, Any]] = []
         if dual_fusion and fusion_config:
             try:
-                fused_requirements = await self.dual_fusion_requirements(pages, fusion_config)
+                fused_requirements = await self.dual_fusion_requirements(pages, fusion_config, prototype_id)
             except Exception as e:
                 logger.warning(f'双路融合失败（已跳过，保留分路径数据）: {e}')
                 warnings.append(f'双路融合失败（已跳过）: {e}')
@@ -369,6 +444,19 @@ class ModaoExtractor:
         kwargs.setdefault('fusion_config', None)
         source_type = kwargs.get('source_type', 'modao')
         url = kwargs.get('url')
+        # 墨刀 sharing 链接若带 screen= 单画布参数，会锁定到单个画布、页面树不展开，
+        # 导致只读到 1 页而非完整原型的全部画布。剥离该参数，加载显示完整页面树的根视图，
+        # 使 _enumerate_pages 能自动发现目录下所有子页面。
+        if url and 'modao.cc' in url and 'screen=' in url:
+            try:
+                from urllib.parse import urlparse, parse_qs, urlencode
+                _pu = urlparse(url)
+                _qs = parse_qs(_pu.query, keep_blank_values=True)
+                _qs.pop('screen', None)
+                url = _pu._replace(query=urlencode(_qs, doseq=True)).geturl()
+                kwargs['url'] = url
+            except Exception:
+                pass
         # 自动识别：墨刀来源但 URL 实为 Axure/webshare 原型时，自动走多页解析
         if source_type != 'webshare' and url:
             import logging
@@ -744,6 +832,56 @@ class ModaoExtractor:
             warnings.append(f'展开评论面板失败（可忽略）: {e}')
         return results
 
+    async def _screenshot_canvas_roi(self, page, shot_path: str) -> str:
+        """裁剪到设备画布(rResCanvas <img>) + 周边缓冲后截图，提升画布内图片/插画 OCR 分辨率。
+
+        墨刀 read_only 视图把原型画布渲染为 class 含 'rResCanvas' 的 <img> 元素；整 viewport
+        截图时该画布仅占很小比例（常 <20% 宽），导致画布内卡通/插画等图片内容经视觉 OCR 返回空。
+        裁剪到画布矩形 + 缓冲（含周围便签）后，画布在截图中的占比大幅提升，OCR 才能识别。
+        找不到画布元素或矩形异常时，回退整 viewport 截图（由调用方兜底）。
+        """
+        import math
+        BUF = 140
+        box = await page.evaluate("""() => {
+            // 一个画布页面可能存在多个 rResCanvas（主屏 + 缩略图/隐藏副本），
+            // 取面积最大的可见元素，避免命中 0 尺寸的隐藏副本导致裁剪失效。
+            const els = Array.from(document.querySelectorAll('[class*="rResCanvas"]'));
+            let best = null, bestArea = 0;
+            for (const el of els) {
+                const r = el.getBoundingClientRect();
+                if (!r || r.width < 5 || r.height < 5) continue;
+                const area = r.width * r.height;
+                if (area > bestArea) { bestArea = area; best = [r.x, r.y, r.width, r.height]; }
+            }
+            return best;
+        }""")
+        if not box:
+            await page.screenshot(path=shot_path, full_page=False, type='jpeg', quality=85)
+            return shot_path
+        x, y, w, h = box
+        vw, vh = 1440, 900
+        try:
+            vp = await page.viewport_size()
+            if vp:
+                vw, vh = int(vp.get('width', 1440)), int(vp.get('height', 900))
+        except Exception:
+            pass
+        cx = max(0, math.floor(float(x) - BUF))
+        cy = max(0, math.floor(float(y) - BUF))
+        right = min(vw, math.ceil(float(x) + float(w) + BUF))
+        bottom = min(vh, math.ceil(float(y) + float(h) + BUF))
+        cw = right - cx
+        ch = bottom - cy
+        if cw < 10 or ch < 10:
+            await page.screenshot(path=shot_path, full_page=False, type='jpeg', quality=85)
+            return shot_path
+        await page.screenshot(
+            path=shot_path,
+            clip={'x': cx, 'y': cy, 'width': cw, 'height': ch},
+            type='jpeg', quality=85,
+        )
+        return shot_path
+
     async def _page_has_visual(self, page) -> bool:
         """检测当前页面是否含实质图片或表格元素（用于判定『混合页』是否需要视觉补充）。
 
@@ -1108,40 +1246,69 @@ class ModaoExtractor:
     async def _ocr_screenshot(self, vision_config, shot_path: str) -> Dict[str, Any]:
         empty = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
         try:
+            import time as _t, hashlib as _hlib
+            _ocr_t0 = _t.time()
+
+            # === OCR 缓存：按截图 sha256 去重，避免同一画布重复调用视觉模型 ===
+            _cache_hit = False
+            try:
+                os.makedirs(OCR_CACHE_DIR, exist_ok=True)
+                with open(shot_path, 'rb') as _cf:
+                    _shot_digest = _hlib.sha256(_cf.read()).hexdigest()
+                _cache_file = os.path.join(OCR_CACHE_DIR, f'{_shot_digest}.json')
+                if os.path.exists(_cache_file):
+                    with open(_cache_file, 'r', encoding='utf-8') as _cf:
+                        _cached = json.loads(_cf.read())
+                    print(f'[OCR_CACHE] ✓ HIT {os.path.basename(shot_path)} sha256={_shot_digest[:8]}', flush=True)
+                    return _cached
+                _cache_hit = False
+            except Exception:
+                _shot_digest = None
+
             from apps.requirement_analysis.models import AIModelService
+            _model_label = f"{vision_config.model_type}/{vision_config.model_name}"
+            print(f'[OCR_LLM] ▶ 调用 {_model_label} (role=vision_ocr) | shot={os.path.basename(shot_path)}', flush=True)
             with open(shot_path, 'rb') as image_file:
                 b64 = base64.b64encode(image_file.read()).decode('utf-8')
             instruction = (
-                '你是产品原型视觉结构提取器，只输出JSON，不得补写截图中不存在的内容。'
-                '忽略浏览器工具栏、墨刀页面导航和登录提示。输出：'
-                '{"ocr_text":"忠实文字","visual_summary":"可见布局",'
+                '你是产品原型视觉结构提取器。只识别截图中实际可见的内容，禁止任何脑补/补写。\n'
+                '【严格规则】\n'
+                '1. 每条文字必须逐字来自截图。若截图未显示某字段（如手机号、奖励明细），该字段留空或输出空字符串，禁止推断。\n'
+                '2. raw_text 必须是截图中真实存在的文字片段，禁止拼接/总结/扩展。\n'
+                '3. 截图模糊/看不清的字段写"无法识别"，confidence 设 0.0-0.3。\n'
+                '4. 不要输出页面中没有的逻辑、规则、奖励、限制条件等假设性内容。\n'
+                '5. 忽略浏览器工具栏、墨刀页面导航、登录提示。\n'
+                '6. 如果截图就是一张静态 UI（如按钮、输入框、表单），visual_artifacts 输出为空数组。\n'
+                '输出JSON：{"ocr_text":"截图中所有可见文字（忠实）","visual_summary":"可见布局（不超过50字）",'
                 '"visual_artifacts":[{"artifact_type":"ui_screen|data_table|decision_table|state_matrix|state_machine|flowchart|interaction_flow|rule_list|timeline|permission_matrix|pricing_matrix|form_schema|list_spec|annotation|unknown",'
-                '"title":"","bbox":[x1,y1,x2,y2],"confidence":0.0,"raw_text":"","preconditions":{},'
-                '"source_elements":[{"element_id":"E-001","text":"逐字文字","bbox":[x1,y1,x2,y2]}],'
-                '"columns":[],"rows":[],"states":[],"transitions":[],"nodes":[],"steps":[],"rules":[],'
-                '"dimensions":[{"name":"","values":[]}],"result_fields":[],"derived_rules":[]}]}。'
-                '普通表格rows为与columns等长的二维数组。决策表rows必须为对象数组，'
-                '每个小方框/原始组合对应一行，不得省略；dimensions列出所有输入维度和值域，'
-                'result_fields列出结果字段。双用户矩阵使用user_a_platform、user_a_type、'
-                'user_b_platform、user_b_type、user_a_result、user_b_result。'
-                'derived_rules每条包含condition、result、source_rows（行号从1开始）。'
-                '多张卡片展示同一功能的不同状态时必须输出state_matrix；states每项包含state、title、'
-                'subtitle、timer_type、timer_source、fixed_text、display_condition、click_action、source_elements，'
-                '无法识别的字段留空但必须保留raw_spec。状态之间有箭头或明确切换文字时同时填写transitions，'
-                '每项包含from、trigger、to、source_elements。价格/周期/套餐卡片用pricing_matrix；'
-                '角色或平台可见可用关系用permission_matrix；多页面或弹窗点击故事用interaction_flow；'
-                '时间条件用timeline；表单用form_schema；列表字段规范用list_spec。一个区域可拆成多个互补产物，'
-                '无法分类必须输出unknown并保存raw_text，不得静默丢弃。'
-                '所有单元格必须逐字来自截图；无法确认关系时降低confidence，禁止猜测。'
+                '"title":"（仅在截图可见时填）","bbox":[x1,y1,x2,y2],"confidence":0.0,"raw_text":"（仅截图中真实文字）",'
+                '"source_elements":[{"element_id":"E-001","text":"逐字文字","bbox":[x1,y1,x2,y2]}]}]}\n'
+                '表格类型补充：\n'
+                '- 普通表格：rows 是与 columns 等长的二维数组。\n'
+                '- 决策表：rows 是对象数组，每行对应一个原始小方框/组合，不得省略。\n'
+                '- state_matrix：states 每项必须包含 state（截图中的状态原名），其他字段看不清留空但必须保留 raw_spec。\n'
+                '- pricing_matrix / permission_matrix / interaction_flow / timeline / form_schema / list_spec 同理。\n'
+                '一个区域可拆成多个互补产物；无法分类时输出 unknown 但 raw_text 留空（不脑补）。'
             )
             messages = [{'role': 'user', 'content': [
                 {'type': 'text', 'text': instruction},
                 {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
             ]}]
             result = await AIModelService.call_openai_compatible_api(
-                vision_config, messages, max_tokens=8000
+                vision_config, messages, max_tokens=4000
             )
             raw = result['choices'][0]['message']['content'].strip()
+            _ocr_elapsed = _t.time() - _ocr_t0
+            print(f'[OCR_LLM] ✓ {_model_label} 返回 {len(raw)}字符 耗时 {_ocr_elapsed:.1f}s', flush=True)
+            # 诊断日志：记录视觉模型原始返回的片段（长度+前200字符），便于排查
+            # 「视觉识别未返回有效内容」时模型到底返回了空串还是空 JSON，不记录任何密钥。
+            try:
+                _dbg_raw = f'[OCR_RAW] len={len(raw)} head={raw[:200]!r}\n'
+                with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df:
+                    _df.write(_dbg_raw)
+            except Exception:
+                pass
+            logger.info(f'[OCR_RAW] len={len(raw)} head={raw[:120]!r}')
             payload = self._parse_visual_payload(raw)
             if not payload:
                 logger.warning('视觉模型未返回有效JSON，降级为普通OCR文本')
@@ -1165,7 +1332,7 @@ class ModaoExtractor:
                     {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
                 ]}]
                 retry_result = await AIModelService.call_openai_compatible_api(
-                    vision_config, retry_messages, max_tokens=8000
+                    vision_config, retry_messages, max_tokens=4000
                 )
                 retry_raw = retry_result['choices'][0]['message']['content'].strip()
                 retry_payload = self._parse_visual_payload(retry_raw)
@@ -1200,7 +1367,7 @@ class ModaoExtractor:
                     {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
                 ]}]
                 state_result = await AIModelService.call_openai_compatible_api(
-                    vision_config, state_messages, max_tokens=8000
+                    vision_config, state_messages, max_tokens=4000
                 )
                 state_raw = state_result['choices'][0]['message']['content'].strip()
                 state_payload = self._parse_visual_payload(state_raw)
@@ -1217,7 +1384,16 @@ class ModaoExtractor:
                 recovered = self._state_matrix_from_text(raw)
                 if recovered:
                     payload.setdefault('visual_artifacts', []).append(recovered)
-            return self._prepare_visual_payload(payload, shot_path)
+            result = self._prepare_visual_payload(payload, shot_path)
+            # === 写入 OCR 缓存 ===
+            if _shot_digest and result.get('ocr_text'):
+                try:
+                    os.makedirs(OCR_CACHE_DIR, exist_ok=True)
+                    with open(_cache_file, 'w', encoding='utf-8') as _cf:
+                        json.dump(result, _cf, ensure_ascii=False)
+                except Exception:
+                    pass
+            return result
         except Exception as exc:
             logger.warning(f'视觉结构提取失败（可忽略）: {exc}')
             return empty
@@ -1231,7 +1407,63 @@ class ModaoExtractor:
     # 作为可选策略：默认关闭（dual_fusion=False），保持既有行为不变；由调用方（如 modao_workflow）
     # 在采用 analyzer 配置时开启并传入 fusion_config。
 
-    async def dual_fusion_requirements(self, pages, fusion_config):
+    async def _run_ocr_batch(self, pages, vision_config, warnings, prototype_id=None):
+        """并发批量视觉 OCR：把原本每页串行的一次视觉模型调用，改为受信号量限流的并发调用。
+
+        视觉 OCR 仅依赖截图文件（shot_path），与浏览器页面状态无关，因此可在所有页面
+        截图完成后统一并发执行，网络 IO 并行；整体耗时 ≈ 单页 OCR 耗时 × (页数 / OCR_CONCURRENCY)。
+        pages: extract 主循环收集的需要 OCR 的页面字典（含临时字段 'shot_path'）。
+        """
+        logger.info(f'[OCR_BATCH] START pages={len(pages)} vision_config={vision_config is not None} '
+                     f'pid={prototype_id} sample_shot={pages[0].get("shot_path", "")[:60] if pages else "N/A"}')
+        _dbg = f'[OCR_BATCH] ENTER pages={len(pages)} config_ok={vision_config is not None}\n'
+        print(_dbg, flush=True)
+        with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df: _df.write(_dbg)
+        sem = asyncio.Semaphore(OCR_CONCURRENCY)
+
+        async def _one(p):
+            _pn = p.get('page_name', '?')
+            _sp = str(p.get('shot_path', ''))[:80]
+            _dbg0 = f'[OCR_ONE_ENTER] {_pn} shot={_sp}\n'
+            print(_dbg0, flush=True)
+            with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df: _df.write(_dbg0)
+            _raise_if_terminated(prototype_id)
+            async with sem:
+                try:
+                    vr = await self._ocr_screenshot(vision_config, p.get('shot_path'))
+                    logger.info(f'[OCR_BATCH] page[{p.get("page_name")}] OK ocr_len={len(vr.get("ocr_text","") or "")} '
+                                f'summary_len={len(vr.get("visual_summary","") or "")}')
+                    _dbg = f'[OCR_ONE] {p.get("page_name")} OK\n'
+                except Exception as e:
+                    logger.warning(f"页面[{p.get('page_name')}] 视觉OCR失败（跳过）: {e}")
+                    vr = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                    _dbg = f'[OCR_ONE] {p.get("page_name")} FAIL: {e}\n'
+                print(_dbg, flush=True)
+                with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df: _df.write(_dbg)
+            ocr_text = vr.get('ocr_text', '') or ''
+            vision_text = ocr_text
+            if vr.get('visual_summary'):
+                vision_text = (vision_text + '\n' + vr['visual_summary']).strip()
+            p['vision_text'] = vision_text
+            p['visual_summary'] = vr.get('visual_summary', '')
+            p['visual_artifacts'] = vr.get('visual_artifacts', [])
+            p['vision_success'] = bool(
+                ocr_text or vr.get('visual_summary') or vr.get('visual_artifacts'))
+            if not p['vision_success']:
+                p.setdefault('extraction_warnings', []).append('视觉识别未返回有效内容')
+            # 兼容字段 text = DOM 文本 + 视觉 OCR 补充，维持 run_struct 既有消费方式
+            base = (p.get('dom_text') or '')
+            p['text'] = (base + '\n[视觉OCR补充]\n' + ocr_text) if ocr_text else base
+            p.pop('shot_path', None)
+
+        await asyncio.gather(*[_one(p) for p in pages])
+        logger.info(f'[OCR_BATCH] DONE success_count='
+                     f'{sum(1 for p in pages if p.get("vision_success"))}/{len(pages)}')
+        _dbg = f'[OCR_BATCH] DONE ok={sum(1 for p in pages if p.get("vision_success"))}/{len(pages)}\n'
+        print(_dbg, flush=True)
+        with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df: _df.write(_dbg)
+
+    async def dual_fusion_requirements(self, pages, fusion_config, prototype_id=None):
         """对已被分别记录 dom_text / vision_text 的各页，做双路 LLM 交叉融合。
 
         pages: extract / extract_webshare_sync 在 dual_fusion=True 时产出的页面列表，
@@ -1239,6 +1471,7 @@ class ModaoExtractor:
         fusion_config: 具备文本能力的 AIModelConfig（如 analyzer）。
         返回融合需求数组（含 sources/confidence/evidence）。失败返回空列表，不抛异常。
         """
+        _raise_if_terminated(prototype_id)
         if not fusion_config:
             return []
         from apps.requirement_analysis.models import AIModelService
@@ -1248,18 +1481,47 @@ class ModaoExtractor:
             name = p.get('page_name') or f"第{p.get('page_no', '?')}页"
             dom = (p.get('dom_text') or '').strip()
             vis = (p.get('vision_text') or '').strip()
+            # 右侧批注面板/评论内容：extract 已抓取进 annotations 但此前未进分析链路，
+            # 这里拼入 DOM 文本块，确保 LLM 能看到画布外的批注（画布内便签已在 dom_text 中）。
+            ann = p.get('annotations') or []
+            if isinstance(ann, list):
+                ann_text = '\n'.join(str(a) for a in ann if a).strip()
+            else:
+                ann_text = ''
             if dom:
-                dom_all.append(f"### {name}\n{dom}")
-                dom_total += len(dom)
+                block = f"### {name}\n{dom}"
+                if ann_text:
+                    block += f"\n\n[批注/评论]\n{ann_text}"
+                dom_all.append(block)
+                dom_total += len(block)
             if vis:
                 vis_all.append(f"### {name}\n{vis}")
         if not dom_all and not vis_all:
+            _dbg = '[FUSION] both dom/vis empty -> return []\n'
+            print(_dbg, flush=True)
+            with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
             return []
-        dom_reqs = await self._dual_extract_one(
-            AIModelService, fusion_config, dom_all) if dom_all else []
-        vis_reqs = await self._dual_extract_one(
-            AIModelService, fusion_config, vis_all) if vis_all else []
-        return await self._dual_fuse(AIModelService, fusion_config, dom_reqs, vis_reqs, dom_total)
+        _dbg = f'[FUSION] START dom_pages={len(dom_all)} vis_pages={len(vis_all)} dom_total={dom_total}\n'
+        print(_dbg, flush=True)
+        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+        # 并行优化：DOM 抽取与视觉抽取两路输入完全独立，用 gather 同时发起，
+        # 把两次串行 LLM 调用压缩为一次（耗时 ≈ max(dom, vis) 而非 sum），最后再融合。
+        if dom_all and vis_all:
+            dom_reqs, vis_reqs = await asyncio.gather(
+                self._dual_extract_one(AIModelService, fusion_config, dom_all),
+                self._dual_extract_one(AIModelService, fusion_config, vis_all),
+            )
+        elif dom_all:
+            dom_reqs = await self._dual_extract_one(AIModelService, fusion_config, dom_all)
+            vis_reqs = []
+        else:
+            dom_reqs = []
+            vis_reqs = await self._dual_extract_one(AIModelService, fusion_config, vis_all)
+        fused = await self._dual_fuse(AIModelService, fusion_config, dom_reqs, vis_reqs, dom_total)
+        _dbg = f'[FUSION] END total_fused={len(fused)}\n'
+        print(_dbg, flush=True)
+        with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+        return fused
 
     async def _dual_extract_one(self, aim_service, fusion_config, blocks):
         """单路分批抽取；按完整页面分组，禁止整体截断导致尾部页面丢失。"""
@@ -1286,15 +1548,20 @@ class ModaoExtractor:
             ]
             try:
                 result = await aim_service.call_openai_compatible_api(
-                    fusion_config, messages, max_tokens=8000)
-                parsed = _parse_llm_json_array(result['choices'][0]['message']['content'])
+                    fusion_config, messages, max_tokens=16000)
+                content = (result['choices'][0]['message']['content'] or '') if result else ''
+                parsed = _parse_llm_json_array(content)
+                _dbg = (f'[FUSION] extract_batch {batch_no}/{len(batches)} '
+                        f'raw_len={len(content)} parsed={len(parsed)}\n')
+                print(_dbg, flush=True)
+                with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
                 requirements.extend(parsed)
             except Exception as e:
                 raise RuntimeError(f'双路抽取第 {batch_no}/{len(batches)} 批失败: {e}') from e
         return requirements
 
     async def _dual_fuse(self, aim_service, fusion_config, dom_reqs, vis_reqs, dom_len):
-        """交叉融合两路需求数组；任一失败降级为两路并集。"""
+        """交叉融合两路需求数组；解析失败/截断时降级为两路并集，避免整体读取被阻断。"""
         if not dom_reqs and not vis_reqs:
             return []
         user = (
@@ -1308,8 +1575,21 @@ class ModaoExtractor:
         ]
         try:
             result = await aim_service.call_openai_compatible_api(
-                fusion_config, messages, max_tokens=8000)
-            return _parse_llm_json_array(result['choices'][0]['message']['content']) or []
+                fusion_config, messages, max_tokens=16000)
+            content = (result['choices'][0]['message']['content'] or '') if result else ''
+            parsed = _parse_llm_json_array(content)
+            _dbg = (f'[FUSION] fuse_reqs dom={len(dom_reqs)} vis={len(vis_reqs)} '
+                    f'raw_len={len(content)} parsed={len(parsed)}\n')
+            print(_dbg, flush=True)
+            with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg)
+            if parsed:
+                return parsed
+            # 融合输出无法解析（多为输出被 max_tokens 截断）：降级为两路并集，
+            # 保证阶段0门禁不因一次性解析失败而把整轮读取判失败。
+            _dbg2 = '[FUSION] fuse parse failed -> fallback to union of two paths\n'
+            print(_dbg2, flush=True)
+            with open(os.path.join(self.shot_dir, '_fusion_debug.log'), 'a') as _df: _df.write(_dbg2)
+            return list(dom_reqs or []) + list(vis_reqs or [])
         except Exception as e:
             raise RuntimeError(f'双路交叉融合失败: {e}') from e
 

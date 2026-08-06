@@ -96,3 +96,57 @@ def query_near_duplicates(collection, vector: list, top_k: int = 5):
             'text': documents[i] if documents else '',
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# 项目知识库 RAG 检索（方案 C）：按语义相似度召回 top-K 知识条目，
+# 替代原先「全量灌入 prompt」的做法，解决同名不同义功能被错误召回的问题。
+# 向量只存 Chroma，不落业务库，因此无需数据库迁移。
+# ---------------------------------------------------------------------------
+
+def get_project_kb_collection(project_id) -> 'Collection':
+    """获取某项目的知识库专用向量集合（余弦距离空间）。"""
+    client = get_chroma_client()
+    return client.get_or_create_collection(
+        name=f'kb_{project_id}',
+        metadata={'hnsw:space': 'cosine'},
+    )
+
+
+def upsert_kb_item(collection, item_id: str, vector: list, document: str, metadata: dict):
+    """写入/更新一条知识条目的向量。"""
+    collection.upsert(
+        ids=[str(item_id)],
+        embeddings=[vector],
+        documents=[document],
+        metadatas=[metadata],
+    )
+
+
+def delete_kb_item(collection, item_id: str):
+    """删除一条知识条目的向量（条目停用/删除时同步）。"""
+    try:
+        collection.delete(ids=[str(item_id)])
+    except Exception as e:
+        logger.warning(f'删除知识库向量失败（可忽略）: {e}')
+
+
+def query_kb(collection, vector: list, top_k: int = 8) -> list:
+    """检索与给定向量最相似的 top_k 条知识（按余弦相似度）。"""
+    n = collection.count()
+    if n == 0:
+        return []
+    res = collection.query(
+        query_embeddings=[vector],
+        n_results=min(top_k, n),
+        include=['documents', 'metadatas'],
+    )
+    documents = (res.get('documents') or [[]])[0]
+    metadatas = (res.get('metadatas') or [[]])[0]
+    out = []
+    for i, doc in enumerate(documents):
+        out.append({
+            'text': doc,
+            'meta': metadatas[i] if i < len(metadatas) else {},
+        })
+    return out

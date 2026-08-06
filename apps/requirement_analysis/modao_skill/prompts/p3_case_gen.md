@@ -25,25 +25,27 @@
 ## 📝 输出格式（YAML）
 
 ```yaml
-testcase:
-  id: TC_<module>_<seq>
-  module: <模块名>
-  title: <用例标题，简洁明确>
-  precondition: |
-    <前置条件，包括账号状态、APP状态、网络环境、数据准备>
-  steps:
-    - <步骤1，具体可执行>
-    - <步骤2>
-    - <步骤3>
-  expected: |
-    <预期结果，包括界面变化、数据变化、提示信息>
-  priority: P0/P1/P2
-  type: 功能/边界/异常/UI/兼容
-  requirement_ref: |
-    <关联到需求文档的具体位置或编号>
-  is_smoke: true/false
-  notes: |
-    <备注，可填写测试要点、常见问题>
+testcases:
+  - id: TC_<module>_<seq>
+    module: <模块名>
+    title: <用例标题，简洁明确>
+    precondition: |
+      <前置条件，包括账号状态、APP状态、网络环境、数据准备>
+    steps:
+      - <步骤1，具体可执行>
+      - <步骤2>
+      - <步骤3>
+    expected: |
+      <预期结果，包括界面变化、数据变化、提示信息>
+    priority: P0/P1/P2
+    type: 功能/边界/异常/UI/兼容
+    requirement_ref: |
+      <关联到需求文档的具体位置或编号>
+    is_smoke: true/false
+    notes: |
+      <备注，可填写测试要点、常见问题>
+  - id: TC_<module>_<seq+1>
+    ...
 ```
 
 ## 🎯 用例标题编写规范

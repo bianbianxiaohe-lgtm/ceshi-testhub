@@ -132,18 +132,28 @@
       </el-form>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'"
         :description="proto.error_message" show-icon />
-      <el-button type="primary" :loading="busy" @click="protoId ? onReExtract() : onCreate()">{{ protoId ? '重新读取当前任务' : form.source_type === 'modao' ? '开始读取墨刀' : form.source_type === 'webshare' ? '开始读取 webshare 页面树' : '保存需求文本' }}</el-button>
+      <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="protoId ? onReExtract() : onCreate()">{{ protoId ? '重新读取当前任务' : form.source_type === 'modao' ? '开始读取墨刀' : form.source_type === 'webshare' ? '开始读取 webshare 页面树' : '保存需求文本' }}</el-button>
       <el-button v-if="proto && proto.status === 'extracting'" :loading="true">读取中…</el-button>
+      <el-button v-if="proto && proto.status === 'extracting'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
       <el-button v-if="proto && proto.status === 'extracted' && proto.current_stage >= 0"
         type="success" @click="goStep(1)">✅ 已读取，进入阶段1</el-button>
     </el-card>
 
     <!-- 阶段1：需求通读 -->
-    <el-card v-if="step === 1" class="stage-card">
-      <template #header><b>阶段1 · 需求通读</b></template>
-      <el-button type="primary" :loading="busy" @click="onStruct">运行需求结构化</el-button>
+    <el-card v-if="step === 1 || (proto && proto.requirement_summary)" class="stage-card">
+      <template #header>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <b>阶段1 · 需求通读</b>
+          <el-button v-if="step > 1" size="small" type="primary" plain @click="goStep(1)">↩ 回到此阶段</el-button>
+        </div>
+      </template>
+      <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onStruct">运行需求结构化</el-button>
       <el-alert v-if="proto && proto.status === 'structuring'" type="info" title="结构化中…" />
+      <el-button v-if="proto && proto.status === 'structuring'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
+        title="质量门禁提示（以下检查未通过，已保留用例/报告）"
+        :description="qualityGateSummary.join('\n')" />
       <div v-if="proto && proto.requirement_summary" class="artifact">
         <div class="artifact-head">
           <h4>需求摘要</h4>
@@ -166,11 +176,20 @@
     </el-card>
 
     <!-- 阶段2：需求澄清 -->
-    <el-card v-if="step === 2" class="stage-card">
-      <template #header><b>阶段2 · 需求澄清</b></template>
-      <el-button type="primary" :loading="busy" @click="onClarify">识别澄清问题</el-button>
+    <el-card v-if="(step === 2 || (proto && proto.clarification_log)) && !(proto && proto.generation_gate && proto.generation_gate.stage2_confirmed)" class="stage-card">
+      <template #header>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <b>阶段2 · 需求澄清</b>
+          <el-button v-if="step > 2" size="small" type="primary" plain @click="goStep(2)">↩ 回到此阶段</el-button>
+        </div>
+      </template>
+      <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onClarify">识别澄清问题</el-button>
       <el-alert v-if="proto && proto.status === 'clarifying'" type="info" title="澄清分析中…" />
+      <el-button v-if="proto && proto.status === 'clarifying'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
+        title="质量门禁提示（以下检查未通过，已保留用例/报告）"
+        :description="qualityGateSummary.join('\n')" />
       <div v-if="proto && proto.clarification_log" class="artifact">
         <div class="artifact-head">
           <h4>澄清清单</h4>
@@ -220,26 +239,33 @@
     </el-card>
 
     <!-- 阶段3：用例设计 -->
-    <el-card v-if="step === 3" class="stage-card">
+    <el-card v-if="step === 3 || (proto && (proto.final_testpoints_json || proto.module_split || proto.risks_json || proto.pci_json))" class="stage-card">
       <template #header>
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
           <b>阶段3 · 用例设计（含风险/PCI/三路合并/质量自检）</b>
-          <el-button size="small" type="primary" plain @click="openEditDialog()">✏️ 编辑产物</el-button>
+          <div style="display:flex;align-items:center;gap:8px">
+            <el-button v-if="step > 3" size="small" type="primary" plain @click="goStep(3)">↩ 回到此阶段</el-button>
+            <el-button size="small" type="primary" plain @click="openEditDialog()">✏️ 编辑产物</el-button>
+          </div>
         </div>
       </template>
       <div class="stage3-actions">
-        <el-button type="primary" :loading="busy" @click="onDesign">① 运行测试点合并</el-button>
+        <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onDesign">① 运行测试点合并</el-button>
         <el-button v-if="proto && (proto.status === 'testpoints_ready' || proto.status === 'done') && proto.final_testpoints_json"
           type="success" :loading="busy" @click="onGenerateCases">② 确认测试点，生成测试用例</el-button>
       </div>
       <el-alert v-if="proto && proto.status === 'designing'" type="info" :closable="false" show-icon
         title="AI 处理中（测试点合并 或 用例生成）…请稍候" />
+      <el-button v-if="proto && proto.status === 'designing'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
       <el-alert v-if="proto && proto.status === 'testpoints_ready'" type="warning" :closable="false" show-icon
         title="第一段完成：测试点已合并。请在下方「合并测试点」中查看/编辑确认后，点击「② 确认测试点，生成测试用例」" />
       <el-alert v-if="proto && proto.final_testpoints_json && generationGateReasons.length" type="warning"
         :closable="false" show-icon title="最终测试用例尚未获准生成"
         :description="generationGateReasons.join('；')" />
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
+        title="质量门禁提示（以下检查未通过，已保留用例/报告）"
+        :description="qualityGateSummary.join('\n')" />
 
       <!-- 产物筛选标签页 -->
       <div v-if="hasAnyArtifact" class="stage3-filter-bar">
@@ -291,7 +317,17 @@
       <div v-if="(stage3ActiveTab === 'all' || stage3ActiveTab === 'pci_json') && proto && proto.pci_json" class="artifact">
         <div class="artifact-head-row">
           <h4>待确认问题 PCI (Q1~Q5) <el-tag size="mini" type="warning">{{ mainPageFlatPci.length }} 个子问题</el-tag></h4>
-          <el-button size="mini" type="text" @click="openEditDialog('pci_json')">✏️ 编辑</el-button>
+          <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
+            <span class="pci-stat-inline">筛选：</span>
+            <el-radio-group v-model="mainPagePciFilter" size="mini">
+              <el-radio-button value="all">全部 ({{ mainPagePciStats.all }})</el-radio-button>
+              <el-radio-button value="blocker">blocker ({{ mainPagePciStats.blocker }})</el-radio-button>
+              <el-radio-button value="high">high ({{ mainPagePciStats.high }})</el-radio-button>
+              <el-radio-button value="medium">medium ({{ mainPagePciStats.medium }})</el-radio-button>
+              <el-radio-button value="low">low ({{ mainPagePciStats.low }})</el-radio-button>
+            </el-radio-group>
+            <el-button size="mini" type="text" @click="openEditDialog('pci_json')">✏️ 编辑</el-button>
+          </div>
         </div>
         <!-- 结构化卡片：每个子问题一张卡 -->
         <div v-if="mainPageFlatPci.length" class="main-page-pci-list">
@@ -487,8 +523,22 @@
 
         <!-- 待确认问题 PCI：拆解为独立子问题卡片（一个问题一张卡，永远扁平） -->
         <div v-else-if="editField === 'pci_json' && flatPciItems.length" class="generic-json-list">
-          <div v-for="(item, idx) in flatPciItems" :key="'sq' + item.pciIndex + '_' + item.subIndex"
-               class="pci-card pci-sub-card" :class="{ 'pci-sub-confirmed': item.sub.confirmed }">
+          <!-- 弹窗内 PCI 优先级筛选（从主卡片进入时继承当前筛选） -->
+          <div class="mt" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+            <span>筛选：</span>
+            <el-radio-group v-model="pciEditFilter" size="mini">
+              <el-radio-button value="all">全部 ({{ flatPciItems.length }})</el-radio-button>
+              <el-radio-button value="blocker">blocker ({{ pciStats.blocker }})</el-radio-button>
+              <el-radio-button value="high">high ({{ pciStats.high }})</el-radio-button>
+              <el-radio-button value="medium">medium ({{ pciStats.medium }})</el-radio-button>
+              <el-radio-button value="low">low ({{ pciStats.low }})</el-radio-button>
+            </el-radio-group>
+            <span class="hint-text">仅显示 {{ displayedPciItems.length }} 条子问题</span>
+          </div>
+          <div v-for="(item, idx) in displayedPciItems" :key="'sq' + item.pciIndex + '_' + item.subIndex"
+               class="pci-card pci-sub-card" :class="{ 'pci-sub-confirmed': item.sub.confirmed, 'pci-dup': item.pci._pci_dup }">
+            <el-alert v-if="item.pci._pci_dup" type="warning" :closable="false" show-icon
+              :title="`疑似与另一 PCI 重复（相似度 ${item.pci._pci_dup_similarity || '-'}），请核对是否可合并`" style="margin-bottom:8px" />
             <div class="pci-card-head">
               <el-tag v-if="item.pci._module" size="mini" type="success" effect="plain">{{ item.pci._module }}</el-tag>
               <span class="generic-card-index">{{ item.pci.id || ('#' + (item.pciIndex+1)) }}</span>
@@ -504,10 +554,12 @@
             <div class="pci-sub-q">
               <span class="pci-q-badge">问</span>{{ item.sub.question }}
             </div>
-            <div class="pci-sub-a-wrap">
-              <label class="pci-sub-a-label">A：</label>
+            <div class="pci-sub-a-wrap" :class="{ 'pci-ai-draft': !!item.sub._aiDraft }">
+              <label class="pci-sub-a-label">{{ item.sub._aiDraft ? 'A（AI 草稿）：' : 'A：' }}</label>
               <el-input v-model="item.sub.answer" type="textarea" :rows="3"
-                placeholder="AI 解答草稿，可编辑修改..." />
+                :class="'pci-answer-input' + (item.sub._aiDraft ? ' pci-ai-answer' : '')"
+                placeholder="AI 解答草稿，可编辑修改..."
+                @input="clearAiDraft(item.sub)" />
             </div>
             <div class="pci-sub-foot">
               <el-checkbox v-model="item.sub.confirmed" size="small">已确认</el-checkbox>
@@ -520,7 +572,19 @@
             <el-button size="small" type="primary" @click="savePciReplies">保存全部回复</el-button>
             <el-button size="small" type="success" :loading="allPciLoading" @click="splitAllPci">AI 全部解答</el-button>
             <el-button size="small" type="warning" plain @click="resetAllPciSplit">重置拆解</el-button>
-            <span class="hint-text">共 {{ flatPciItems.length }} 个子问题（来自 {{ parsedPciItems.length }} 条 PCI）</span>
+            <el-divider direction="vertical" />
+            <el-button size="small" type="info" plain @click="batchConfirmByImpact('low')">一键确认 low ({{ pciStats.low }})</el-button>
+            <el-button size="small" type="warning" plain @click="batchConfirmByImpact('medium')">一键确认 medium ({{ pciStats.medium }})</el-button>
+            <el-popconfirm title="将所有 low/medium 子问题标记为已确认并填充默认答案？" @confirm="batchConfirmLowMedium">
+              <template #reference>
+                <el-button size="small" type="warning" plain>批量确认 low+medium ({{ pciStats.low + pciStats.medium }})</el-button>
+              </template>
+            </el-popconfirm>
+            <el-button size="small" :loading="allPciLoading" @click="splitAndAutoConfirm">AI 解答并自动确认</el-button>
+            <span class="hint-text">
+              共 {{ flatPciItems.length }} 个子问题（{{ parsedPciItems.length }} 条 PCI）
+              <span class="pci-stat-inline">| blocker: {{ pciStats.blocker }} / high: {{ pciStats.high }} / medium: {{ pciStats.medium }} / low: {{ pciStats.low }}</span>
+            </span>
           </div>
         </div>
 
@@ -584,8 +648,13 @@
     </el-dialog>
 
     <!-- 阶段4：冒烟执行 -->
-    <el-card v-if="step === 4" class="stage-card">
-      <template #header><b>阶段4 · 冒烟执行决策</b></template>
+    <el-card v-if="step === 4 || (proto && (proto.smoke_json || proto.testcases_json))" class="stage-card">
+      <template #header>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <b>阶段4 · 冒烟执行决策</b>
+          <el-button v-if="step > 4" size="small" type="primary" plain @click="goStep(4)">↩ 回到此阶段</el-button>
+        </div>
+      </template>
       <p>请在 APP 端按冒烟用例清单逐项执行，记录 Pass / Fail / Block 后告知结果：</p>
       <el-radio-group v-model="smokeDecision">
         <el-radio value="passed">✅ 冒烟通过（进入全量测试）</el-radio>
@@ -633,6 +702,7 @@
 
 <script>
 import request from '@/utils/api'
+import { load as yamlLoad } from 'js-yaml'
 import ModaoQA from './ModaoQA.vue'
 
 export default {
@@ -644,6 +714,7 @@ export default {
       protoId: null,
       proto: null,
       busy: false,
+      terminating: false,
       pollTimer: null,
       smokeDecision: '',
       rejectEmail: '',
@@ -707,6 +778,10 @@ export default {
       adoptedCaseMap: {},
       // 阶段3产物筛选标签页
       stage3ActiveTab: 'all',
+      // 主卡片 PCI 优先级筛选（all / blocker / high / medium / low）
+      mainPagePciFilter: 'all',
+      // 弹窗 PCI 优先级筛选（从主卡片进入时继承）
+      pciEditFilter: 'all',
     }
   },
   beforeUnmount() {
@@ -737,6 +812,91 @@ export default {
     },
   },
   methods: {
+    // ---------- PCI 批量操作 ----------
+    // 按影响级别批量确认 PCI 子问题
+    // 答案优先级：后端 suggested_answer > resolution_condition（需过滤非答案）> 智能默认答案
+    batchConfirmByImpact(impact) {
+      // 判定一段文本是否像"答案"而非"问题描述复述"
+      const looksLikeAnswer = (text) => {
+        if (!text || !text.trim()) return false
+        const t = text.trim()
+        // ❌ 以"确认""需要""请确认""待"开头 → 多半是问题复述
+        if (/^(确认|需要|请确认|待|需).{0,4}(所有?|是否|什么|哪些|如何|该)/.test(t)) return false
+        // ❌ 超过60字且包含原问题关键词 → 大概率是复述
+        if (t.length > 60 && /(确认|验证|检查|明确|定义|处理方案)/.test(t)) return false
+        // ✅ 包含具体处置词 → 像答案
+        if (/(采用|使用|选择|默认|显示|返回|跳转|延后|记录|忽略|按|取值)/.test(t)) return true
+        return t.length <= 50 // 短文本倾向于答案
+      }
+
+      const defaultAnswers = {
+        low: '低风险，延后到测试复盘阶段统一处理。',
+        medium: '中风险，在测试执行过程中并行验证即可。',
+        high: '高风险，需在测试设计阶段重点覆盖。',
+        blocker: '阻断项，必须在测试执行前解决。',
+      }
+      let count = 0
+      ;(this.flatPciItems || []).forEach(item => {
+        if ((item.pci && item.pci.impact) === impact || (!item.pci?.impact && impact === 'low')) {
+          if (item.sub) {
+            // 优先用后端 suggested_answer（prompt #7 新增字段）
+            const suggested = item.pci.suggested_answer && item.pci.suggested_answer.trim()
+            const rc = item.pci.resolution_condition && item.pci.resolution_condition.trim()
+            if (!item.sub.answer.trim()) {
+              if (suggested && looksLikeAnswer(suggested)) {
+                item.sub.answer = suggested
+              } else if (rc && looksLikeAnswer(rc)) {
+                item.sub.answer = rc
+              } else {
+                item.sub.answer = defaultAnswers[impact] || defaultAnswers.low
+              }
+            }
+            item.sub.confirmed = true
+            count++
+          }
+        }
+      })
+      if (count > 0) {
+        this.$message.success(`已自动确认 ${count} 个 ${impact} 级别子问题`)
+        this.flatPciItemsList = [...this.flatPciItemsList]
+      } else {
+        this.$message.info(`没有找到 ${impact} 级别的未确认子问题`)
+      }
+    },
+    // 批量确认所有 low + medium 子问题
+    batchConfirmLowMedium() {
+      this.batchConfirmByImpact('low')
+      this.batchConfirmByImpact('medium')
+    },
+    // AI 解答全部 PCI 后自动确认 medium/low 级别
+    async splitAndAutoConfirm() {
+      this.allPciLoading = true
+      try {
+        // 1) 先 AI 解答（复用现有逻辑）
+        await Promise.all(this.parsedPciItems.map((_, i) =>
+          (this.pciSubQuestions[i] && this.pciSubQuestions[i].length)
+            ? Promise.resolve()
+            : this.splitAndAnswerPci(i)
+        ))
+        // 2) 自动确认 medium / low
+        let autoCount = 0
+        ;(this.flatPciItems || []).forEach(item => {
+          if (item.sub && !item.sub.confirmed) {
+            const level = (item.pci && item.pci.impact) || 'low'
+            if (level === 'low' || level === 'medium') {
+              item.sub.confirmed = true
+              autoCount++
+            }
+          }
+        })
+        this.$message.success(`AI 解答完成，已自动确认 ${autoCount} 个 medium/low 级子问题（blocker/high 请人工审核）`)
+      } catch (e) {
+        /* 单条错误已在内部处理 */
+      } finally {
+        this.allPciLoading = false
+        this.recomputeFlatPciItems()
+      }
+    },
     base() { return '/requirement-analysis/api/modao' },
     statusLabel(s) {
       const m = { pending: '待处理', extracting: '读取中', extracted: '已读取', structuring: '结构化中', clarifying: '澄清中', designing: '用例设计中', done: '已完成', failed: '失败' }
@@ -828,9 +988,9 @@ export default {
       let items = null
       // 策略1：直接解析为 JSON 数组
       try { items = JSON.parse(raw) } catch (e) { items = null }
-      // 策略2：提取 ```json 或 ```yaml 代码块内容再解析
+      // 策略2：提取 ```json 或 ```yaml 代码块内容再解析（兼容有无结束 ``` 标记）
       if (!Array.isArray(items)) {
-        const m = raw.match(/```(?:json|yaml|yml)?\s*\n([\s\S]*?)```/i)
+        const m = raw.match(/```(?:json|yaml|yml)?\s*\n([\s\S]*?)(?:```|$)/i)
         if (m) {
           const inner = m[1].trim()
           try { items = JSON.parse(inner) } catch (e) { items = null }
@@ -866,6 +1026,7 @@ export default {
           data: { field: 'clarification_log', value },
         })
         this.proto.clarification_log = value
+        await this.refresh()
         this.$message.success('澄清回复已保存')
       } catch (e) {
         this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
@@ -885,6 +1046,21 @@ export default {
     // ---------- 阶段3 产物编辑弹窗 ----------
     openEditDialog(field) {
       const target = field || 'testcases_json'
+      // ⚠️ 切换任务后必须重置弹窗状态，否则 flatPciItemsList / pciSubQuestions
+      // 会残留上一个任务的数据，导致 PCI/风险显示错误任务的内容。
+      this.flatPciItemsList = []
+      this.pciSubQuestions = []
+      this.pciReplies = []
+      this.pciLoading = []
+      this.riskReplies = []
+      this.editFieldValue = ''
+      this.editRawMode = false
+      // 弹窗 PCI 筛选：主卡片选中某级别时，进入弹窗继承该筛选
+      if (target === 'pci_json') {
+        this.pciEditFilter = this.mainPagePciFilter || 'all'
+      } else {
+        this.pciEditFilter = 'all'
+      }
       this.editDialogVisible = true
       if (this.editField === target) {
         // 同一字段：直接恢复草稿 / 从 proto 初始化
@@ -936,26 +1112,60 @@ export default {
     onEditFieldChange() {
       // 优先恢复未保存草稿（关闭弹窗 / 切换字段 / 刷新页面后重新进入都能保留）
       const draft = this.loadDraft(this.editField)
-      if (draft) {
-        this.editFieldValue = draft.editFieldValue || ''
+      const protoRaw = (this.proto && this.proto[this.editField]) || ''
+      // 草稿有效性校验（关键，已踩坑）：不仅要「非空」，还要能解析出有效列表。
+      // 否则「非空但损坏/过期的草稿」会遮盖 proto 真实数据，导致弹窗显示
+      // 「当前产物为空或格式无法解析」。规则：
+      //   - 草稿有数据且能解析出列表 → 用之（恢复未保存内容）
+      //   - proto 有真实可解析数据，而草稿解析为空 → 丢弃草稿，用 proto
+      //   - 两者都为空 → 用 proto（可能为空，由模板提示）
+      const draftHasData = !!(draft && draft.editFieldValue && draft.editFieldValue.trim())
+      const protoHasData = !!protoRaw.trim()
+      const draftParsedLen = draftHasData ? this._parseListLen(draft.editFieldValue, this.editField) : 0
+      const protoParsedLen = protoHasData ? this._parseListLen(protoRaw, this.editField) : 0
+      const useDraft = draftHasData && !(protoParsedLen > 0 && draftParsedLen === 0)
+
+      // ── PCI 字段特殊处理：必须先恢复 pciSubQuestions，再设置 editFieldValue ──
+      // 原因：editFieldValue 有 watch 会立即触发 recomputeFlatPciItems()，
+      // 如果此时 pciSubQuestions 还是旧值/空数组，recompute 会从 parsedPciItems 重新生成
+      // 子问题（answer 为空），导致用户之前填写的答案被覆盖丢失。
+      if (this.editField === 'pci_json') {
+        // 防御：若后端 proto 已保存了子问题/答案，则忽略浏览器陈旧草稿，直接用 proto。
+        // 否则旧代码 bug 时期缓存的空答案草稿会覆盖正确的后端数据，导致「答案消失」。
+        const protoHasSavedAnswers = (this.parsedPciItems || []).some(it =>
+          (it.sub_questions && it.sub_questions.some(s => s.answer && s.answer.trim())) ||
+          (it.answer && it.answer.trim()) || (it.resolution_condition && it.resolution_condition.trim()))
+        if (useDraft && draft.pciSubQuestions && draft.pciSubQuestions.length && !protoHasSavedAnswers) {
+          // 有有效草稿且 proto 无已保存答案：先恢复子问题（含用户填写的 answer），再设 editFieldValue
+          this.pciSubQuestions = draft.pciSubQuestions
+          this.pciReplies = draft.pciReplies || []
+          this.editFieldValue = draft.editFieldValue
+          this.editRawMode = !!draft.editRawMode
+          this.riskReplies = draft.riskReplies || []
+        } else {
+          // 无草稿或草稿无效：从 proto 初始化
+          this.editFieldValue = protoRaw
+          if (!this.pciSubQuestions.length && this.parsedPciItems.length) {
+            this.splitAllPciLocal()
+          }
+          this.recomputeFlatPciItems()
+          this.pciReplies = (this.parsedPciItems || []).map(it => (it && (it.answer || it.resolution_condition || it.resolution)) || '')
+          this.pciLoading = (this.parsedPciItems || []).map(() => false)
+        }
+        return // PCI 已处理完毕，提前返回
+      }
+
+      // ── 非 PCI 字段的通用逻辑 ──
+      if (useDraft) {
+        this.editFieldValue = draft.editFieldValue
         this.editRawMode = !!draft.editRawMode
         this.pciReplies = draft.pciReplies || []
-        // 仅当草稿含有效子问题才恢复，避免空草稿把 pciSubQuestions 置空后直接 return 跳过拆分
         this.pciSubQuestions = (draft.pciSubQuestions && draft.pciSubQuestions.length) ? draft.pciSubQuestions : []
         this.riskReplies = draft.riskReplies || []
       } else {
-        // 无草稿：从 proto 原始数据初始化
-        this.editFieldValue = this.proto[this.editField] || ''
+        this.editFieldValue = protoRaw
       }
-      // 兜底：PCI 字段且尚未拆解出子问题时，本地快速拆分（保证 v-model 绑定真实响应式对象，而非临时副本）
-      if (this.editField === 'pci_json') {
-        if (!this.pciSubQuestions.length && this.parsedPciItems.length) {
-          this.splitAllPciLocal()
-        }
-        this.recomputeFlatPciItems()
-        this.pciReplies = (this.parsedPciItems || []).map(it => (it && (it.answer || it.resolution_condition || it.resolution)) || '')
-        this.pciLoading = (this.parsedPciItems || []).map(() => false)
-      } else if (this.editField === 'risks_json') {
+      if (this.editField === 'risks_json') {
         this.riskReplies = (this.parsedRiskItems || []).map(it => (it && it.mitigation) || '')
       }
     },
@@ -973,13 +1183,14 @@ export default {
             answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
             confirmed: !!s.confirmed,
             _loading: false,
+            _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
           }))
           return
         }
         // 2) 回退：无 sub_questions 时按 description 中文标点拆分
         const desc = (pci.description || '').trim()
         if (!desc) {
-          this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.resolution_condition || ''), confirmed: false, _loading: false }]
+          this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.resolution_condition || ''), confirmed: false, _loading: false, _aiDraft: !!(pci.answer || pci.resolution_condition || '').trim() }]
           return
         }
         const parts = desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean)
@@ -988,8 +1199,9 @@ export default {
           answer: pci.answer || pci.resolution_condition || pci.resolution || '',
           confirmed: false,
           _loading: false,
+          _aiDraft: !!(pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
         }))
-        this.pciSubQuestions[i] = items.length ? items : [{ question: desc, answer: '', confirmed: false, _loading: false }]
+        this.pciSubQuestions[i] = items.length ? items : [{ question: desc, answer: '', confirmed: false, _loading: false, _aiDraft: false }]
       })
     },
     // 重新计算弹窗 PCI 子问题的扁平列表。
@@ -1010,6 +1222,7 @@ export default {
               answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
               confirmed: !!s.confirmed,
               _loading: false,
+              _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
             }))
             return
           }
@@ -1021,6 +1234,7 @@ export default {
             answer: pci.answer || pci.resolution_condition || pci.resolution || '',
             confirmed: false,
             _loading: false,
+            _aiDraft: !!(pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
           }))
           this.pciSubQuestions[i] = items
         } else {
@@ -1078,12 +1292,13 @@ export default {
         if (!Array.isArray(items) || !items.length) {
           items = [{ question: pci.description || '', answer: res.data.answer || '' }]
         }
-        // 给每项加 confirmed 和 _loading
+        // 给每项加 confirmed、_loading 和 _aiDraft
         items = items.map(it => ({
           question: it.question || '',
           answer: it.answer || '',
           confirmed: false,
           _loading: false,
+          _aiDraft: !!(it.answer || '').trim(),
         }))
         // 合并策略：保留用户已编辑的 answer（避免异步返回覆盖用户正在输入的内容）
         const existing = this.pciSubQuestions[i] || []
@@ -1119,21 +1334,52 @@ export default {
           data: { stage: 3, question: sq.question },
         })
         sq.answer = res.data.answer || ''
+        sq._aiDraft = true
       } catch (e) {
         this.$message.error('解答失败：' + (e.response?.data?.detail || e.message))
       } finally {
         sq._loading = false
       }
     },
+    // 用户在 PCI 回答输入框中编辑时，自动取消 AI 草稿标记（转为人工回答样式）
+    clearAiDraft(sub) {
+      if (sub && sub._aiDraft) sub._aiDraft = false
+    },
+    // 清空 editFieldValue 中 PCI 的 sub_questions（重置拆解用，避免 recompute 从旧数据恢复）
+    // idx < 0 表示清空全部；否则只清空第 idx 条
+    clearPciSubQuestions(idx = -1) {
+      try {
+        const v = JSON.parse(this.editFieldValue)
+        const flat = []
+        const collect = (node) => {
+          if (!node || typeof node !== 'object') return
+          if (Array.isArray(node)) { node.forEach(collect); return }
+          if (Array.isArray(node.pci_list)) node.pci_list.forEach(p => flat.push(p))
+          if (node.data && typeof node.data === 'object') collect(node.data)
+        }
+        collect(v)
+        if (idx >= 0) {
+          const t = flat[idx]
+          if (t && typeof t === 'object') delete t.sub_questions
+        } else {
+          flat.forEach(p => { if (p && typeof p === 'object') delete p.sub_questions })
+        }
+        this.editFieldValue = JSON.stringify(v, null, 2)
+      } catch (e) { /* 解析失败则忽略，recompute 会回退到 description 拆分 */ }
+    },
     // 重置某条 PCI 的拆解状态
     resetPciSplit(i) {
+      this.clearPciSubQuestions(i)
       this.pciSubQuestions[i] = []
       this.recomputeFlatPciItems()
+      this.$message.info(`已重置第 ${i + 1} 条 PCI 的拆解`)
     },
     // 重置全部 PCI 的拆解状态
     resetAllPciSplit() {
+      this.clearPciSubQuestions(-1)
       this.pciSubQuestions = []
       this.recomputeFlatPciItems()
+      this.$message.info('已重置全部 PCI 拆解（按原文重新拆分）')
     },
     // 一键全部拆解所有 PCI 条目（并发，单条失败不影响整体）
     async splitAllPci() {
@@ -1273,6 +1519,35 @@ export default {
         else if (v.data && Array.isArray(v.data[listKey])) push(v.data[listKey], -1, v.module || v.data.module)
       }
       return out
+    },
+    // PCI 分级统计（用于批量确认按钮展示）
+    pciStats() {
+      const stats = { blocker: 0, high: 0, medium: 0, low: 0 }
+      ;(this.flatPciItems || []).forEach(item => {
+        const level = (item.pci && item.pci.impact) || 'low'
+        if (stats[level] !== undefined) stats[level]++
+        else stats.low++ // 未知级别归入 low
+      })
+      return stats
+    },
+    // 弹窗 PCI 渲染列表：根据 pciEditFilter 过滤，引用未变（仍可编辑 sub.answer）
+    displayedPciItems() {
+      const filter = this.pciEditFilter
+      if (filter === 'all') return this.flatPciItems || []
+      return (this.flatPciItems || []).filter(item => {
+        const impact = ((item.pci && item.pci.impact) || 'low').toLowerCase()
+        return impact === filter
+      })
+    },
+    // 计算某字段原始串能解析出的结构化条目数（用于草稿有效性校验）。
+    // 非结构化字段（如 testcases_json）无法用 flattenModuleList 判断，统一视为 1（有内容即有效）。
+    _parseListLen(raw, field) {
+      try {
+        const v = JSON.parse(raw)
+        if (field === 'pci_json') return this.flattenModuleList(v, 'pci_list').length
+        if (field === 'risks_json') return this.flattenModuleList(v, 'risk_points').length
+        return 1
+      } catch (e) { return 0 }
     },
     // 把已编辑的条目按 _moduleIdx/_listIdx 精确写回原 wrapper（多模块时逐条回填对应模块的 list）
     writeBackModuleList(wrapper, items, listKey, stripInternal) {
@@ -1427,12 +1702,39 @@ export default {
           project: row.project || null, version: row.version || null, dual_fusion: true,
         }
         await this.loadHistory()
-        this.$message.success('已回到第一步，请点击“重新读取当前任务”')
+        // 重置后项目下拉保持不变但版本下拉框被 onProjectChange 清空 → 重新拉一次
+        if (this.form.project) {
+          await this.onProjectChange(this.form.project)
+        }
+        this.$message.success('已回到第一步，请点击"重新读取当前任务"')
       } catch (e) {
         this.$message.error('重置失败：' + (e.response?.data?.detail || e.message))
       }
     },
+    async onTerminate() {
+      if (!this.protoId) return
+      try {
+        await this.$confirm(
+          '确认终止当前正在运行的任务？任务将立即停止，已产生的部分结果会被标记为失败，可随后「重走」或「终止」后新建。',
+          '终止任务',
+          { type: 'warning', confirmButtonText: '确认终止', cancelButtonText: '取消' }
+        )
+      } catch (e) { return }
+      this.terminating = true
+      try {
+        await request({ url: `${this.base()}/${this.protoId}/terminate/`, method: 'post' })
+        this.stopPoll()
+        this.busy = false
+        this.$message.success('已发送终止信号，任务即将停止')
+        await this.refresh()
+      } catch (e) {
+        this.$message.error('终止失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.terminating = false
+      }
+    },
     async onReExtract() {
+      if (this.isRunning || this.busy) return
       if (!this.protoId) return this.onCreate()
       this.busy = true
       try {
@@ -1474,6 +1776,7 @@ export default {
       }
     },
     async onCreate() {
+      if (this.isRunning || this.busy) return
       this.busy = true
       try {
         // 根据来源类型，把对应输入框按行拆成 urls 传给后端
@@ -1501,6 +1804,7 @@ export default {
       }
     },
     async runStage(action) {
+      if (this.isRunning || this.busy) return
       this.busy = true
       try {
         await request({ url: `${this.base()}/${this.protoId}/${action}/`, method: 'post', data: this.form })
@@ -1704,11 +2008,86 @@ export default {
     this.loadProjects()
   },
   computed: {
+    // 以服务端 proto.status 为权威依据：任务运行中（含未终止）则禁止再次触发，
+    // 防止连点/刷新后组件重挂导致 busy 被清零而并发启动多个 run。
+    isRunning() {
+      return ['extracting', 'structuring', 'clarifying', 'designing'].includes(this.proto?.status)
+    },
     clarificationUnresolvedCount() {
       return this.proto?.generation_gate?.unresolved_count || 0
     },
     generationGateReasons() {
       return this.proto?.generation_gate?.reasons || []
+    },
+    // 解析质量自检报告，汇总 FAIL/WARNING 检查项，转为自然语言供失败时直观展示
+    qualityGateSummary() {
+      const raw = this.proto && this.proto.quality_report_json
+      if (!raw) return []
+      let d
+      try { d = typeof raw === 'string' ? JSON.parse(raw) : raw } catch (e) { return [] }
+      const qr = (d && d.quality_report) || d
+      if (!qr || typeof qr !== 'object') return []
+      const out = []
+      const overall = String(qr.overall_result || '').toUpperCase()
+      if (overall === 'FAIL') out.push('总体评价：未通过质量门禁')
+      else if (overall === 'WARNING') out.push('总体评价：存在警告项')
+      // 检查项简称 → 中文标签映射
+      const checkLabels = {
+        C1_completeness: '完整性', C2_smoke_ratio: '冒烟比例',
+        C3_p0_main_flow_coverage: 'P0主流程覆盖', C4_duplication: '重复率',
+        C5_priority_distribution: '优先级分布', C6_description_length: '描述长度'
+      }
+      const checks = qr.checks || {}
+      for (const [cid, cval] of Object.entries(checks)) {
+        if (cval && (cval.result === 'FAIL' || cval.result === 'WARNING')) {
+          const label = checkLabels[cid] || cid
+          const issues = cval.issues || []
+          // 从 issue 对象中提取自然语言描述，去掉字段名噪音
+          const toText = (i) => {
+            if (!i) return ''
+            if (typeof i === 'string') return i
+            // 优先取 detail / issue 字段（已是自然语言）
+            const msg = (i.detail || i.issue || i.message || '')
+            if (typeof msg === 'string' && msg.trim()) return msg.trim()
+            // 处理 {case_id, missing_fields} 等结构化对象 → 转自然语言
+            const parts = []
+            if (i.case_id) parts.push(`用例 ${i.case_id}`)
+            if (Array.isArray(i.missing_fields) && i.missing_fields.length) {
+              parts.push(`缺少字段：${i.missing_fields.join('、')}`)
+            }
+            if (parts.length) return parts.join('，')
+            try { return JSON.stringify(i) } catch { return String(i) }
+          }
+          const parts = issues.map(toText).filter(Boolean)
+          if (parts.length) {
+            const statusTag = cval.result === 'FAIL' ? '❌' : '⚠️'
+            out.push(`${statusTag} ${label}：${parts.join('；')}`)
+          } else {
+            const statusTag = cval.result === 'FAIL' ? '❌' : '⚠️'
+            out.push(`${statusTag} ${label}`)
+          }
+        }
+      }
+      return out
+    },
+    // PCI 分级统计（用于批量确认按钮展示）
+    pciStats() {
+      const stats = { blocker: 0, high: 0, medium: 0, low: 0 }
+      ;(this.flatPciItems || []).forEach(item => {
+        const level = (item.pci && item.pci.impact) || 'low'
+        if (stats[level] !== undefined) stats[level]++
+        else stats.low++ // 未知级别归入 low
+      })
+      return stats
+    },
+    // 弹窗 PCI 渲染列表：根据 pciEditFilter 过滤，引用未变（仍可编辑 sub.answer）
+    displayedPciItems() {
+      const filter = this.pciEditFilter
+      if (filter === 'all') return this.flatPciItems || []
+      return (this.flatPciItems || []).filter(item => {
+        const impact = ((item.pci && item.pci.impact) || 'low').toLowerCase()
+        return impact === filter
+      })
     },
     hasAnyArtifact() {
       const p = this.proto
@@ -1728,12 +2107,22 @@ export default {
       }
     },
     parsedJsonArray() {
+      // 先按 JSON 解析；失败再按 YAML 兜底（module_split 等产物是 YAML 格式）
+      let v = null
       try {
-        const v = JSON.parse(this.editFieldValue)
-        if (Array.isArray(v)) return v.map(item => ({ ...item, _raw: JSON.stringify(item, null, 2) }))
-        if (typeof v === 'object') return [{ ...v, _raw: JSON.stringify(v, null, 2) }]
-        return []
-      } catch (e) { return [] }
+        v = JSON.parse(this.editFieldValue)
+      } catch (e) {
+        try { v = yamlLoad(this.editFieldValue) } catch (e2) { return [] }
+      }
+      if (Array.isArray(v)) return v.map(item => ({ ...item, _raw: JSON.stringify(item, null, 2) }))
+      if (v && typeof v === 'object') {
+        // {modules: [...]} 之类的单键数组容器：展开为每个模块一张卡片
+        if (Array.isArray(v.modules)) {
+          return v.modules.map(item => ({ ...item, _raw: JSON.stringify(item, null, 2) }))
+        }
+        return [{ ...v, _raw: JSON.stringify(v, null, 2) }]
+      }
+      return []
     },
     parsedTestcases() {
       let arr = this.parsedJsonArray
@@ -1802,6 +2191,25 @@ export default {
       })
       return out
     },
+    // PCI 分级统计（用于批量确认按钮展示）
+    pciStats() {
+      const stats = { blocker: 0, high: 0, medium: 0, low: 0 }
+      ;(this.flatPciItems || []).forEach(item => {
+        const level = (item.pci && item.pci.impact) || 'low'
+        if (stats[level] !== undefined) stats[level]++
+        else stats.low++ // 未知级别归入 low
+      })
+      return stats
+    },
+    // 弹窗 PCI 渲染列表：根据 pciEditFilter 过滤，引用未变（仍可编辑 sub.answer）
+    displayedPciItems() {
+      const filter = this.pciEditFilter
+      if (filter === 'all') return this.flatPciItems || []
+      return (this.flatPciItems || []).filter(item => {
+        const impact = ((item.pci && item.pci.impact) || 'low').toLowerCase()
+        return impact === filter
+      })
+    },
     // 风险识别：从嵌套的 risk_points 中展开每条（兼容多种结构，同 PCI）
     parsedRiskItems() {
       try {
@@ -1836,7 +2244,11 @@ export default {
     mainPageFlatPci() {
       const out = []
       const pcis = this.mainPageParsedPci || []
+      const filter = this.mainPagePciFilter
       pcis.forEach((pci, i) => {
+        // 优先级筛选
+        const impact = (pci.impact || 'low').toLowerCase()
+        if (filter !== 'all' && filter !== impact) return
         const subs = pci.sub_questions
         const fallbackAnswer = pci.answer || pci.resolution_condition || pci.resolution || ''
         if (Array.isArray(subs) && subs.length) {
@@ -1860,6 +2272,46 @@ export default {
         }
       })
       return out
+    },
+    // 主卡片 PCI 分级统计（基于全部 PCI，不受筛选影响）
+    mainPagePciStats() {
+      const stats = { blocker: 0, high: 0, medium: 0, low: 0, all: 0 }
+      const pcis = this.mainPageParsedPci || []
+      pcis.forEach(pci => {
+        const impact = (pci.impact || 'low').toLowerCase()
+        if (stats[impact] !== undefined) stats[impact]++
+        else stats.low++
+      })
+      stats.all = pcis.length
+      return stats
+    },
+    // PCI 分级统计（用于批量确认按钮展示）
+    pciStats() {
+      const stats = { blocker: 0, high: 0, medium: 0, low: 0 }
+      ;(this.flatPciItems || []).forEach(item => {
+        const level = (item.pci && item.pci.impact) || 'low'
+        if (stats[level] !== undefined) stats[level]++
+        else stats.low++ // 未知级别归入 low
+      })
+      return stats
+    },
+    // 弹窗 PCI 渲染列表：根据 pciEditFilter 过滤，引用未变（仍可编辑 sub.answer）
+    displayedPciItems() {
+      const filter = this.pciEditFilter
+      if (filter === 'all') return this.flatPciItems || []
+      return (this.flatPciItems || []).filter(item => {
+        const impact = ((item.pci && item.pci.impact) || 'low').toLowerCase()
+        return impact === filter
+      })
+    },
+    // 弹窗 PCI 渲染列表：根据 pciEditFilter 过滤，引用未变（仍可编辑 sub.answer）
+    displayedPciItems() {
+      const filter = this.pciEditFilter
+      if (filter === 'all') return this.flatPciItems || []
+      return (this.flatPciItems || []).filter(item => {
+        const impact = ((item.pci && item.pci.impact) || 'low').toLowerCase()
+        return impact === filter
+      })
     },
     // ── 主页面：合并去重后测试点 ──
     mainPageTestpoints() {
@@ -2120,7 +2572,7 @@ export default {
   padding: 8px 12px; background: #fefce8; border-radius: 6px; border-left: 3px solid #eab308;
 }
 .pci-q-badge {
-  display: inline-block; margin-right: 6px; padding: 0 6px; background: #eab308; color: #fff;
+  display: inline-block; margin-right: 6px; padding: 0 6px; background: #3b82f6; color: #fff;
   border-radius: 4px; font-size: 11px; font-weight: 600; vertical-align: middle;
 }
 .pci-reply-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
@@ -2154,6 +2606,9 @@ export default {
   border: 1px dashed #86efac; margin-top: 10px;
 }
 .hint-text { color: #9ca3af; font-size: 12px; }
+.pci-stat-inline { color: #6b7280; font-size: 11.5px; margin-left: 4px; }
+.pci-stat-inline b { color: #374151; }
+.pci-batch-actions { padding: 10px 0; border-top: 1px solid #f0f0f0; margin-top: 8px; }
 .pci-sub-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .pci-sub-card {
   border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px;
@@ -2164,6 +2619,9 @@ export default {
   background: #f0fdf4; border-color: #86efac;
   opacity: 0.85;
 }
+.pci-dup {
+  opacity: 0.55;
+}
 .pci-sub-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .pci-sub-index {
   display: inline-block; width: 26px; height: 26px; line-height: 26px;
@@ -2171,15 +2629,48 @@ export default {
   border-radius: 50%; font-size: 12px; font-weight: 700;
 }
 .pci-sub-q {
-  font-size: 13px; line-height: 1.7; color: #1f2937;
-  padding: 6px 10px; background: #fefce8; border-radius: 6px;
-  border-left: 3px solid #eab308; margin-bottom: 8px;
+  font-size: 13px; line-height: 1.7; color: #1e3a8a;
+  padding: 6px 10px; background: #eff6ff; border-radius: 6px;
+  border-left: 3px solid #3b82f6; margin-bottom: 8px;
 }
-.pci-sub-a-wrap { display: flex; gap: 6px; align-items: flex-start; }
+.pci-sub-a-wrap {
+  display: flex; gap: 6px; align-items: flex-start;
+  padding: 6px 10px; background: #f0fdf4; border-radius: 6px;
+  border-left: 3px solid #10b981; margin-bottom: 8px;
+}
 .pci-sub-a-label {
   font-weight: 600; color: #059669; font-size: 13px;
   white-space: nowrap; margin-top: 4px;
 }
+/* 人工回答输入框（绿色调，与蓝色问题文案区分） */
+.pci-answer-input { flex: 1; }
+.pci-answer-input .el-textarea__inner {
+  background: #ecfdf5; border-color: #86efac; color: #065f46;
+  box-shadow: 0 0 0 1px #86efac inset;
+}
+.pci-answer-input .el-textarea__inner:focus {
+  border-color: #10b981;
+  box-shadow: 0 0 0 1px #10b981 inset;
+}
+.pci-answer-input .el-textarea__inner::placeholder { color: #6ee7b7; }
+
+/* AI 草稿答案（灰色/蓝色调，与人工绿色回答区分） */
+.pci-ai-draft {
+  background: #f8fafc !important;
+  border-left-color: #94a3b8 !important;
+  border-left-style: solid;
+  border-left-width: 3px;
+}
+.pci-ai-draft .pci-sub-a-label { color: #64748b; }
+.pci-ai-answer .el-textarea__inner {
+  background: #f1f5f9 !important; border-color: #cbd5e1 !important; color: #475569 !important;
+  box-shadow: 0 0 0 1px #cbd5e1 inset !important;
+}
+.pci-ai-answer .el-textarea__inner:focus {
+  border-color: #94a3b8 !important;
+  box-shadow: 0 0 0 1px #94a3b8 inset !important;
+}
+.pci-ai-answer .el-textarea__inner::placeholder { color: #94a3b8 !important; }
 .pci-sub-a-text {
   flex: 1;
   font-size: 13px; line-height: 1.7; color: #065f46;

@@ -20,6 +20,8 @@ import asyncio
 import datetime
 import re
 import urllib.parse
+import time
+import functools
 
 import numpy as np
 
@@ -32,11 +34,44 @@ from apps.requirement_analysis.vector_store import (
     get_merge_collection, release_merge_collection,
 )
 from apps.requirement_analysis.models import AIModelService
+from apps.requirement_analysis.modao_extractor import ModaoTerminateError
+from apps.requirement_analysis.cancel_flags import TERMINATE_REQUESTED
 
 logger = logging.getLogger(__name__)
 
+
+# ---------- 阶段耗时埋点（写文件，不依赖 Django 日志配置）----------
+def _wf_tlog(proto_id, msg, t0=None):
+    """把阶段耗时写入 /app/media/modao/proto_<id>_timing.log，供排障分析。"""
+    try:
+        path = os.path.join('media', 'modao', f'proto_{proto_id}_timing.log')
+        if t0 is not None:
+            msg = f'{msg} | 耗时 {time.time() - t0:.1f}s'
+        line = f'[{datetime.datetime.now().strftime("%H:%M:%S")}] {msg}\n'
+        with open(path, 'a') as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def _timed_stage(label):
+    """装饰器：记录某个工作流阶段的开始/结束与墙钟耗时。"""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *a, **k):
+            pid = self.prototype.id
+            t0 = time.time()
+            _wf_tlog(pid, f'▶ STAGE {label} START')
+            try:
+                return fn(self, *a, **k)
+            finally:
+                _wf_tlog(pid, f'■ STAGE {label} END', t0)
+        return wrapper
+    return deco
+
+
 MEDIA_ROOT = os.environ.get('MEDIA_ROOT', 'media')
-DEDUP_THRESHOLD = 0.85  # 余弦相似度阈值（中文需求语义去重）
+DEDUP_THRESHOLD = 0.80  # 余弦相似度阈值（中文需求语义去重，优化后降低避免漏网）
 
 
 # ---------- 解析工具 ----------
@@ -90,7 +125,82 @@ def _parse_json(text: str):
 def _normalize_evidence_text(value) -> str:
     """Normalize text for conservative evidence matching."""
     text = str(value or '').lower()
-    return re.sub(r'[\s，。；：、,.!?！？:;（）()【】\[\]"“”\'‘’\-—_]+', '', text)
+    return re.sub(r'[\s，。；：、,.!?！？:;（）()【】\[\]"""\'''\-—_]+', '', text)
+
+
+def _repair_source_coverage(all_fused_requirements, valid_pages):
+    """Stage-0 G6 确定性覆盖补全。
+
+    融合模型常把同一画布内靠 tab 切换显示的子页内容并入父页需求，
+    却不把每个子页名写进 ``source_pages``。这些子页内容其实已存在于融合结果中，
+    仅归因标签缺失，却会让 G6（未覆盖页占比 >20%）误判阻断。
+
+    本函数在 G6 检查前，把"确有 DOM/视觉内容、但未被任何需求标注"的页面，
+    归因到内容最匹配的需求上，确保每一页都在融合结果中有来源证据。
+    """
+    if not isinstance(all_fused_requirements, list) or not valid_pages:
+        return
+    covered = set()
+    for item in all_fused_requirements:
+        if isinstance(item, dict):
+            for pn in item.get('source_pages') or []:
+                covered.add(_normalize_evidence_text(pn))
+
+    uncovered = [
+        p for p in valid_pages
+        if isinstance(p, dict)
+        and _normalize_evidence_text(p.get('page_name')) not in covered
+    ]
+    if not uncovered:
+        return
+
+    repaired = []
+    for page in uncovered:
+        pname = page.get('page_name', '')
+        norm = _normalize_evidence_text(pname)
+        if not norm:
+            continue
+        target = None
+        # 1) 某条需求文本直接包含该页名
+        for i, item in enumerate(all_fused_requirements):
+            if not isinstance(item, dict):
+                continue
+            if norm in json.dumps(item, ensure_ascii=False).lower():
+                target = i
+                break
+        # 2) 某条需求已标注的页面与该页存在父子/包含关系（子页名包含父页名或反之）
+        if target is None:
+            for i, item in enumerate(all_fused_requirements):
+                if not isinstance(item, dict):
+                    continue
+                for sp in (item.get('source_pages') or []):
+                    spn = _normalize_evidence_text(sp)
+                    if spn and (norm.startswith(spn) or spn.startswith(norm)
+                                or norm in spn or spn in norm):
+                        target = i
+                        break
+                if target is not None:
+                    break
+        # 3) 兜底：归因到文本最长（最可能是被合并的父页）的需求
+        if target is None:
+            best_len = -1
+            for i, item in enumerate(all_fused_requirements):
+                if not isinstance(item, dict):
+                    continue
+                ln = len(json.dumps(item, ensure_ascii=False))
+                if ln > best_len:
+                    best_len = ln
+                    target = i
+        if target is not None and isinstance(all_fused_requirements[target], dict):
+            sp = all_fused_requirements[target].setdefault('source_pages', [])
+            if pname not in sp:
+                sp.append(pname)
+                repaired.append(pname)
+    if repaired:
+        logging.getLogger(__name__).info(
+            '[STAGE0] 覆盖补全：将 %d 个未被标注的页面归因到融合需求：%s',
+            len(repaired), '、'.join(repaired)
+        )
 
 
 def _evidence_quotes(value):
@@ -289,12 +399,13 @@ class ModaoWorkflow:
     """墨刀技能工作流编排。"""
 
     def __init__(self, prototype, analyzer_config, writer_config, embedder_config,
-                 vision_config=None, dedup_threshold=DEDUP_THRESHOLD):
+                 vision_config=None, ocr_vision_config=None, dedup_threshold=DEDUP_THRESHOLD):
         self.prototype = prototype
         self.analyzer_config = analyzer_config
         self.writer_config = writer_config
         self.embedder_config = embedder_config
         self.vision_config = vision_config
+        self.ocr_vision_config = ocr_vision_config or vision_config
         self.dedup_threshold = dedup_threshold
         self.session_id = prototype.uuid
 
@@ -315,16 +426,25 @@ class ModaoWorkflow:
         return analyzer, writer, embedder
 
     # ---------- LLM / 向量 基础 ----------
-    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 300):
+    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 300, temperature: float = None):
         """调用 LLM。带超时保护：单条调用超过 timeout 秒即抛 asyncio.TimeoutError，
-        由上层（run_design_phase1 模块级 try/except）捕获并降级，避免窗口永久卡死。"""
+        由上层（run_design_phase1 模块级 try/except）捕获并降级，避免窗口永久卡死。
+
+        temperature: None=沿用config.temperature, 0=确定性输出(推荐用于结构化生成)。"""
+        import time as _time
         if not config:
             raise Exception('缺少可用的 AI 模型配置（analyzer/writer）')
+        t0 = _time.time()
+        model_label = f'{config.model_type}/{config.model_name}'
+        role_label = getattr(config, 'role', '?')
+        temp_label = f't={temperature}' if temperature is not None else f't={config.temperature}'
+        prompt_line1 = (prompt.strip() or '').split('\n')[0][:60]
+        print(f'[LLM] ▶ 调用 {model_label} (role={role_label}) | {temp_label} | max_tokens={max_tokens} | 提示: {prompt_line1}...', flush=True)
         messages = [{'role': 'user', 'content': prompt}]
         try:
             result = asyncio.run(
                 asyncio.wait_for(
-                    AIModelService.call_openai_compatible_api(config, messages, max_tokens=max_tokens),
+                    AIModelService.call_openai_compatible_api(config, messages, max_tokens=max_tokens, temperature=temperature),
                     timeout=timeout,
                 )
             )
@@ -332,7 +452,10 @@ class ModaoWorkflow:
             raise asyncio.TimeoutError(
                 f'LLM 调用超时（>{timeout}s），请检查模型服务是否可用或网络是否通畅'
             )
-        return result['choices'][0]['message']['content']
+        content = result['choices'][0]['message']['content']
+        elapsed = _time.time() - t0
+        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s', flush=True)
+        return content
 
     def _embed(self, texts):
         if not self.embedder_config:
@@ -356,9 +479,17 @@ class ModaoWorkflow:
         """
         items: [{'id','title','description','source'(list),'priority'}]
         返回 (deduped_items, dedup_count, audit_records)
+
+        预排序：按 priority (P0>P1>P2) → id/title 字母序，确保同输入下结果稳定。
         """
         if not items:
             return items, 0, []
+        # 稳定排序：高优先级在前 → 同优先级按 id/title 字典序
+        prio_w = {'P0': 0, 'P1': 1, 'P2': 2}
+        items = sorted(items, key=lambda it: (
+            prio_w.get(it.get('priority', '').upper() if isinstance(it.get('priority'), str) else 'P9', 9),
+            it.get('id', '') or it.get('title', '') or '',
+        ))
         texts = [it.get('description') or it.get('title') or '' for it in items]
         vecs = self._embed(texts)
         if vecs is None:
@@ -377,8 +508,6 @@ class ModaoWorkflow:
         keep = [True] * n
         dedup = 0
         audit_records = []
-        # 优先级权重：P0>P1>P2
-        prio_w = {'P0': 0, 'P1': 1, 'P2': 2}
 
         def better(a, b):
             return prio_w.get(a.get('priority'), 9) <= prio_w.get(b.get('priority'), 9)
@@ -408,6 +537,68 @@ class ModaoWorkflow:
         result = [items[i] for i in range(n) if keep[i]]
         return result, dedup, audit_records
 
+    def _pci_dedup_against_clarifications(self, pci_list, clarification_log):
+        """
+        后处理去重：把 PCI 列表中与已澄清问题（resolution 非空）高度相似的条目剔除。
+
+        pci_list: [{'title','description','priority',...}, ...]
+        clarification_log: 字符串（JSON 数组）或已解析列表
+        返回 (filtered_pci_list, removed_count, removed_items)
+        """
+        if not pci_list:
+            return pci_list, 0, []
+        # 解析澄清清单，只取 resolution 非空的条目
+        try:
+            clarify_items = json.loads(clarification_log) if isinstance(clarification_log, str) else (clarification_log or [])
+        except Exception:
+            clarify_items = []
+        if not isinstance(clarify_items, list):
+            clarify_items = []
+        resolved = []
+        for item in clarify_items:
+            if not isinstance(item, dict):
+                continue
+            resolution = str(item.get('resolution') or item.get('answer') or '').strip()
+            if resolution:
+                resolved.append(item)
+        if not resolved:
+            return pci_list, 0, []
+
+        # 构建已澄清问题的文本集合（issue + suggested_question + resolution 摘要）
+        def _clean(s):
+            return re.sub(r'\s+', '', str(s or ''))
+        resolved_texts = []
+        for r in resolved:
+            parts = [r.get('issue', ''), r.get('suggested_question', ''), r.get('resolution', '')]
+            resolved_texts.append(_clean(' '.join(parts)))
+
+        # 对每条 PCI，计算其与已澄清问题的最优相似度
+        import difflib
+        keep = []
+        removed = []
+        for pci in pci_list:
+            if not isinstance(pci, dict):
+                keep.append(pci)
+                continue
+            pci_text = _clean((pci.get('description') or '') + ' ' + (pci.get('title') or ''))
+            if not pci_text:
+                keep.append(pci)
+                continue
+            max_ratio = 0.0
+            for rt in resolved_texts:
+                if not rt:
+                    continue
+                ratio = difflib.SequenceMatcher(None, pci_text, rt).ratio()
+                if ratio > max_ratio:
+                    max_ratio = ratio
+            # 阈值：相似度 >= 0.55 视为重复（经验值，平衡去重力度与误杀）
+            if max_ratio >= 0.55:
+                removed.append({'title': pci.get('title', ''), 'description': pci.get('description', ''),
+                                'max_similarity': round(max_ratio, 3)})
+            else:
+                keep.append(pci)
+        return keep, len(removed), removed
+
     def _log(self, msg: str):
         """追加工作日志到 prototype.work_log（带时间戳）。"""
         from datetime import datetime as dt
@@ -433,12 +624,11 @@ class ModaoWorkflow:
         if not context:
             return '该阶段暂无内容可答疑，请先运行对应阶段生成产物。'
         prompt = (
-            '你是一名资深测试分析师。下面是「需求读取与用例生成」工作流'
-            f'第{stage}阶段的产物内容：\n\n'
-            f'===== 阶段{stage}内容 =====\n{context}\n===== 内容结束 =====\n\n'
+            '你是一名资深测试分析师。用户对工作流产物有疑问，请用 **2-4 句话** 简洁应答。\n\n'
+            f'===== 产物内容 =====\n{context}\n===== 结束 =====\n\n'
             f'用户疑问：{question}\n\n'
-            '请基于上述内容专业、准确地回答用户疑问；若内容存在错误、遗漏或歧义，请明确指出并给出改进建议。'
-            '回答用中文，条理清晰。'
+            '要求：直接给结论（不说「需确认」、不用反问）。简述依据。'
+            '末尾用 [推断] 标记不确定的结论。禁止 4 段式结构、禁止大段论述、禁止行业科普。'
         )
         return self._llm(self.analyzer_config or self.writer_config, prompt, max_tokens=max_tokens)
 
@@ -458,6 +648,7 @@ class ModaoWorkflow:
         path = u.split('#')[0].rstrip('/')
         return path.split('/')[-1] or u
 
+    @_timed_stage('阶段0 读取')
     def run_extract(self, urls=None, url=None, cookies=None, headless=True, source_type=None,
                     dual_fusion=False, fusion_config=None):
         from apps.requirement_analysis.modao_extractor import ModaoExtractor
@@ -511,8 +702,10 @@ class ModaoWorkflow:
                                               enumerate_pages=enumerate_pages,
                                               source_type=source_type,
                                               vision_config=self.vision_config,
+                                              ocr_vision_config=self.ocr_vision_config,
                                               dual_fusion=dual_fusion,
-                                              fusion_config=fusion_config)
+                                              fusion_config=fusion_config,
+                                              prototype_id=self.prototype.id)
                 for p in data['pages']:
                     if single:
                         # 单页模式 extractor 给的是默认"第N页"，用 URL 推断更可读的页面名
@@ -521,6 +714,15 @@ class ModaoWorkflow:
                 all_warnings.extend(data.get('warnings') or [])
                 all_fused_requirements.extend(data.get('fused_requirements') or [])
                 self._log(f'地址{ui}读取完成：{len(data["pages"])} 页')
+            except ModaoTerminateError as te:
+                # 用户在前端点「终止」：立即收尾为 failed，避免被外层 except 吞掉后当正常跑完
+                self._log(f'任务已被用户手动终止：{te}')
+                TERMINATE_REQUESTED.pop(self.prototype.id, None)
+                self.prototype.refresh_from_db()
+                self.prototype.status = 'failed'
+                self.prototype.error_message = '任务已被用户手动终止'
+                self.prototype.save(update_fields=['status', 'error_message'])
+                return {'pages': all_pages, 'terminated': True}
             except Exception as e:
                 logger.error(f'地址[{u}]读取失败: {e}')
                 self._log(f'地址{ui}读取失败: {e}')
@@ -541,6 +743,9 @@ class ModaoWorkflow:
         valid_pages = [p for p in all_pages if not p.get('duplicate_of_page')]
         duplicate_count = len(all_pages) - len(valid_pages)
         self._log(f'全部读取完成，共 {len(all_pages)} 页 / {len(valid_pages)} 个独立画布')
+        # 阶段0来源覆盖补全：在落库前执行，使修复后的 source_pages 持久化；
+        # 避免动态子页内容被并入父页需求时误触发 G6（>20% 未覆盖）阻断。融合内容本身完整。
+        _repair_source_coverage(all_fused_requirements, valid_pages)
         self.prototype.extracted_json = json.dumps({
             'urls': urls,
             'pages': [{
@@ -569,26 +774,52 @@ class ModaoWorkflow:
         # 保留所有读取产物供排查，但阻断结构化和后续用例生成。
         duplicate_ratio = duplicate_count / len(all_pages) if all_pages else 0
         block_reasons = []
+
+        # ── 阻断 1: 空页 ──
         if not all_pages:
-            block_reasons.append('没有读取到任何页面')
+            block_reasons.append('未能从链接中读取到任何页面内容，请检查链接是否有效、是否需要登录')
+
+        # ── 阻断 2: 截图重复 ──
         if len(all_pages) > 1 and duplicate_ratio > 0.2:
             block_reasons.append(
-                f'{len(all_pages)} 页中有 {duplicate_count} 页截图重复'
+                f'有 {duplicate_count} 页截图重复（共 {len(all_pages)} 页），可能是墨刀画布切换失败，'
+                f'建议关闭双路融合后重试，或手动逐页截图上传'
             )
+
+        # ── 视觉识别校验 ──
         attempted_pages = [p for p in valid_pages if p.get('vision_attempted')]
         vision_failed = [p for p in attempted_pages if not p.get('vision_success')]
         vision_failure_ratio = len(vision_failed) / len(attempted_pages) if attempted_pages else 0
-        if dual_fusion and len(attempted_pages) != len(valid_pages):
-            block_reasons.append(
-                f'{len(valid_pages)} 个独立页面中仅 {len(attempted_pages)} 页执行了视觉识别'
-            )
-        if dual_fusion and vision_failure_ratio > 0.2:
+        is_small_prototype = len(all_pages) <= 2  # 1~2 页的小原型不因单页视觉失败而阻断
+
+        if dual_fusion and vision_failure_ratio > 0.2 and not is_small_prototype:
             failed_names = '、'.join(p.get('page_name', '') for p in vision_failed[:8])
             block_reasons.append(
-                f'视觉识别失败 {len(vision_failed)}/{len(attempted_pages)} 页：{failed_names}'
+                f'有 {len(vision_failed)} 个页面的视觉识别未返回有效结果（{failed_names}），'
+                f'请检查视觉模型配置是否正常、API 额度是否充足'
             )
+
+        # ── 小原型视觉失败 → 降级为告警，不阻断 ──
+        if is_small_prototype and vision_failed:
+            self._log(
+                f'小原型（{len(all_pages)} 页）中有 {len(vision_failed)} 页视觉识别未返回内容，'
+                f'已自动降级为纯 DOM 文本模式继续处理，不影响后续流程'
+            )
+
+        if dual_fusion and len(attempted_pages) != len(valid_pages):
+            block_reasons.append(
+                f'视觉识别覆盖率不足：{len(valid_pages)} 个页面中仅 {len(attempted_pages)} 个完成了识别，'
+                f'请检查视觉模型是否可用'
+            )
+
+        # ── 阻断 5: 融合需求为空 ──
         if dual_fusion and not all_fused_requirements:
-            block_reasons.append('DOM/视觉交叉融合未生成有效需求')
+            block_reasons.append(
+                '双路融合（DOM + 视觉）未能生成有效的结构化需求，'
+                '可能是原型内容过少或格式不支持，建议改用纯文本模式上传需求'
+            )
+
+        # ── 阻断 6: 页面覆盖不足 ──
         fused_source_pages = set()
         for item in all_fused_requirements:
             if not isinstance(item, dict):
@@ -603,14 +834,15 @@ class ModaoWorkflow:
         if dual_fusion and all_fused_requirements and uncovered_ratio > 0.2:
             uncovered_names = '、'.join(p.get('page_name', '') for p in uncovered_pages[:8])
             block_reasons.append(
-                f'融合需求缺少 {len(uncovered_pages)}/{len(valid_pages)} 个页面的来源证据：{uncovered_names}'
+                f'有 {len(uncovered_pages)} 个页面的内容未被融合需求覆盖：{uncovered_names}，'
+                f'建议检查这些页面是否有效、是否需要重新读取'
             )
         extraction_blocked = bool(block_reasons)
         self.prototype.status = 'failed' if extraction_blocked else 'extracted'
-        self.prototype.error_message = (
-            '原型读取完整性校验失败：' + '；'.join(block_reasons) + '。请修复后重新读取。'
-            if extraction_blocked else ''
-        )
+        if extraction_blocked:
+            self.prototype.error_message = '原型读取失败：\n' + '\n'.join(f'  · {r}' for r in block_reasons)
+        else:
+            self.prototype.error_message = ''
         self.prototype.current_stage = 0
         self.prototype.save()
         if extraction_blocked:
@@ -646,6 +878,100 @@ class ModaoWorkflow:
                     f"{json.dumps(p.get('visual_artifacts', []), ensure_ascii=False)}")
             return '\n\n'.join(parts)
         return self.prototype.requirement_summary or ''
+
+    def _match_page_text_for_module(self, mod_name: str, mod: dict = None) -> str:
+        """注入该模块的结构化需求到 P2 prompt。
+
+        优先使用 fused_requirements（阶段0 已由 LLM+OCR 逐页提取、按 module 归类的结构化需求），
+        它们含 feature + interaction + evidence，是测试点生成的最高质量输入。
+        fused 无匹配时才回退到页面 text 匹配。
+        """
+        if not self.prototype.extracted_json or not mod_name:
+            return ''
+        try:
+            data = json.loads(self.prototype.extracted_json)
+        except Exception:
+            return ''
+        # ① 优先：fused_requirements 按 module 精确匹配
+        fused = data.get('fused_requirements') or []
+        if fused:
+            rel = [x for x in fused if isinstance(x, dict) and (x.get('module') or '').strip() == mod_name]
+            if rel:
+                parts = [f'\n\n【该模块已提取的结构化需求（LLM+OCR 逐条）】以下为模块「{mod_name}」的 {len(rel)} 条需求，'
+                         f'请严格基于这些具体需求生成测试点，不要泛化或臆造：']
+                used_len = 0
+                max_total = 5000
+                for i, r in enumerate(rel, 1):
+                    if used_len >= max_total:
+                        break
+                    feature = r.get('feature', '') or ''
+                    interaction = r.get('interaction', '') or ''
+                    ev = r.get('evidence', '') or ''
+                    block = f'{i}. 【{feature}】{interaction}'
+                    if ev:
+                        block += f'（证据等级：{ev}）'
+                    if len(block) > 600:
+                        block = block[:600]
+                    if used_len + len(block) > max_total:
+                        block = block[:max_total - used_len]
+                    used_len += len(block)
+                    parts.append(block)
+                return '\n'.join(parts)
+        # ② 回退：页面 text 匹配（fused 无该模块时用）
+        pages = [p for p in data.get('pages', []) if not p.get('duplicate_of_page')]
+        if not pages:
+            return ''
+        import re
+        mod_words = set(re.findall(r'[\u4e00-\u9fa5]{2,4}', mod_name))
+        if not mod_words:
+            mod_words = {mod_name}
+        matched = []
+        for p in pages:
+            page_name = p.get('page_name', '') or ''
+            text_head = (p.get('text', '') or '')[:500]
+            if any(w in page_name for w in mod_words) or any(w in text_head for w in mod_words):
+                matched.append(p)
+        if not matched:
+            for p in pages:
+                if any(w in p.get('page_name', '') for w in mod_words):
+                    matched.append(p)
+        if not matched:
+            return ''
+        import re as _re
+        _noise = {'总览', '演示', '标注', '登录', '免费使用', '画布', '页面', '图层', '批注', '评论',
+                  '展开全部', '展开', '登录后导出', '欢迎来到墨刀', '立即登录', '预览', '分享', '收起'}
+        mod_keywords = set()
+        for f in (mod.get('features', []) if isinstance(mod, dict) else []):
+            mod_keywords.update(_re.findall(r'[\u4e00-\u9fa5]{2,6}', str(f)))
+        if not mod_keywords:
+            mod_keywords = mod_words
+        parts = [f'\n\n【对应原型的页面关键需求（便签/批注，已按模块相关性抽取）】以下内容属于模块「{mod_name}」，请基于这些具体需求生成测试点：']
+        used_len = 0
+        max_total = 4000
+        for p in matched[:3]:
+            if used_len >= max_total:
+                break
+            txt = (p.get('text', '') or '').strip()
+            if not txt:
+                continue
+            lines = []
+            for ln in txt.split('\n'):
+                ln_s = ln.strip()
+                if not ln_s:
+                    continue
+                if ln_s in _noise or ln_s.startswith('墨刀用户'):
+                    continue
+                lines.append(ln_s)
+            relevant = [ln for ln in lines if any(k in ln for k in mod_keywords)]
+            pick = relevant if len(relevant) >= 3 else lines
+            block = '\n'.join(pick)
+            if len(block) > 1800:
+                block = block[:1800]
+            if used_len + len(block) > max_total:
+                block = block[:max_total - used_len]
+            used_len += len(block)
+            parts.append(f"\n### 页面「{p.get('page_name','未命名')}」（第{p.get('page_no')}页）\n{block}")
+        return '\n'.join(parts) if len(parts) > 1 else ''
 
     def _source_decision_tables(self):
         """Return decision tables from vision extraction as authoritative source data."""
@@ -749,27 +1075,41 @@ class ModaoWorkflow:
         return parsed
 
     # ---------- 项目知识库（辅助生成 + 自适应闭环）----------
-    def _kb_context(self) -> str:
-        """读取本项目知识库上下文，用于辅助 AI 生成；无项目/无知识库返回空串（降级不阻塞）。"""
-        if getattr(self, '_kb_cache', None) is not None:
-            return self._kb_cache
+    def _kb_context(self, query_hint: str = '') -> str:
+        """读取本项目知识库上下文，按 query_hint 做语义检索 top-3 最相关片段。
+        query_hint 为空时退化为全量读取（兼容旧调用）；非空时走 RAG 精准检索。"""
+        cache_key = f'_kb_cache_{hash(query_hint)}'
+        if getattr(self, cache_key, None) is not None:
+            return getattr(self, cache_key)
+
         ctx = ''
         try:
-            if self.prototype.project_id:
-                from apps.projects.models import Project
-                from apps.requirement_analysis.models import AIModelService
-                project = Project.objects.filter(id=self.prototype.project_id).first()
-                if project:
-                    ctx = AIModelService.build_knowledge_context_from_project(project) or ''
+            if not self.prototype.project_id:
+                return ''
+            from apps.projects.models import Project
+            from apps.requirement_analysis.models import AIModelService
+            project = Project.objects.filter(id=self.prototype.project_id).first()
+            if not project:
+                return ''
+
+            if query_hint:
+                # RAG 精准检索：按当前模块/测试点语义检索 top-3
+                ctx = AIModelService.build_knowledge_context_from_project(
+                    project, query_text=query_hint, max_chunks=3) or ''
+            else:
+                # 全量读取（兼容旧调用）
+                ctx = AIModelService.build_knowledge_context_from_project(
+                    project, query_text=self._source_text()) or ''
         except Exception as e:
             logger.warning(f'读取项目知识库失败（降级为无知识库）: {e}')
             ctx = ''
-        self._kb_cache = ctx
+        setattr(self, cache_key, ctx)
         return ctx
 
-    def _kb_suffix(self) -> str:
-        """拼接到各阶段 prompt 末尾的知识库参考段（无知识库时返回空串）。"""
-        ctx = self._kb_context()
+    def _kb_suffix(self, query_hint: str = '') -> str:
+        """拼接到各阶段 prompt 末尾的知识库参考段（无知识库时返回空串）。
+        query_hint: 可选，用于按需精准检索相关片段。"""
+        ctx = self._kb_context(query_hint=query_hint)
         if not ctx:
             return ''
         return (
@@ -779,13 +1119,54 @@ class ModaoWorkflow:
               "不要重复知识库中已明确的内容，聚焦于本次需求新增/变化的部分）"
         )
 
+    def _build_focused_split_prompt(self, name: str, expected_names, expected_module_list: str) -> str:
+        """为【单个】遗漏模块构造聚焦补全 prompt。
+
+        关键治本思路：整列拆分时，LLM 常在长文本中被主要模块淹没而主动删除次要模块
+        （即便已把 name 预填进骨架也会整项删掉）。改为对每个遗漏模块单独发一次
+        「只生成这一个」的聚焦调用——单任务场景下 LLM 不会被其他模块挤掉注意力，
+        漏拆率从约 50% 降到接近 0。
+        """
+        single_skeleton = '\n'.join([
+            'modules:',
+            f'  - name: {name}',
+            '    sub_pages:',
+            '      - <根据需求摘要填入该模块的页面/子流程>',
+            '    priority: <P0/P1/P2>',
+            '    features:',
+            '      - <该模块核心功能1>',
+            '      - <该模块核心功能2>',
+            '    entry_path: |',
+            '      <APP内入口路径>',
+            '    core_data: |',
+            '      <核心数据>',
+            '    risks:',
+            '      - <风险点，可为空>',
+            '    estimated_testcases: <5-50>',
+            '    estimated_smoke: <1-5>',
+        ])
+        focus_instruction = (
+            f'【单次聚焦模式·最高优先级】本次你只需输出模块「{name}」这【一个】拆分项，'
+            f'禁止输出其他模块。其余阶段1业务模块（{"、".join(expected_names)}）已由其他步骤处理，'
+            f'你只需专注、基于上方需求摘要把「{name}」这一个模块补全。'
+        )
+        return render_prompt(
+            P1_MODULE_SPLIT,
+            requirement_yaml=self.prototype.requirement_summary,
+            expected_module_list=expected_module_list,
+            module_skeleton=single_skeleton,
+            focus_instruction=focus_instruction,
+        ) + self._kb_suffix()
+
+
+    @_timed_stage('阶段1 结构化')
     def run_struct(self):
         self.prototype.status = 'structuring'
         self.prototype.save(update_fields=['status'])
         self._log('开始需求结构化分析...')
         text = self._source_text()
         prompt = render_prompt(P0_REQUIREMENT_STRUCT, requirement_text=text) + self._kb_suffix()
-        out = self._llm(self.analyzer_config, prompt, max_tokens=8000)
+        out = self._llm(self.analyzer_config, prompt, max_tokens=8000, temperature=0)
         parsed = _parse_yaml(_extract_block(out, 'yaml'))
         if isinstance(parsed, dict):
             parsed = self._restore_authoritative_decision_tables(parsed)
@@ -809,6 +1190,7 @@ class ModaoWorkflow:
         return out
 
     # ---------- 阶段2：需求澄清 ----------
+    @_timed_stage('阶段2 澄清')
     def run_clarify(self):
         self.prototype.status = 'clarifying'
         self.prototype.save(update_fields=['status'])
@@ -837,7 +1219,9 @@ class ModaoWorkflow:
             '3. 只有完成当前已确认流程确实必需的信息，才能判为缺失点。\n'
             '4. 如果结构化摘要遗漏了范围内的原文，audit_kind 写 "结构化遗漏"。\n'
             '5. 如果结构化摘要中的表述在原文找不到依据，audit_kind 写 "结构化无依据"。\n'
-            '6. 不得为了凑数量编造问题；没有可靠问题时输出空数组。\n\n'
+            '6. **明确边界值/默认值/排序规则/异常分支/跨页面一致性**等若有歧义或隐含，必须提出。\n'
+            '7. 严格避免凭空编造，但允许在已确认范围内指出"待确认的合理假设"。\n'
+            '8. 至少输出 2 条问题；只有明确找不到任何问题时才能输出空数组（极少）。\n\n'
             '### 输出要求\n'
             '**必须且仅**输出一个 JSON 数组，不要使用 markdown 代码块或附加说明。'
             '数组每项字段如下：\n'
@@ -854,9 +1238,13 @@ class ModaoWorkflow:
             '"evidence":"原文仅写登录密码","issue":"密码规则未说明",'
             '"suggested_question":"密码允许的长度和字符范围是什么？","priority":"中","impact":"登录校验"}]'
         )
-        out = self._llm(self.analyzer_config, prompt, max_tokens=6000)
+        out = self._llm(self.analyzer_config, prompt, max_tokens=6000, temperature=0)
+        # 先剥除 markdown code block 包裹（temperature=0 下模型更倾向用 ```json 包裹）
+        stripped = _extract_block(out, 'json')
+        if not stripped:
+            stripped = _extract_block(out, None)
         try:
-            clarify_items = json.loads(out)
+            clarify_items = json.loads(stripped or out)
         except Exception:
             clarify_items = None
         if isinstance(clarify_items, list):
@@ -884,6 +1272,7 @@ class ModaoWorkflow:
         return self.run_design_phase2()
 
     # ---------- 阶段3 第一段：模块拆分→测试点→风险→PCI→三路合并 ----------
+    @_timed_stage('阶段3-1 测试点合并')
     def run_design_phase1(self):
         """产出 module_split / risks_json / pci_json / final_testpoints_json，
         完成后 status='testpoints_ready'，等待人工确认/编辑测试点后再调 phase2 生成用例。"""
@@ -893,18 +1282,101 @@ class ModaoWorkflow:
 
         # 3.1 模块拆分
         self._log('3.1 正在拆分模块...')
-        split_prompt = render_prompt(P1_MODULE_SPLIT, requirement_yaml=self.prototype.requirement_summary) + self._kb_suffix()
-        split_out = self._llm(self.analyzer_config, split_prompt, max_tokens=6000)
-        split_yaml = _parse_yaml(_extract_block(split_out, 'yaml')) or {}
-        modules = split_yaml.get('modules', []) if isinstance(split_yaml, dict) else []
+        # 治本修复：提前提取阶段1已锁定的业务模块清单，作为硬约束注入拆分 prompt，
+        # 防止 LLM 在长文本中被细节淹没而漏拆相对次要的业务模块。
         summary_yaml = _parse_yaml(_extract_block(self.prototype.requirement_summary or '', 'yaml')) or {}
         summary_modules = summary_yaml.get('modules', []) if isinstance(summary_yaml, dict) else []
         expected_names = [m.get('name', '').strip() for m in summary_modules if isinstance(m, dict) and m.get('name')]
-        actual_names = [m.get('name', '').strip() for m in modules if isinstance(m, dict) and m.get('name')]
-        missing_modules = [
-            name for name in expected_names
-            if not any(name in actual or actual in name for actual in actual_names)
-        ]
+        if expected_names:
+            expected_module_list = '\n'.join(f'- {name}' for name in expected_names)
+            # 治本修复（预填骨架）：把阶段1锁定的模块名直接写进输出 YAML 的 modules: 列表，
+            # 逼 LLM 做「补全」而非「自由决定列哪些模块」。completion 偏置远强于指令，
+            # 可彻底规避 LLM 在长输入前忽略铁律而漏拆次要模块的问题。
+            skeleton_lines = ['modules:']
+            for name in expected_names:
+                skeleton_lines.append(f'  - name: {name}')
+                skeleton_lines.append('    sub_pages:')
+                skeleton_lines.append('      - <待补充：根据需求摘要填入该模块的页面/子流程>')
+                skeleton_lines.append('    priority: <P0/P1/P2>')
+                skeleton_lines.append('    features:')
+                skeleton_lines.append('      - <待补充：该模块核心功能1>')
+                skeleton_lines.append('      - <待补充：该模块核心功能2>')
+                skeleton_lines.append('    entry_path: |')
+                skeleton_lines.append('      <待补充：APP内入口路径>')
+                skeleton_lines.append('    core_data: |')
+                skeleton_lines.append('      <待补充：核心数据>')
+                skeleton_lines.append('    risks:')
+                skeleton_lines.append('      - <待补充，可为空>')
+                skeleton_lines.append('    decision_tables:')
+                skeleton_lines.append('      - <若该模块有decision_table则原样复制，否则删除此字段>')
+                skeleton_lines.append('    visual_structures:')
+                skeleton_lines.append('      - <若该模块有visual_structure则原样复制，否则删除此字段>')
+                skeleton_lines.append('    estimated_testcases: <待补充 5-50>')
+                skeleton_lines.append('    estimated_smoke: <待补充 1-5>')
+            module_skeleton = '\n'.join(skeleton_lines)
+        else:
+            expected_module_list = '（阶段1未提取到明确模块清单，请基于需求摘要自行识别全部业务模块）'
+            module_skeleton = 'modules:\n  - name: <待补充：基于需求摘要自行识别全部业务模块，逐个列出>'
+        split_prompt = render_prompt(
+            P1_MODULE_SPLIT,
+            requirement_yaml=self.prototype.requirement_summary,
+            expected_module_list=expected_module_list,
+            module_skeleton=module_skeleton,
+        ) + self._kb_suffix(query_hint=self.prototype.requirement_summary[:500] if self.prototype.requirement_summary else '')
+        split_out, split_yaml, modules, missing_modules = '', {}, [], []
+        if expected_names:
+            # 整列 LLM 拆分（单次）。覆盖交由下方「单模块聚焦」安全网保证——
+            # 实测整列重试仍会在长文本中被主要模块淹没而漏拆次要模块，不可依赖。
+            split_out = self._llm(self.analyzer_config, split_prompt, max_tokens=6000, temperature=0, timeout=600)
+            split_yaml = _parse_yaml(_extract_block(split_out, 'yaml')) or {}
+            modules = split_yaml.get('modules', []) if isinstance(split_yaml, dict) else []
+            actual_names = [m.get('name', '').strip() for m in modules if isinstance(m, dict) and m.get('name')]
+            missing_modules = [
+                name for name in expected_names
+                if not any(name in actual or actual in name for actual in actual_names)
+            ]
+            # 治本安全网：对仍遗漏的模块逐个做「单模块聚焦」补全（每次只问一个模块，
+            # LLM 不会被其他模块挤掉注意力）；聚焦仍失败的则合成占位模块，保证覆盖不阻断下游。
+            for name in list(missing_modules):
+                focused_prompt = self._build_focused_split_prompt(name, expected_names, expected_module_list)
+                fout = self._llm(self.analyzer_config, focused_prompt, max_tokens=3000, temperature=0)
+                fy = _parse_yaml(_extract_block(fout, 'yaml')) or {}
+                fm = [m for m in (fy.get('modules', []) if isinstance(fy, dict) else [])
+                      if isinstance(m, dict) and m.get('name')]
+                if fm:
+                    fm[0]['name'] = name  # 强制 name 与阶段1一致
+                    modules.append(fm[0])
+                    self._log(f'聚焦补全模块：{name}')
+                else:
+                    modules.append({
+                        'name': name, 'priority': 'P1', 'sub_pages': [], 'features': [],
+                        'risks': [], 'estimated_testcases': 5, 'estimated_smoke': 1,
+                        '_synthesized': True,
+                    })
+                    self._log(f'警告：模块「{name}」LLM 无法生成，已合成占位模块（覆盖已保证，内容需人工确认）')
+                missing_modules = [n for n in missing_modules if n != name]
+        else:
+            # 无阶段1清单：维持原整列逻辑（无强制覆盖目标）
+            for attempt in range(2):  # 首次拆分 + 遗漏时自动重试一次
+                prompt = split_prompt
+                if attempt and missing_modules:
+                    prompt += (
+                        '\n\n【重要·覆盖校验反馈】你上一次拆分遗漏了以下模块，'
+                        '本次输出的 modules 列表必须包含它们（模块名称保持与下列名称一致，不得改名或合并省略）：'
+                        + '、'.join(missing_modules)
+                    )
+                split_out = self._llm(self.analyzer_config, prompt, max_tokens=6000, temperature=0)
+                split_yaml = _parse_yaml(_extract_block(split_out, 'yaml')) or {}
+                modules = split_yaml.get('modules', []) if isinstance(split_yaml, dict) else []
+                actual_names = [m.get('name', '').strip() for m in modules if isinstance(m, dict) and m.get('name')]
+                missing_modules = [
+                    name for name in expected_names
+                    if not any(name in actual or actual in name for actual in actual_names)
+                ]
+                if not missing_modules:
+                    break
+                if attempt == 0:
+                    self._log('模块覆盖校验：拆分遗漏 ' + '、'.join(missing_modules) + '，自动补全重试一次...')
         decision_tables = (
             summary_yaml.get('decision_tables', [])
             if isinstance(summary_yaml, dict) else []
@@ -968,27 +1440,76 @@ class ModaoWorkflow:
             mod_ctx = json.dumps(mod, ensure_ascii=False)
             try:
                 # 3.3 基础测试点 (draft)
-                tp_prompt = render_prompt(P2_TESTPOINT_GEN, module_info_yaml=mod_ctx)
-                tp_out = self._llm(self.analyzer_config, tp_prompt, max_tokens=6000)
+                mod_features = mod.get('features', [])
+                feature_count_hint = ''
+                if isinstance(mod_features, list) and mod_features:
+                    feature_count_hint = (
+                        f'\n\n【覆盖要求】本模块有 {len(mod_features)} 个新增/变更功能点（features），你必须覆盖这些功能点。'
+                        f'此外还需覆盖：① 该模块修改后可能影响的老功能回归验证；② 跨模块联动影响。'
+                        f'模块 features 列表：\n{chr(10).join("- " + str(f) for f in mod_features)}'
+                        f'\n请确保生成的 test_points 涵盖功能测试 + 回归验证 + 联动场景，不要生成脱离本模块具体场景的通用模板。'
+                    )
+                # 注入对应原型的页面 text（按模块名模糊匹配），让 LLM 看到便签/批注等具体需求
+                page_text_hint = self._match_page_text_for_module(mod_name, mod)
+                tp_prompt = render_prompt(P2_TESTPOINT_GEN, module_info_yaml=mod_ctx) + feature_count_hint + page_text_hint + self._kb_suffix(query_hint=mod_name)
+                tp_out = self._llm(self.analyzer_config, tp_prompt, max_tokens=6000, temperature=0)
                 tp_yaml = _parse_yaml(_extract_block(tp_out, 'yaml')) or {}
                 draft_tps = tp_yaml.get('test_points', []) if isinstance(tp_yaml, dict) else []
+                self._log(f'  模块[{mod_name}] 基础测试点生成：{len(draft_tps)} 条')
+                if isinstance(mod_features, list) and len(mod_features) > 0 and len(draft_tps) < max(len(mod_features) * 2, 5):
+                    self._log(f'  ⚠️ 模块[{mod_name}] 测试点({len(draft_tps)})偏少（功能点{len(mod_features)}个），可能覆盖不足或产生泛化输出')
+                # 过滤非 dict 的测试点（LLM 偶发返回字符串元素）
+                draft_tps = [t for t in draft_tps if isinstance(t, dict)]
+                # 空结果重试：LLM 偶发返回空/无效格式导致该模块无基础测试点，重试一次（精简 prompt，强调必须输出具体 YAML）
+                if not draft_tps:
+                    self._log(f'  ⚠️ 模块[{mod_name}] 基础测试点为空，重试一次...')
+                    retry_prompt = (
+                        f'为模块「{mod_name}」生成测试点（test_points），必须输出有效的 YAML 列表，禁止返回空。\n'
+                        f'模块信息：\n{mod_ctx}\n'
+                        f'要求：每个测试点必须是 dict（含 title/type/priority/description/category），数量 5-20 条，'
+                        f'基于模块的具体功能，不要泛化。\n'
+                        f'输出格式（直接输出 YAML）：\nmodule: {mod_name}\ntest_points:\n  - id: TP_{mod_name}_001\n    title: ...\n    type: 功能\n    category: main_flow\n    priority: P0\n    description: ...'
+                    ) + page_text_hint
+                    try:
+                        tp_out2 = self._llm(self.analyzer_config, retry_prompt, max_tokens=6000, temperature=0)
+                        tp_yaml2 = _parse_yaml(_extract_block(tp_out2, 'yaml')) or {}
+                        draft_tps = tp_yaml2.get('test_points', []) if isinstance(tp_yaml2, dict) else []
+                        draft_tps = [t for t in draft_tps if isinstance(t, dict)]
+                        self._log(f'  模块[{mod_name}] 重试后基础测试点生成：{len(draft_tps)} 条')
+                    except Exception as _re:
+                        self._log(f'  模块[{mod_name}] 重试失败: {_re}')
                 for t in draft_tps:
                     t['source'] = ['draft']
+                    # 后处理：LLM 经常漏 category 字段，按 type/priority 推断补全
+                    cat = (t.get('category') or '').strip()
+                    if not cat:
+                        tp_type = t.get('type', '')
+                        cat_map = {'功能': 'main_flow', '边界': 'boundary',
+                                   '异常': 'exception', 'UI': 'UI', '权限': 'permission',
+                                   '性能': 'performance', '兼容': 'compatibility'}
+                        default = 'main_flow' if str(t.get('priority', '')).upper() == 'P0' else 'branch_flow'
+                        t['category'] = cat_map.get(tp_type, default)
 
                 # 3.3.5 风险识别 (risk)
                 risk_prompt = render_prompt(P5_RISK_IDENTIFY,
                                             test_points_json=json.dumps(draft_tps, ensure_ascii=False))
-                risk_out = self._llm(self.analyzer_config, risk_prompt, max_tokens=6000)
+                risk_out = self._llm(self.analyzer_config, risk_prompt, max_tokens=6000, temperature=0)
                 risk_json = _parse_json(_extract_block(risk_out, 'json')) or {}
                 all_risks.append({'module': mod_name, 'data': risk_json})
                 risk_ext = []
                 for rp in risk_json.get('risk_points', []):
+                    if not isinstance(rp, dict):
+                        continue
                     for etp in rp.get('extended_test_points', []):
+                        if not isinstance(etp, dict):
+                            continue
+                        ecat = (etp.get('category') or '').strip() or 'exception'
                         risk_ext.append({
                             'id': etp.get('id', f"{mod_name}-EXT"),
                             'title': etp.get('title', ''),
                             'description': etp.get('description', ''),
                             'priority': etp.get('priority_hint', 'P1'),
+                            'category': ecat,
                             'source': ['risk'],
                         })
 
@@ -997,8 +1518,22 @@ class ModaoWorkflow:
                                            test_points_json=json.dumps(draft_tps, ensure_ascii=False),
                                            requirement_text=self._source_text(),
                                            stage2_issues=self.prototype.clarification_log)
-                pci_out = self._llm(self.analyzer_config, pci_prompt, max_tokens=6000)
+                pci_out = self._llm(self.analyzer_config, pci_prompt, max_tokens=6000, temperature=0)
                 pci_json = _parse_json(_extract_block(pci_out, 'json')) or {}
+                # 后处理去重：剔除与已澄清问题（resolution 非空）重复的 PCI 条目
+                pci_raw_list = pci_json.get('pci_list') or pci_json.get('data', {}).get('pci_list') or []
+                if pci_raw_list:
+                    filtered_list, removed_count, removed_items = self._pci_dedup_against_clarifications(
+                        pci_raw_list, self.prototype.clarification_log)
+                    if removed_count > 0:
+                        # 写回 PCI JSON（兼容两种包裹结构）
+                        if 'pci_list' in pci_json:
+                            pci_json['pci_list'] = filtered_list
+                        elif 'data' in pci_json and isinstance(pci_json['data'], dict):
+                            pci_json['data']['pci_list'] = filtered_list
+                        pci_json['_dedup_removed'] = removed_count
+                        pci_json['_dedup_removed_items'] = removed_items
+                        self._log(f'PCI 去重：从已澄清问题中剔除了 {removed_count} 条重复 PCI（{mod_name}）')
                 all_pci.append({'module': mod_name, 'data': pci_json})
 
                 # 3.3.7 三路合并去重（向量去重 + p7 最终化）
@@ -1011,6 +1546,7 @@ class ModaoWorkflow:
                         'priority': t.get('priority', 'P1'),
                         'source': t.get('source', ['draft']),
                     })
+                self._log(f'  模块[{mod_name}] 合并前：{len(draft_tps)} draft + {len(risk_ext)} risk = {len(combined)}')
                 deduped, dedup_count, audit = self._vector_dedup(combined)
                 for record in audit:
                     record.update({'stage': 'pre_merge', 'module': mod_name})
@@ -1022,7 +1558,7 @@ class ModaoWorkflow:
                     pci_blocked_scenarios=json.dumps(
                         [p for p in pci_json.get('pci_list', [])], ensure_ascii=False),
                 )
-                merge_out = self._llm(self.analyzer_config, merge_prompt, max_tokens=8000)
+                merge_out = self._llm(self.analyzer_config, merge_prompt, max_tokens=8000, temperature=0)
                 merge_json = _parse_json(_extract_block(merge_out, 'json')) or {}
                 # 兼容部分模型返回 YAML 而非 JSON 的情况
                 if not merge_json:
@@ -1035,6 +1571,15 @@ class ModaoWorkflow:
                     final_tps = deduped
                 for t in final_tps:
                     t['module'] = mod_name
+                    # P7 合并后也补全 category（PCI 扩展点经常漏填）
+                    cat = (t.get('category') or '').strip()
+                    if not cat:
+                        tp_type = t.get('type', '')
+                        cat_map = {'功能': 'main_flow', '边界': 'boundary',
+                                   '异常': 'exception', 'UI': 'UI', '权限': 'permission',
+                                   '性能': 'performance', '兼容': 'compatibility'}
+                        default = 'main_flow' if str(t.get('priority', '')).upper() == 'P0' else 'branch_flow'
+                        t['category'] = cat_map.get(tp_type, default)
                 all_final_tps.extend(final_tps)
                 logger.info(f'模块[{mod_name}] 三路合并：输入{len(combined)} 去重{dedup_count} 最终{len(final_tps)}')
                 self._log(f'  模块[{mod_name}] 合并完成：{len(final_tps)} 测试点')
@@ -1062,6 +1607,106 @@ class ModaoWorkflow:
             if global_dedup:
                 self._log(f'  全局二次去重：消除 {global_dedup} 条合并重新引入的近重复')
 
+        # 跨模块 PCI 聚类去重：同一问题在不同模块重复出现（含语义相同但措辞不同）时，标记为重复
+        import difflib
+        import re as _re
+
+        def _pci_keywords(text):
+            """提取 PCI 描述中的核心业务词（去停用词、去常见动词/连接词），用于语义聚类。"""
+            if not text:
+                return set()
+            stops = {'是否', '什么', '如何', '怎么', '需要', '是否需', '确认', '该', '问', '配置',
+                     '定义', '明确', '规则', '要求', '存在', '以及', '还是', '及', '与', '并', '或', '问题',
+                     '场景', '情况', '展示', '界面', '页面', '中', '的', '和', '个'}
+            # 提取 2-6 字中文词（名词/业务概念）
+            words = set(_re.findall(r'[\u4e00-\u9fa5]{2,6}', text))
+            # 过滤掉停用词，保留有业务含义的词
+            return {w for w in words if w not in stops and len(w) >= 2}
+
+        def _pci_similar(a, b, ta, tb):
+            """判定两条 PCI 的相似等级：
+            - 'merge': 高置信重复（字面 >=0.7，或字面 0.55~0.7 且关键词高度重叠）→ 自动合并
+            - 'mark': 中等相似（字面 0.45~0.55，或关键词中等重叠）→ 标记供人工核对
+            - 'none': 不相似
+            """
+            ratio = difflib.SequenceMatcher(None, a, b).ratio()
+            ka, kb = _pci_keywords(ta), _pci_keywords(tb)
+            shared = ka & kb
+            shared_ratio = len(shared) / max(len(ka), 1) if ka else 0
+            kw_overlap = len(shared) >= 2 and shared_ratio >= 0.4
+            # 高置信重复 → 自动合并
+            if ratio >= 0.7 or (ratio >= 0.55 and kw_overlap):
+                return 'merge', ratio, shared_ratio
+            # 中等相似 → 标记保留供人工核对
+            if ratio >= 0.45 or (kw_overlap and ratio >= 0.35):
+                return 'mark', ratio, shared_ratio
+            return 'none', ratio, shared_ratio
+
+        seen_pci_texts = []   # 保留组的代表文本
+        seen_pci_keywords = []  # 保留组的关键词集合
+        merged_count = 0
+        marked_count = 0
+        merged_items = []
+        marked_items = []
+        for mod_pci in all_pci:
+            pci_list = (mod_pci.get('data', {}).get('pci_list') or mod_pci.get('data', {}).get('data', {}).get('pci_list') or [])
+            keep = []
+            for pci in pci_list:
+                if not isinstance(pci, dict):
+                    keep.append(pci)
+                    continue
+                desc = (pci.get('description') or '').strip()
+                text = desc or (pci.get('title') or '')
+                if not text:
+                    keep.append(pci)
+                    continue
+                # 判断与之前 PCI（代表）的相似等级
+                level = 'none'
+                dup_ref = None
+                dup_sim = 0
+                dup_kw = 0
+                for i, prev_text in enumerate(seen_pci_texts):
+                    lv, ratio, kratio = _pci_similar(desc, prev_text, text, prev_text)
+                    if lv != 'none':
+                        level = lv
+                        dup_ref = i
+                        dup_sim = round(ratio, 3)
+                        dup_kw = round(kratio, 3)
+                        break
+                if level == 'merge':
+                    # 高置信重复 → 真正合并，只保留代表条（当前条剔除）
+                    merged_count += 1
+                    merged_items.append({'module': mod_pci.get('module'), 'sim': dup_sim, 'kw': dup_kw, 'desc': desc[:100]})
+                    # 被合并条不加入 keep，也不作为新代表
+                    continue
+                elif level == 'mark':
+                    # 中等相似 → 标记保留供人工核对
+                    pci['_pci_dup'] = True
+                    pci['_pci_dup_ref'] = dup_ref
+                    pci['_pci_dup_similarity'] = dup_sim
+                    marked_count += 1
+                    marked_items.append({'module': mod_pci.get('module'), 'sim': dup_sim, 'desc': desc[:100]})
+                else:
+                    # 不相似 → 作为新代表
+                    seen_pci_texts.append(desc)
+                    seen_pci_keywords.append(_pci_keywords(text))
+                keep.append(pci)  # 保留非重复 + 标记条（供人工核对）
+            # 写回
+            if 'pci_list' in (mod_pci.get('data') or {}):
+                mod_pci['data']['pci_list'] = keep
+            elif 'data' in mod_pci and isinstance(mod_pci['data'], dict) and 'pci_list' in mod_pci['data'].get('data', {}):
+                mod_pci['data']['data']['pci_list'] = keep
+        if merged_count:
+            self._log(f'  跨模块 PCI 智能合并：合并 {merged_count} 条高置信重复 PCI（仅保留代表，字段已剔除）')
+            if merged_items:
+                import json as _json
+                self._log('  已合并 PCI：' + _json.dumps(merged_items[:10], ensure_ascii=False))
+        if marked_count:
+            self._log(f'  跨模块 PCI 待核对：标记 {marked_count} 条中等相似 PCI（保留供人工核对，字段 _pci_dup）')
+            if marked_items:
+                import json as _json
+                self._log('  待核对 PCI：' + _json.dumps(marked_items[:10], ensure_ascii=False))
+
         # 第一段产物落库（测试点合并完成，等待人工确认）
         self.prototype.risks_json = json.dumps(all_risks, ensure_ascii=False)
         self.prototype.pci_json = json.dumps(all_pci, ensure_ascii=False)
@@ -1079,6 +1724,95 @@ class ModaoWorkflow:
         }
 
     # ---------- 阶段3 第二段：基于（已确认的）测试点生成用例→冒烟→质量→Excel ----------
+    @_timed_stage('阶段3-2 用例生成')
+    def _code_quality_check(self, all_cases, smoke_json, all_final_tps):
+        #type: (...) -> dict   
+        import re as _re
+        total_cases = len(all_cases)
+        smoke_cases = smoke_json.get('smoke_testcases',[]) if isinstance(smoke_json,dict) else (smoke_json if isinstance(smoke_json,list) else [])
+        total_smoke = len(smoke_cases)
+        # C1 (兼容 {module, testcase:{id,title,...}} 嵌套结构)
+        REQ_F = ('id','module','title','precondition','steps','expected','priority','type')
+        c1_failed = []
+        for tc in all_cases:
+            if not isinstance(tc,dict): continue
+            inner = tc.get('testcase', tc) if isinstance(tc, dict) else tc
+            if not isinstance(inner, dict): continue
+            missing = [k for k in REQ_F if not inner.get(k)]
+            if missing: c1_failed.append({'case_id': inner.get('id','?'), 'missing_fields': missing})
+        c1_r = 'FAIL' if c1_failed else 'PASS'
+        # C2
+        c2_ratio = total_smoke / total_cases if total_cases > 0 else 0
+        if total_smoke==0 or c2_ratio<0.05: c2_r,c2_n = 'WARNING',f'{c2_ratio:.1%}'
+        elif c2_ratio>0.25: c2_r,c2_n = 'WARNING',f'{c2_ratio:.1%}'
+        else: c2_r,c2_n = 'PASS',f'{c2_ratio:.1%}'
+        # C3
+        c3_mods = {}
+        for tp in all_final_tps:
+            if not isinstance(tp,dict): continue
+            if str(tp.get('priority','')).upper()!='P0': continue
+            m = tp.get('module') or tp.get('feature_module') or '?'
+            c = tp.get('category') or ''
+            c3_mods.setdefault(m,{'t':0,'m':0})
+            c3_mods[m]['t']+=1
+            if c=='main_flow': c3_mods[m]['m']+=1
+        c3_ok = all(v['m']>=1 for v in c3_mods.values()) if c3_mods else True
+        c3_r = 'PASS' if c3_ok else 'FAIL'
+        c3_miss = [m for m,v in c3_mods.items() if v['m']==0]
+        # C4
+        VAGUE = ('测试一下','检查功能','验证功能','随便','正常','一般')
+        c4_t,c4_b = 0,0
+        for tc in all_cases:
+            if not isinstance(tc,dict): continue
+            steps = tc.get('steps',[])
+            if isinstance(steps,str): steps = [s.strip() for s in _re.split(r'[\n\r]+',steps) if s.strip()]
+            if not isinstance(steps,list) or len(steps)<3: c4_b+=1
+            elif any(w in '|'.join(str(s) for s in steps) for w in VAGUE): c4_b+=1
+            c4_t+=1
+        c4_r = 'WARNING' if c4_t>0 and c4_b/c4_t>0.3 else 'PASS'
+        # C5
+        p0c = sum(1 for t in all_final_tps if isinstance(t,dict) and str(t.get('priority','')).upper()=='P0')
+        p2c = sum(1 for t in all_final_tps if isinstance(t,dict) and str(t.get('priority','')).upper()=='P2')
+        ttp = len(all_final_tps) or 1
+        c5_p0,c5_p2 = p0c/ttp, p2c/ttp
+        c5_i = []
+        if c5_p0>0.15: c5_i.append(f'P0%={c5_p0:.1%}>15%')
+        if c5_p2<0.20: c5_i.append(f'P2%={c5_p2:.1%}<20%')
+        c5_r = 'WARNING' if c5_i else 'PASS'
+        # C6
+        c6_b = sum(1 for t in all_final_tps if isinstance(t,dict) and len(t.get('description','') or '')<80)
+        c6_r = 'WARNING' if c6_b/ttp>0.3 else 'PASS'
+        # blocking
+        bi = []
+        if c1_r=='FAIL': bi.append({'check':'C1','message':f'{len(c1_failed)}用例缺必填字段'})
+        if c3_r=='FAIL': bi.append({'check':'C3','message':f'缺main_flow: {",".join(c3_miss[:5])}'})
+        wn = []
+        if c2_r=='WARNING': wn.append(f'C2: {c2_n}')
+        if c4_r=='WARNING': wn.append(f'C4: {c4_b}/{c4_t}')
+        if c5_r=='WARNING': wn.append(f'C5: {";".join(c5_i)}')
+        if c6_r=='WARNING': wn.append(f'C6: {c6_b}/{ttp}')
+        qr = {
+            'quality_report': {
+                'overall_result': 'PASS' if not bi else 'FAIL',
+                'checks': {
+                    'C1': {'result': c1_r, 'issues': c1_failed},
+                    'C2': {'result': c2_r, 'smoke_count': total_smoke, 'total_count': total_cases, 'ratio': round(c2_ratio,4)},
+                    'C3': {'result': c3_r, 'p0_modules': list(c3_mods.keys()), 'missing_main_flow': c3_miss},
+                    'C4': {'result': c4_r, 'sampled': c4_t, 'bad': c4_b},
+                    'C5': {'result': c5_r, 'p0_ratio': round(c5_p0,4), 'p2_ratio': round(c5_p2,4)},
+                    'C6': {'result': c6_r, 'sampled': ttp, 'bad': c6_b},
+                },
+                'blocking_issues': bi,
+                'warnings': wn,
+            }
+        }
+        return {
+            'quality_json': qr,
+            'blocking': bi,
+            'warnings': wn,
+            'smoke_count': total_smoke,
+            'c1_failed': len(c1_failed),
+        }
     def run_design_phase2(self):
         """读取（可能被人工编辑过的）final_testpoints_json，生成测试用例、冒烟、质量报告、Excel。"""
         self.prototype.status = 'designing'
@@ -1124,68 +1858,77 @@ class ModaoWorkflow:
                                              module_context=mod_ctx)
                                + "\n\n### 附加指令\n请为上面列出的【每一条】最终测试点生成一条结构化测试用例，"
                                  "以 YAML 列表返回，列表项为 `testcase:` 字典（字段同 p3 输出规范）。"
-                               + self._kb_suffix())
+                               + self._kb_suffix(query_hint=mod_name))
                 # 注入人工已确认的 PCI 答案 + 风险处置结论，让 AI 基于确认结论精准出例
                 confirmed_ctx = self._build_confirmed_context()
                 if confirmed_ctx:
                     case_prompt += (
                         "\n\n### 已确认的待确认问题答案与风险处置结论（人工已确认，请务必作为用例设计依据）\n"
                         + confirmed_ctx)
-                case_out = self._llm(self.writer_config, case_prompt, max_tokens=16000)
+                case_out = self._llm(self.writer_config, case_prompt, max_tokens=16000, temperature=0)
                 case_yaml = _parse_yaml(_extract_block(case_out, 'yaml')) or {}
-                cases = case_yaml.get('testcases', []) if isinstance(case_yaml, dict) else []
-                if not cases and isinstance(case_yaml, list):
+                # 兼容三种 LLM 输出形态：
+                #   1) {testcases: [...]}  推荐，列表
+                #   2) {testcase: {...}}   旧 prompt，单条
+                #   3) [...]               裸数组
+                cases = []
+                if isinstance(case_yaml, dict):
+                    cases = case_yaml.get('testcases') or []
+                    if not cases and 'testcase' in case_yaml:
+                        cases = [case_yaml['testcase']]
+                elif isinstance(case_yaml, list):
                     cases = case_yaml
+                # 过滤掉空字典（LLM 偶发返回的空占位）
+                cases = [c for c in cases if isinstance(c, dict) and c]
                 for c in cases:
-                    c['module'] = mod_name
+                    if not c.get('module'):
+                        c['module'] = mod_name
                 module_testcases.append((mod_name, cases))
             except Exception as e:
                 logger.error(f'模块[{mod_name}] 用例生成失败: {e}')
                 self._log(f'  模块[{mod_name}] 用例生成失败: {e}')
                 continue
 
-        # 3.5 冒烟提取（p4 技能输出 YAML，必须用 _parse_yaml 解析；用 _parse_json 会失败导致冒烟为空）
-        self._log('3.5 正在提取冒烟用例...')
+        # 汇总全部用例
+        all_cases = []
+        for _, cases in module_testcases:
+            all_cases.extend(cases)
+        self.prototype.testcases_json = json.dumps(all_cases, ensure_ascii=False)
+        self._log(f'3.4 用例生成完成，共 {len(all_cases)} 条用例')
+
+        # 3.5 冒烟提取（p4 技能输出 YAML，必须用 _parse_yaml 解析）
+        # 关键：输入必须是「已生成的全部测试用例」，从中筛选 P0 用例作为冒烟，
+        # 直接复用其 steps/expected，避免从测试点现编步骤导致与正式用例脱节、id 对不上。
+        self._log('3.5 正在从已生成用例中筛选 P0 冒烟用例...')
         smoke_prompt = render_prompt(P4_SMOKE_EXTRACT,
-                                     all_test_points_yaml=json.dumps(all_final_tps, ensure_ascii=False))
-        smoke_out = self._llm(self.analyzer_config, smoke_prompt, max_tokens=6000)
+                                     generated_testcases_json=json.dumps(all_cases, ensure_ascii=False))
+        smoke_out = self._llm(self.analyzer_config, smoke_prompt, max_tokens=6000, temperature=0)
         smoke_json = _parse_yaml(_extract_block(smoke_out, 'yaml')) or {}
         # 兼容模型直接返回数组的情况，统一包装为 {smoke_overview, smoke_testcases, execution_suggestion}
         if isinstance(smoke_json, list):
             smoke_json = {'smoke_testcases': smoke_json}
         self.prototype.smoke_json = json.dumps(smoke_json, ensure_ascii=False)
 
-        # 汇总全部用例
-        all_cases = []
-        for _, cases in module_testcases:
-            all_cases.extend(cases)
-        self.prototype.testcases_json = json.dumps(all_cases, ensure_ascii=False)
-        self._log(f'3.5 冒烟用例提取完成，共 {len(all_cases)} 条用例')
-
-        # 3.6 质量自检
-        self._log('3.6 正在执行质量自检...')
-        quality_prompt = render_prompt(P8_QUALITY_CHECK,
-                                       generated_testcases_json=json.dumps(all_cases, ensure_ascii=False),
-                                       smoke_testcases_json=json.dumps(smoke_json, ensure_ascii=False))
-        quality_out = self._llm(self.analyzer_config, quality_prompt, max_tokens=6000)
-        quality_json = _parse_json(_extract_block(quality_out, 'json')) or {}
-        self.prototype.quality_report_json = json.dumps(quality_json, ensure_ascii=False)
-        self._log('3.6 质量自检完成')
-
-        quality_report = quality_json.get('quality_report', quality_json) if isinstance(quality_json, dict) else {}
-        overall_result = str(quality_report.get('overall_result', '')).upper() if isinstance(quality_report, dict) else ''
-        blocking_issues = quality_report.get('blocking_issues', []) if isinstance(quality_report, dict) else []
-        if overall_result == 'FAIL' or blocking_issues:
+        # 3.6 质量自检（代码级 C1-C6，省掉 P8 LLM 调用）
+        self._log('3.6 正在执行质量自检（代码级 C1-C6）...')
+        q = self._code_quality_check(all_cases, smoke_json, all_final_tps)
+        self.prototype.quality_report_json = json.dumps(q['quality_json'], ensure_ascii=False)
+        self._log('3.6 质量自检完成（代码级，0 次 LLM 调用）')
+        if q['blocking']:
             self.prototype.status = 'failed'
-            self.prototype.error_message = '质量门禁未通过，已保留测试用例和质量报告，但未导出正式 Excel。'
+            reasons = '；'.join(b.get('message',str(b)) for b in q['blocking'])
+            self.prototype.error_message = f'质量门禁未通过（阻断项）：{reasons}。已保留测试用例和质量报告，但未导出正式 Excel。'
             self.prototype.excel_path = ''
             self.prototype.save()
             self._log(self.prototype.error_message)
-            return {
-                'final_testpoints': len(all_final_tps), 'testcases': len(all_cases),
-                'smoke': len(smoke_json.get('smoke_testcases', []) if isinstance(smoke_json, dict) else []),
-                'excel': '', 'quality': 'failed', 'blocking_issues': blocking_issues, 'phase': 2,
-            }
+            return {'final_testpoints': len(all_final_tps), 'testcases': len(all_cases),
+                    'smoke': q['smoke_count'], 'excel': '', 'quality': 'failed', 'blocking_issues': q['blocking'], 'phase': 2}
+        if q['warnings']:
+            self.prototype.error_message = '质量门禁告警（已放行导出）：' + '；'.join(q['warnings'])
+            self._log('质量门禁软告警（已放行导出）：' + '；'.join(q['warnings']))
+        else:
+            self.prototype.error_message = ''
+            self._log('质量门禁全部通过')
 
         # 3.7 Excel 导出
         self._log('3.7 正在导出 Excel...')
@@ -1196,6 +1939,54 @@ class ModaoWorkflow:
         self.prototype.current_stage = 3
         self.prototype.save()
         self._log(f'用例生成全部完成！共 {len(all_final_tps)} 测试点 / {len(all_cases)} 用例 / Excel: {excel_path or "无"}')
+
+        # 自适应沉淀（方案C闭环）：本次流程发现的风险处置/PCI处置/质量缺口/澄清结论，
+        # 自动回填项目知识库（带 proto 的版本/功能前缀），供后续同类需求 RAG 召回。
+        # 仅质量门禁通过（status='done'）时沉淀，避免把失败产物写入知识库。
+        try:
+            from apps.requirement_analysis.models import AIModelService
+            kb_result = AIModelService.auto_fill_knowledge_from_modao_products(
+                self.prototype,
+                model_config=self.analyzer_config,
+                user_id=self.prototype.created_by_id,
+            )
+            self._log(
+                f'[知识沉淀] 自动回填 {kb_result.get("created_count", 0)} 条新知识'
+                f'（跳过已存在 {kb_result.get("skipped_count", 0)} 条）'
+            )
+        except Exception as e:
+            self._log(f'[知识沉淀] 自动回填失败（可忽略，不影响用例产出）: {e}')
+
+        # 确认问答沉淀（方案C闭环补充）：把澄清阶段用户确认过的问答对精确沉淀为知识，
+        # 与上面 AI 从全文提炼的约束知识互补（前者是「用户怎么确认的」，后者是「AI 总结的约束」）。
+        try:
+            from apps.requirement_analysis.models import AIModelService
+            confirmed_answers = []
+            for _item in self.prototype.clarification_items():
+                if not isinstance(_item, dict):
+                    continue
+                _resolution = (str(_item.get('resolution') or _item.get('answer') or '')).strip()
+                _q = (str(_item.get('suggested_question') or _item.get('issue') or _item.get('question') or '')).strip()
+                if _q and _resolution:
+                    confirmed_answers.append({'question': _q, 'answer': _resolution})
+            if confirmed_answers:
+                _ver = getattr(self.prototype, 'version', None)
+                _mod = getattr(self.prototype, 'feature_module', None)
+                conf_result = AIModelService.auto_fill_knowledge_from_confirmations(
+                    confirmed_answers=confirmed_answers,
+                    project_id=self.prototype.project_id,
+                    user_id=self.prototype.created_by_id,
+                    model_config=self.analyzer_config,
+                    version_tag=getattr(_ver, 'name', '') or '',
+                    module_tag=getattr(_mod, 'name', '') or '',
+                )
+                self._log(
+                    f'[知识沉淀·确认问答] 自动回填 {conf_result.get("created_count", 0)} 条'
+                    f'（跳过已存在 {conf_result.get("skipped_count", 0)} 条）'
+                )
+        except Exception as e:
+            self._log(f'[知识沉淀·确认问答] 自动回填失败（可忽略，不影响用例产出）: {e}')
+
         return {
             'final_testpoints': len(all_final_tps),
             'testcases': len(all_cases),
@@ -1380,9 +2171,12 @@ class ModaoWorkflow:
             for i, sc in enumerate(smoke_cases, 1):
                 steps = sc.get('test_steps') or sc.get('steps') or []
                 steps_txt = '\n'.join(f'{j+1}. {s}' for j, s in enumerate(steps)) if isinstance(steps, list) else str(steps)
+                expected_val = sc.get('pass_criteria') or sc.get('expected') or ''
+                if isinstance(expected_val, list):
+                    expected_val = '\n'.join(str(x) for x in expected_val)
                 ws3.append([i, sc.get('id', ''), sc.get('module', ''), sc.get('title', ''),
                             sc.get('precondition', ''), steps_txt,
-                            sc.get('pass_criteria') or sc.get('expected') or '', '', '', sc.get('notes', '')])
+                            expected_val, '', '', sc.get('notes', '')])
                 for ci in range(1, len(shead) + 1):
                     cell = ws3.cell(row=ws3.max_row, column=ci)
                     cell.alignment = LEFT

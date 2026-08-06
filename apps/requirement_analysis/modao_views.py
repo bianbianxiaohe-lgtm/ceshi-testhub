@@ -15,6 +15,7 @@
 """
 import os
 import json
+import difflib
 import datetime
 import uuid as uuid_lib
 import threading
@@ -28,7 +29,8 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status as http_status
 from django.shortcuts import get_object_or_404
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 
 from apps.requirement_analysis.models import ModaoPrototype
 from apps.requirement_analysis.serializers import ModaoPrototypeSerializer
@@ -37,12 +39,148 @@ from apps.feature_modules.models import FeatureModule, TestPoint
 from apps.testcases.models import TestCase
 
 
+def _module_of(c):
+    """从一条用例/测试点结构里取模块名。兼容 {testcase:{...}, module} 嵌套与扁平两种格式。"""
+    if not isinstance(c, dict):
+        return '未分组'
+    if c.get('testcase'):
+        t = c['testcase']
+        return (c.get('module') or t.get('module') or t.get('feature_module') or '未分组')
+    return (c.get('module') or c.get('feature_module') or '未分组')
+
+
+def _collect_canonical_modules(proto, project):
+    """真实模块名集合：原型中已有用例/测试点使用的模块 + 项目中已挂测试用例的功能模块。
+
+    排除 0 用例的空壳模块（如 LLM 脑补出的近似模块），避免把"待归并名"误当作权威名。
+    """
+    names = set()
+    if proto is not None:
+        for c in _safe_json_list(getattr(proto, 'testcases_json', None)):
+            names.add(_module_of(c))
+        for t in _safe_json_list(getattr(proto, 'final_testpoints_json', None)):
+            if isinstance(t, dict) and t.get('module'):
+                names.add(t['module'])
+    if project is not None:
+        real_ids = TestCase.objects.filter(
+            project=project, feature_modules__isnull=False
+        ).values_list('feature_modules', flat=True).distinct()
+        for fm in FeatureModule.objects.filter(id__in=list(real_ids)):
+            names.add(fm.name)
+    names.discard('未分组')
+    names.discard('')
+    return names
+
+
+def _canonical_module_name(raw, proto=None, project=None):
+    """模块名归一化：把 LLM 可能脑补的近似模块名（如「动作库界面」）归并到已有真实模块（如「动作库」）。
+
+    规则：
+    1. 原名已在真实模块集合内 → 原样返回；
+    2. 否则用 difflib 模糊匹配最接近的已有模块（cutoff=0.6），命中则归并；
+    3. 都不命中 → 视为真正的新模块，原样返回。
+    """
+    raw = (raw or '').strip()
+    if not raw or raw == '未分组':
+        return raw
+    candidates = _collect_canonical_modules(proto, project)
+    if raw in candidates:
+        return raw
+    match = difflib.get_close_matches(raw, list(candidates), n=1, cutoff=0.6)
+    if match:
+        return match[0]
+    return raw
+
+
+# 容器进程启动时间（用于判断 proto.updated_at 是否在本次运行之前）
+import datetime as _dt
+_CONTAINER_START_TIME = _dt.datetime.now()
+
+def _recover_stale_designing(proto, timeout_minutes=120):
+    """自动回收卡死的 designing 状态。
+
+    当 proto.status 为 designing 但 updated_at 距今超过 timeout_minutes 分钟时，
+    判定执行线程已死亡（OOM/容器重启/进程被杀），自动标记为 failed。
+
+    安全保护：如果 proto.updated_at 早于容器进程启动时间，说明是重启后遗留状态，
+    不判定为超时（任务可能尚未被重新触发）。
+    """
+    from django.utils import timezone
+    if proto.status not in ('extracting', 'structuring', 'clarifying', 'designing'):
+        return False
+    if not proto.updated_at:
+        return False
+    elapsed = (timezone.now() - proto.updated_at).total_seconds()
+    if elapsed < timeout_minutes * 60:
+        return False
+    # 容器重启后 updated_at 可能很早 → 不判为超时
+    try:
+        if proto.updated_at.replace(tzinfo=None) < _CONTAINER_START_TIME:
+            logger.info('[stale-recover] proto %d skipped: updated_at before container start', proto.id)
+            return False
+    except Exception:
+        pass
+    # 已超时且无活跃线程 → 回收
+    wl_tail = (proto.work_log or '')[-150:]
+    proto.status = 'failed'
+    proto.error_message = (
+        f'任务执行超时（已超过 {timeout_minutes} 分钟无更新，'
+        f'可能因线程中断/容器重启导致）。最后日志：{wl_tail}。请重新触发该阶段。'
+    )
+    proto.save(update_fields=['status', 'error_message'])
+    logger.warning('[stale-recover] proto %d status %s stale %.0fs -> failed', proto.id, proto.status, elapsed)
+    return True
+
+
+def _user_can_access_proto(user, proto):
+    """判断用户是否有权查看/操作某条墨刀原型任务。
+
+    规则：
+    - 超级管理员：全部可访问
+    - 任务创建者：可访问
+    - 关联项目的 owner / admin / developer / tester 成员：可访问（viewer 不含）
+    - 无关联项目（project 为空）：仅创建者本人可访问
+    """
+    from apps.core.mixins import _is_superuser
+    if _is_superuser(user):
+        return True
+    if proto.created_by_id == user.id:
+        return True
+    if not proto.project_id:
+        return False
+    from apps.projects.models import ProjectMember
+    return ProjectMember.objects.filter(
+        project_id=proto.project_id,
+        user=user,
+        role__in=('owner', 'admin', 'developer', 'tester'),
+    ).exists()
+
+
+def _accessible_proto_qs(user):
+    """返回用户有权限查看的 ModaoPrototype queryset。"""
+    from apps.core.mixins import _is_superuser
+    from apps.projects.models import ProjectMember
+    if _is_superuser(user):
+        return ModaoPrototype.objects.all()
+    # 自己创建的 + 自己是有效成员的项目下的任务
+    own = ModaoPrototype.objects.filter(created_by=user)
+    member_project_ids = ProjectMember.objects.filter(
+        user=user,
+        role__in=('owner', 'admin', 'developer', 'tester'),
+    ).values_list('project_id', flat=True).distinct()
+    project_protos = ModaoPrototype.objects.filter(project_id__in=member_project_ids)
+    return (own | project_protos).distinct()
+
+
 def _build_wf(proto, analyzer_id=None, writer_id=None, embedder_id=None):
     analyzer, writer, embedder = ModaoWorkflow.resolve_configs(analyzer_id, writer_id, embedder_id)
     # 视觉识别配置：用于纯图片/截图/表格型页面的 OCR 补充（writer_vision 角色）
     from apps.requirement_analysis.models import AIModelConfig
     vision_config = AIModelConfig.objects.filter(role='writer_vision', is_active=True).first()
-    return ModaoWorkflow(proto, analyzer, writer, embedder, vision_config=vision_config)
+    # OCR 专用视觉模型：独立配置，可指向更快的模型（如 qwen-vl-plus），
+    # 与融合/结构化使用的强模型解耦；未单独配置时回退到 writer_vision。
+    ocr_vision_config = AIModelConfig.objects.filter(role='writer_vision_ocr', is_active=True).first() or vision_config
+    return ModaoWorkflow(proto, analyzer, writer, embedder, vision_config=vision_config, ocr_vision_config=ocr_vision_config)
 
 
 # ---------- 模块同步解析工具 ----------
@@ -117,7 +255,7 @@ def _sync_stage3(proto, user):
         cases_by_mod.setdefault(c.get('module', ''), []).append(c)
 
     for m in modules:
-        mname = m.get('name')
+        mname = _canonical_module_name(m.get('name'), proto=proto, project=proto.project)
         if not mname:
             continue
         child, _ = FeatureModule.objects.get_or_create(
@@ -198,15 +336,16 @@ def _run_in_thread(proto, target):
 def modao_list(request):
     """历史记录列表（按创建时间倒序）。
 
-    - 管理员（is_staff / is_superuser）：可查看所有人的生成历史；
-    - 普通用户：仅查看自己创建的历史。
+    权限规则：
+    - 超级管理员：可查看所有人的任务；
+    - 普通用户：可查看自己创建的 + 自己是项目成员（owner/admin/developer/tester）的项目下的任务。
     """
     from apps.core.mixins import _is_superuser
     is_admin = _is_superuser(request.user)
-    if is_admin:
-        qs = ModaoPrototype.objects.all().order_by('-created_at')
-    else:
-        qs = ModaoPrototype.objects.filter(created_by=request.user).order_by('-created_at')
+    qs = _accessible_proto_qs(request.user).order_by('-created_at')
+    # 批量回收列表中可能卡死的 designing 状态
+    for p in qs.filter(status__in=('extracting', 'structuring', 'clarifying', 'designing')):
+        _recover_stale_designing(p)
     return Response({
         'is_admin': is_admin,
         'results': ModaoPrototypeSerializer(qs, many=True).data,
@@ -273,10 +412,8 @@ def _reset_modao_workflow(proto):
 @api_view(['POST'])
 def modao_reset(request, pk):
     """将墨刀/webshare任务退回阶段0，以同一来源重新走完整流程。"""
-    from apps.core.mixins import _is_superuser
-
     proto = get_object_or_404(ModaoPrototype, pk=pk)
-    if proto.created_by_id != request.user.id and not _is_superuser(request.user):
+    if not _user_can_access_proto(request.user, proto):
         return Response({'detail': '无权重置该任务'}, status=http_status.HTTP_403_FORBIDDEN)
     if proto.source_type == 'text':
         return Response({'detail': '文本来源没有独立原文副本，暂不支持重置到阶段0，请新建文本任务'},
@@ -290,6 +427,28 @@ def modao_reset(request, pk):
 
 
 @api_view(['POST'])
+def modao_terminate(request, pk):
+    """手动终止正在运行的任务（读取/结构化/澄清/用例设计）。
+
+    与 reset 不同：reset 拒绝运行中的任务；terminate 专用于运行中，
+    置 TERMINATE_REQUESTED 标记 + status=failed，后台线程在检查点捕获后退出。
+    当前墨刀读取阶段（逐页 / 并发 OCR / 双路融合）已接入检查点；
+    其余阶段若未到检查点，也会因 status 已被置 failed 而停止轮询。
+    """
+    from apps.requirement_analysis.cancel_flags import TERMINATE_REQUESTED
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    if not _user_can_access_proto(request.user, proto):
+        return Response({'detail': '无权终止该任务'}, status=http_status.HTTP_403_FORBIDDEN)
+    if proto.status not in ('extracting', 'structuring', 'clarifying', 'designing'):
+        return Response({'detail': '任务未在运行，无需终止'}, status=http_status.HTTP_400_BAD_REQUEST)
+    TERMINATE_REQUESTED[proto.id] = True
+    proto.status = 'failed'
+    proto.error_message = '任务已被用户手动终止'
+    proto.save(update_fields=['status', 'error_message'])
+    return Response({'detail': '已发送终止信号，任务将很快停止'})
+
+
+@api_view(['POST'])
 def modao_extract(request, pk):
     proto = get_object_or_404(ModaoPrototype, pk=pk)
     if proto.source_type == 'text':
@@ -299,6 +458,16 @@ def modao_extract(request, pk):
         return Response({'detail': '文本来源无需读取，可直接进入结构化阶段'})
 
     cookies = proto.auth_cookie or request.data.get('cookies', '')
+    # 自动加载共享 cookies 文件（若未提供 proto 级 cookies）
+    if not cookies:
+        import os as _os, json as _json
+        _shared = _os.path.join('media', 'modao_cookies.json')
+        if _os.path.exists(_shared):
+            try:
+                with open(_shared, 'r', encoding='utf-8') as _f:
+                    cookies = _json.dumps(_json.load(_f))
+            except Exception:
+                pass
     headless = request.data.get('headless', True)
     # 多地址：优先用请求体 urls，否则解析 proto.url（可能含换行/逗号分隔）
     raw_urls = request.data.get('urls') or []
@@ -529,7 +698,11 @@ def modao_ask(request, pk):
 @api_view(['GET', 'DELETE'])
 def modao_detail(request, pk):
     proto = get_object_or_404(ModaoPrototype, pk=pk)
+    # 自动回收：designing 状态超时无更新 → 线程已死，标记 failed 避免永久卡住
+    _recover_stale_designing(proto)
     if request.method == 'DELETE':
+        if not _user_can_access_proto(request.user, proto):
+            return Response({'detail': '无权删除该任务'}, status=http_status.HTTP_403_FORBIDDEN)
         title = proto.title
         proto.delete()
         return Response({'detail': f'已删除「{title}」'})
@@ -605,7 +778,7 @@ def _adopt_to_library(proto, user, include_smoke=False):
     # 这样无论用例库按 sort_order 全局排序还是按模块分组排序，都与生成用例顺序完全一致。
     cases = _safe_json_list(proto.testcases_json)
     for sort_order, c in enumerate(cases, 1):
-        mname = _module_of(c)
+        mname = _canonical_module_name(_module_of(c), proto=proto, project=proto.project)
         fm, created = FeatureModule.objects.get_or_create(
             project=proto.project, name=mname,
             defaults={
@@ -644,7 +817,7 @@ def _adopt_to_library(proto, user, include_smoke=False):
         smoke_base = len(cases)  # 冒烟用例 sort_order 接在主用例之后
         for smoke_idx, sc in enumerate(smoke_list, 1):
             tc_obj = sc.get('testcase', sc) if isinstance(sc, dict) else sc
-            mname = _module_of(sc)
+            mname = _canonical_module_name(_module_of(sc), proto=proto, project=proto.project)
             fm, _ = FeatureModule.objects.get_or_create(
                 project=proto.project, name=mname,
                 defaults={'description': f'墨刀流程「{proto.title}」一键采纳自动创建', 'created_by': user, 'parent': parent},
@@ -714,7 +887,7 @@ def _adopt_single_case(proto, user, case_index):
             return (c.get('module') or t.get('module') or t.get('feature_module') or '未分组')
         return (c.get('module') or c.get('feature_module') or '未分组')
 
-    mname = _module_of(c)
+    mname = _canonical_module_name(_module_of(c), proto=proto, project=proto.project)
     fm, created = FeatureModule.objects.get_or_create(
         project=proto.project, name=mname,
         defaults={
@@ -784,3 +957,94 @@ def modao_adopt_single(request, pk):
         'detail': result['detail'],
         **result['counts'],
     })
+
+
+# ==================== 流水线日志查看器（免登录）====================
+
+import os as _os
+
+_LOG_PATH = '/app/_pipeline_v4.txt'
+
+@csrf_exempt
+def modao_log_viewer(request):
+    """内嵌日志查看页面（自动 3 秒刷新，免登录）。"""
+    html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mini2 流水线日志</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1e1e1e;color:#d4d4d4;font:13px/1.5 "Cascadia Code","Fira Code",Consolas,monospace;padding:16px 20px}
+h2{color:#569cd6;font-size:15px;margin-bottom:6px}
+#bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;
+  border-bottom:1px solid #3c3c3c;padding-bottom:6px}
+#bar span{font-size:12px}#status{color:#6a9955}#time{color:#808080}
+#log{white-space:pre-wrap;word-break:break-all}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#555;border-radius:3px}
+</style>
+</head>
+<body>
+<h2>🚀 mini2 流水线日志 (proto id=36)</h2>
+<div id="bar"><span id="status">连接中...</span><span id="time"></span></div>
+<pre id="log">加载中...</pre>
+<script>
+var lastLen = 0;
+// 通过当前页面路径拼出 log-raw 的完整路径
+var base = window.location.pathname.replace('/log-viewer/', '/log-raw/');
+async function fetchLog() {
+    try {
+        var r = await fetch(base + '?_=' + Date.now());
+        var d = await r.json();
+        var el = document.getElementById('log');
+        el.textContent = d.content;
+        var now = new Date().toLocaleTimeString();
+        document.getElementById('time').textContent = now;
+        var delta = d.lines - lastLen;
+        if (delta > 0) {
+            document.getElementById('status').innerHTML = '✅ 运行中 &nbsp;|&nbsp; <b>+'+delta+'</b> 条新日志';
+            document.getElementById('status').style.color = '#6a9955';
+        } else {
+            document.getElementById('status').textContent = '⏳ 等待更新 | ' + d.lines + ' 行';
+            document.getElementById('status').style.color = '#dcdcaa';
+        }
+        if (d.finished) {
+            document.getElementById('status').innerHTML = '🏁 <b>流水线已结束</b> | ' + d.lines + ' 行 | 状态: ' + d.proto_status;
+            document.getElementById('status').style.color = '#4ec9b0';
+        }
+        lastLen = d.lines;
+        window.scrollTo(0, document.body.scrollHeight);
+        setTimeout(fetchLog, 3000);
+    } catch(e) {
+        document.getElementById('status').textContent = '🔴 错误: ' + e.message;
+        document.getElementById('status').style.color = '#f44747';
+        setTimeout(fetchLog, 5000);
+    }
+}
+fetchLog();
+</script>
+</body>
+</html>"""
+    return HttpResponse(html, content_type='text/html; charset=utf-8')
+
+
+@csrf_exempt
+def modao_log_raw(request):
+    """返回原始日志文本（免登录，供日志页面 AJAX 轮询）。"""
+    content = ''
+    if _os.path.exists(_LOG_PATH):
+        with open(_LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    lines = content.count('\n') + (1 if content else 0)
+    # 检测是否已结束
+    finished = '===== 流水线完成 =====' in content
+    proto_status = ''
+    if finished:
+        try:
+            from apps.requirement_analysis.models import ModaoPrototype
+            p = ModaoPrototype.objects.filter(pk=36).first()
+            if p:
+                proto_status = p.status
+        except Exception:
+            pass
+    return JsonResponse({'content': content, 'lines': lines, 'finished': finished, 'proto_status': proto_status})

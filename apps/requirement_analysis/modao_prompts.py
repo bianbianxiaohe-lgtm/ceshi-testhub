@@ -18,7 +18,9 @@ _INPUT_KEYS = {
     'requirement_text', 'requirement_yaml', 'module_info_yaml', 'test_point_yaml',
     'module_context', 'all_test_points_yaml', 'test_points_json',
     'risk_extended_testpoints', 'pci_blocked_scenarios', 'draft_testpoints',
-    'generated_testcases_json', 'smoke_testcases_json', 'stage2_issues',
+    'generated_testcases_json', 'smoke_testcases_json', 'final_testpoints_json', 'stage2_issues',
+    'expected_module_list', 'module_skeleton', 'focus_instruction',
+    'c3_precheck',
 }
 
 

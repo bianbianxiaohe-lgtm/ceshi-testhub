@@ -3770,11 +3770,16 @@ class RequirementAnalysisResultViewSet(viewsets.ModelViewSet):
             or AIModelConfig.objects.filter(role='writer', is_active=True).first()
         )
         
+        # 透传功能模块/版本标签（可选，用于知识条目标注同名功能，增强语义区分）
+        version_tag = (request.data.get('version') or '').strip()
+        module_tag = (request.data.get('module') or request.data.get('feature_module') or '').strip()
         result = AIModelService.auto_fill_knowledge_from_confirmations(
             confirmed_answers=confirmed_answers,
             project_id=int(project_id),
             user_id=request.user.id,
             model_config=model_config,
+            version_tag=version_tag,
+            module_tag=module_tag,
         )
         return Response(result)
 

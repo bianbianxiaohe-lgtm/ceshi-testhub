@@ -19,8 +19,8 @@
 
 1. **6 项必须全检**：C1~C6 每项都要检查
 2. **FAIL 项必须列出**：所有失败项必须给出具体问题位置和建议
-3. **FAIL 时阻断**：C1/C2/C3 任一 FAIL 必须阻断，不允许进入阶段4
-4. **WARNING 不阻断**：C4/C5/C6 FAIL 仅作为 warning，提示但不阻断
+3. **FAIL 时阻断**：C1/C3 任一 FAIL 必须阻断，不允许进入阶段4
+4. **WARNING 不阻断**：C2/C4/C5/C6 仅作为 warning，提示但不阻断；C2 的 result 只能是 WARNING 或 PASS，不得为 FAIL
 5. **输出纯 JSON**：不得在 JSON 前后添加任何解释性文字
 
 ## 📋 6 项质量检查
@@ -32,18 +32,23 @@
 - `priority`, `type`, `requirement_ref`
 - 缺失任一字段 → FAIL
 
-### 🔴 C2 冒烟比例合规（阻断项）
+### 🟡 C2 冒烟比例合规（WARNING，不阻断）
 
-冒烟用例数 / P0 用例数 应在 10%-15% 范围内：
-- 占比 < 10% → FAIL（冒烟覆盖不足）
-- 占比 > 15% → FAIL（冒烟过多，失去意义）
-- 占比 = 0 → FAIL（无冒烟用例）
+冒烟用例数 / 用例总数 应在 5%-25% 范围内（分母用全部用例数，而非 P0 用例数）：
+- 占比 < 5% → WARNING（冒烟覆盖不足，建议补充）
+- 占比 > 25% → WARNING（冒烟过多，失去精简意义）
+- 占比 = 0 → WARNING（无冒烟用例，建议至少 1 条）
+- 此检查项仅作提示，绝不阻断导出，也不计入 blocking_issues
 
 ### 🔴 C3 P0 主流程覆盖（阻断项）
 
-每个 P0 模块必须至少 1 个 main_flow 类型的 P0 测试点：
-- 缺失 → FAIL
-- P0 中非 main_flow 类占比 > 60% → FAIL
+{c3_precheck}
+
+> 口径：以上 C3 预检查由代码逐模块统计得出，你**必须据此裁决**，不得修改、不得重新计数。
+
+判定：
+- 某 P0 模块没有任何 `category: 'main_flow'` 的测试点 → FAIL（模块名记入 `missing_main_flow`）
+- P0 测试点中 `category != 'main_flow'` 的占比 > 60% → FAIL
 
 ### 🟡 C4 用例步骤具体性（WARNING）
 
@@ -86,9 +91,9 @@
         ]
       },
       "C2_smoke_ratio": {
-        "result": "PASS | FAIL | WARNING",
+        "result": "PASS | WARNING",
         "smoke_count": 0,
-        "p0_count": 0,
+        "total_count": 0,
         "ratio": 0.0,
         "issues": []
       },
@@ -129,8 +134,9 @@
 | 阻断项 | 触发条件 | 动作 |
 |------|------|------|
 | C1 字段缺失 | 任意用例缺字段 | 返回 P3 修复缺失字段 |
-| C2 冒烟比例不合规 | 比例 < 10% 或 > 15% | 返回 P4 重新提取 |
-| C3 P0 主流程缺失 | 任一 P0 模块无 main_flow | 返回 P3 补充 main_flow |
+| C3 P0 主流程缺失 | 任一 P0 模块无 `category: main_flow` 测试点 | 返回 P7 测试点补充 main_flow（勿误查测试用例 type） |
+
+> 注：C2 冒烟比例仅作提示（WARNING），不阻断、不进 blocking_issues。
 
 ## 💡 检查技巧
 
@@ -144,7 +150,7 @@
 ## 🚫 禁止
 
 - ❌ 跳过任意一项检查
-- ❌ C1/C2/C3 FAIL 时仍输出 PASS
+- ❌ C1/C3 FAIL 时仍输出 PASS（C2 允许为 WARNING 不阻断）
 - ❌ 问题清单为空但 result=FAIL（自相矛盾）
 - ❌ WARNING 项升级为 FAIL（除非用户特殊要求）
 
@@ -152,5 +158,6 @@
 
 {generated_testcases_json}
 {smoke_testcases_json}
+{final_testpoints_json}
 
 ## 📤 输出（直接输出 JSON）
