@@ -2591,6 +2591,13 @@ class TestCaseExecutionViewSet(viewsets.ModelViewSet):
         'test_case', 'project', 'test_suite', 'executed_by'
     )
     serializer_class = TestCaseExecutionSerializer
+
+    def get_serializer_class(self):
+        """列表用轻量序列化器（不含日志/截图），详情用完整序列化器"""
+        from .serializers import TestCaseExecutionListSerializer
+        if self.action == 'list':
+            return TestCaseExecutionListSerializer
+        return TestCaseExecutionSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['test_case__name', 'error_message']
@@ -3759,10 +3766,66 @@ class AICaseViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         instance.delete()
 
+    @action(detail=False, methods=['post'], url_path='midscene-playground')
+    def midscene_playground(self, request):
+        """
+        Midscene Playground：自然语言单条调试（连真机执行并返回截图 base64）。
+        用于验证 Midscene 自然语言操作方式，确认稳定后再沉淀为正式步骤。
+        """
+        data = request.data
+        app_config_id = data.get('app_config_id')
+        device_id = data.get('device_id')
+        prompt = (data.get('prompt') or '').strip()
+        action = data.get('action') or 'aiAct'
+        launch_app = data.get('launch_app', True)
+
+        if not app_config_id or not device_id:
+            return Response(
+                {'error': 'app_config_id 与 device_id 均为必填'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not prompt:
+            return Response(
+                {'error': 'prompt（自然语言操作指令）不能为空'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if action not in ('aiAct', 'aiTap', 'aiInput', 'aiQuery'):
+            return Response(
+                {'error': 'action 仅支持 aiAct/aiTap/aiInput/aiQuery'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            from apps.ui_automation.models import AppConfig, AppDevice
+            app_config = AppConfig.objects.get(id=app_config_id)
+            device = AppDevice.objects.get(id=device_id)
+        except (AppConfig.DoesNotExist, AppDevice.DoesNotExist):
+            return Response(
+                {'error': '应用配置或设备不存在'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            from .midscene_engine import MidsceneAppEngine
+            engine = MidsceneAppEngine(app_config=app_config, device=device)
+            result = engine.playground_run(prompt=prompt, action=action, launch_app=launch_app)
+        except Exception as e:
+            logger.warning('[Midscene Playground] 执行失败: %s', e)
+            return Response(
+                {'status': 'failed', 'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        return Response(result)
+
     @action(detail=True, methods=['post'])
     def run(self, request, pk=None):
         """执行 AI 用例"""
         ai_case = self.get_object()
+
+        # Midscene APP 自动化模式：走结构化 steps + 真机引擎
+        if ai_case.execution_mode == 'midscene':
+            return self._run_midscene(request, ai_case)
 
         # 创建执行记录
         execution_record = AIExecutionRecord.objects.create(
@@ -3878,6 +3941,95 @@ class AICaseViewSet(viewsets.ModelViewSet):
         
         return Response({
             'message': 'AI 用例开始执行',
+            'execution_id': execution_record.id
+        })
+
+    def _run_midscene(self, request, ai_case):
+        """Midscene APP 自动化执行分支：读取结构化 steps，驱动真机执行"""
+        if not ai_case.steps:
+            return Response(
+                {'error': '该 Midscene 用例没有步骤（steps）配置'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not ai_case.app_config or not ai_case.device:
+            return Response(
+                {'error': 'Midscene 用例必须关联应用配置(app_config)与执行设备(device)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        execution_record = AIExecutionRecord.objects.create(
+            project=ai_case.project,
+            ai_case=ai_case,
+            case_name=ai_case.name,
+            task_description=ai_case.task_description or '(Midscene 结构化步骤)',
+            execution_mode='midscene',
+            status='running',
+            executed_by=request.user,
+            logs='[Midscene] 正在连接真机并启动应用...\n'
+        )
+
+        def run_task():
+            STOP_SIGNALS[execution_record.id] = False
+            try:
+                from .midscene_engine import MidsceneAppEngine
+
+                engine = MidsceneAppEngine(
+                    app_config=ai_case.app_config,
+                    device=ai_case.device,
+                )
+                engine.connect()
+                result = engine.run(ai_case.steps)
+
+                # 合并引擎日志与每步结果
+                logs = list(engine.logs)
+                logs.append('\n[Midscene] 执行结束：%s' % result.get('status', 'unknown'))
+                if result.get('error'):
+                    logs.append('错误：%s' % result['error'])
+
+                # 汇总截图序列
+                screenshots = []
+                for s in result.get('steps', []):
+                    if s.get('screenshot'):
+                        screenshots.append(s['screenshot'])
+                    if s.get('fail_screenshot'):
+                        screenshots.append(s['fail_screenshot'])
+
+                # 汇总跨步骤业务上下文（业务锚点 extract 结果）
+                context_dump = result.get('context', {})
+                if context_dump:
+                    logs.append('\n[Midscene] 业务上下文(extract 结果)：')
+                    for k, v in context_dump.items():
+                        logs.append('  ${{%s}} = %s' % (k, v))
+
+                execution_record.status = 'passed' if result.get('status') == 'passed' else 'failed'
+                execution_record.logs = '\n'.join(logs)
+                execution_record.steps_completed = result.get('steps', [])
+                execution_record.screenshots_sequence = screenshots
+                execution_record.error_message = result.get('error') or ''
+                execution_record.end_time = timezone.now()
+                execution_record.duration = (
+                    execution_record.end_time - execution_record.start_time
+                ).total_seconds()
+                execution_record.save()
+            except Exception as e:
+                execution_record.status = 'failed'
+                execution_record.end_time = timezone.now()
+                execution_record.duration = (
+                    execution_record.end_time - execution_record.start_time
+                ).total_seconds()
+                execution_record.logs += '\n[Midscene] 执行出错: %s' % str(e)
+                execution_record.error_message = str(e)
+                execution_record.save()
+                logger.warning('[Midscene] 执行失败: %s', e)
+            finally:
+                STOP_SIGNALS.pop(execution_record.id, None)
+
+        thread = threading.Thread(target=run_task)
+        thread.daemon = True
+        thread.start()
+
+        return Response({
+            'message': 'Midscene 用例开始执行',
             'execution_id': execution_record.id
         })
 

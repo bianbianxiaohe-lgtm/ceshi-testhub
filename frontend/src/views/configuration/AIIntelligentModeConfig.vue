@@ -21,6 +21,9 @@
               <div class="config-title">
                 <h3>{{ config.name || '未命名配置' }}</h3>
                 <div class="config-badges">
+                  <span class="role-badge" :class="config.role">
+                    {{ getRoleLabel(config.role) }}
+                  </span>
                   <span class="provider-badge" :class="config.model_type">
                     {{ getProviderLabel(config.model_type) }}
                   </span>
@@ -92,6 +95,21 @@
             </div>
 
             <div class="form-group">
+              <label>角色 <span class="required">*</span></label>
+              <select
+                v-model="configForm.role"
+                class="form-select"
+                required>
+                <option v-for="opt in roleOptions" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+              <small class="form-hint">
+                选择「Midscene 视觉驱动」后，该配置会被 APP 真机自动化（Midscene）读取；选择「Browser-use 文本模式」则用于 Web AI 智能测试
+              </small>
+            </div>
+
+            <div class="form-group">
               <label>模型提供商 <span class="required">*</span></label>
               <select
                 v-model="configForm.model_type"
@@ -104,6 +122,7 @@
                 <option value="anthropic">Anthropic</option>
                 <option value="google_gemini">Google Gemini</option>
                 <option value="deepseek">DeepSeek</option>
+                <option value="qwen">通义千问 (Qwen)</option>
                 <option value="siliconflow">硅基流动 (SiliconFlow)</option>
                 <option value="other">其他 (Other)</option>
               </select>
@@ -214,12 +233,19 @@ const testResult = ref({
 
 const configForm = ref({
   name: '',
+  role: 'browser_use_text',
   model_type: '',
   model_name: '',
   api_key: '',
   base_url: '',
   is_active: true
 })
+
+// 角色选项（对应后端 AIMODE_ROLE_CHOICES）
+const roleOptions = [
+  { value: 'browser_use_text', label: 'Browser-use 文本模式（Web AI 智能测试）' },
+  { value: 'midscene_vision', label: 'Midscene 视觉驱动（APP 真机自动化）' }
+]
 
 // 模型提供商与Base URL的映射关系
 const modelBaseUrlMap = {
@@ -228,6 +254,7 @@ const modelBaseUrlMap = {
   anthropic: 'https://api.anthropic.com',
   google_gemini: '',
   deepseek: 'https://api.deepseek.com',
+  qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   siliconflow: 'https://api.siliconflow.cn/v1',
   other: ''
 }
@@ -241,10 +268,19 @@ const getProviderLabel = (modelType) => {
     anthropic: 'Anthropic',
     google_gemini: 'Google Gemini',
     deepseek: 'DeepSeek',
+    qwen: '通义千问',
     siliconflow: '硅基流动',
     other: '其他'
   }
   return labels[modelType] || modelType
+}
+
+const getRoleLabel = (role) => {
+  const labels = {
+    browser_use_text: 'Browser-use 文本',
+    midscene_vision: 'Midscene 视觉'
+  }
+  return labels[role] || role
 }
 
 const loadConfigs = async () => {
@@ -272,6 +308,7 @@ const openAddModal = () => {
 const resetForm = () => {
   configForm.value = {
     name: '',
+    role: 'browser_use_text',
     model_type: '',
     model_name: '',
     api_key: '',
@@ -290,6 +327,7 @@ const editConfig = (config) => {
 
   configForm.value = {
     name: config.name,
+    role: config.role || 'browser_use_text',
     model_type: config.model_type,
     model_name: config.model_name,
     api_key: maskedKey, // 显示与原API Key相同长度的掩码
@@ -312,6 +350,11 @@ const onModelTypeChange = () => {
     configForm.value.model_name = 'claude-3-5-sonnet-20241022'
   } else if (configForm.value.model_type === 'deepseek' && !configForm.value.model_name) {
     configForm.value.model_name = 'deepseek-chat'
+  } else if (configForm.value.model_type === 'qwen' && !configForm.value.model_name) {
+    // Midscene 视觉驱动需要多模态视觉模型，优先推荐 qwen-vl-plus
+    configForm.value.model_name = configForm.value.role === 'midscene_vision'
+      ? 'qwen-vl-plus'
+      : 'qwen-plus'
   } else if (configForm.value.model_type === 'siliconflow' && !configForm.value.model_name) {
     configForm.value.model_name = 'Qwen/Qwen2.5-7B-Instruct'
   }
@@ -648,11 +691,21 @@ onMounted(() => {
   flex-wrap: wrap;
 }
 
-.provider-badge, .model-name-badge, .status-badge {
+.provider-badge, .model-name-badge, .status-badge, .role-badge {
   padding: 4px 12px;
   border-radius: 20px;
   font-size: 0.8rem;
   font-weight: 600;
+}
+
+.role-badge {
+  background: #e8eaf6;
+  color: #283593;
+}
+
+.role-badge.midscene_vision {
+  background: #fce4ec;
+  color: #c2185b;
 }
 
 .provider-badge.openai {
@@ -668,6 +721,11 @@ onMounted(() => {
 .provider-badge.deepseek {
   background: #e3f2fd;
   color: #1976d2;
+}
+
+.provider-badge.qwen {
+  background: #f3e5f5;
+  color: #7b1fa2;
 }
 
 .provider-badge.siliconflow {

@@ -7,7 +7,8 @@ from .models import (
     TestCase, TestCaseStep, TestCaseExecution, OperationRecord,
     UiScheduledTask, UiNotificationLog, UiTaskNotificationSetting,
     AICase, AIExecutionRecord,
-    AppDevice, AppConfig
+    AppDevice, AppConfig,
+    AppPipelineRun
 )
 from django.contrib.auth import get_user_model
 
@@ -568,8 +569,8 @@ class TestCaseSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-class TestCaseExecutionSerializer(serializers.ModelSerializer):
-    """测试用例执行记录序列化器"""
+class TestCaseExecutionListSerializer(serializers.ModelSerializer):
+    """测试用例执行记录列表序列化器（轻量，不含日志/截图等大数据字段）"""
     test_case_name = serializers.CharField(source='test_case.name', read_only=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
     test_suite_name = serializers.SerializerMethodField()
@@ -580,7 +581,36 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'test_case', 'test_case_name', 'project', 'project_name',
             'test_suite', 'test_suite_name', 'execution_source', 'status',
-            'engine', 'browser', 'headless',             'execution_logs', 'step_results', 'error_message',
+            'engine', 'browser', 'headless', 'error_message',
+            'execution_time', 'started_at', 'finished_at',
+            'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['created_by']
+
+    def get_test_suite_name(self, obj):
+        return obj.test_suite.name if obj.test_suite else None
+
+    def get_created_by_name(self, obj):
+        return obj.created_by.username if obj.created_by else '-'
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class TestCaseExecutionSerializer(serializers.ModelSerializer):
+    """测试用例执行记录详情序列化器（含日志、截图、步骤结果等完整数据）"""
+    test_case_name = serializers.CharField(source='test_case.name', read_only=True)
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    test_suite_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TestCaseExecution
+        fields = [
+            'id', 'test_case', 'test_case_name', 'project', 'project_name',
+            'test_suite', 'test_suite_name', 'execution_source', 'status',
+            'engine', 'browser', 'headless', 'execution_logs', 'step_results', 'error_message',
             'screenshots', 'execution_time', 'started_at', 'finished_at',
             'created_by', 'created_by_name', 'created_at'
         ]
@@ -991,4 +1021,26 @@ class AppConfigSerializer(serializers.ModelSerializer):
         if obj.ai_project:
             return obj.ai_project.name
         return None
+
+
+class AppPipelineRunSerializer(serializers.ModelSerializer):
+    """App 自动化流水线运行记录序列化器"""
+    app_config_name = serializers.CharField(source='app_config.name', read_only=True)
+    device_name = serializers.CharField(source='device.name', read_only=True, allow_null=True)
+    device_udid = serializers.CharField(source='device.udid', read_only=True, allow_null=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True, allow_null=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = AppPipelineRun
+        fields = [
+            'id', 'app_config', 'app_config_name', 'device', 'device_name', 'device_udid',
+            'stages', 'status', 'status_display', 'log', 'result_summary',
+            'snapshot_path', 'report_url', 'created_by', 'created_by_name',
+            'created_at', 'started_at', 'finished_at', 'duration'
+        ]
+        read_only_fields = [
+            'id', 'status', 'status_display', 'log', 'result_summary',
+            'snapshot_path', 'report_url', 'created_at', 'started_at', 'finished_at', 'duration'
+        ]
 

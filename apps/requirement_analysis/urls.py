@@ -28,6 +28,7 @@ from .modao_views import (
     modao_confirm, modao_smoke, modao_detail, modao_excel,     modao_edit, modao_ask, modao_adopt,
     modao_adopt_single,
     modao_log_viewer, modao_log_raw,
+    modao_export_xmind, modao_import_xmind,
 )
 
 # 创建DRF路由器
@@ -77,6 +78,8 @@ urlpatterns = [
     path('api/modao/<int:pk>/edit/', modao_edit, name='modao-edit'),
     path('api/modao/<int:pk>/ask/', modao_ask, name='modao-ask'),
     path('api/modao/<int:pk>/', modao_detail, name='modao-detail'),
+    path('api/modao/<int:pk>/export-xmind/', modao_export_xmind, name='modao-export-xmind'),
+    path('api/modao/<int:pk>/import-xmind/', modao_import_xmind, name='modao-import-xmind'),
     path('api/modao/<int:pk>/excel/', modao_excel, name='modao-excel'),
     path('api/modao/<int:pk>/adopt/', modao_adopt, name='modao-adopt'),
     path('api/modao/<int:pk>/adopt-single/', modao_adopt_single, name='modao-adopt-single'),

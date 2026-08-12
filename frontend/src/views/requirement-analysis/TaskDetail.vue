@@ -1,11 +1,17 @@
 <template>
   <div class="task-detail">
     <div class="page-header">
-      <div class="header-left">
-        <h2>任务详情 - {{ task.title }}</h2>
-        <div class="task-info">
-          <span class="task-id">任务ID: {{ taskId }}</span>
-          <span class="task-status" :class="task.status">{{ getStatusText(task.status) }}</span>
+      <div class="page-header-top">
+        <button class="back-link" @click="goBack" title="返回用例记录列表">
+          <el-icon><ArrowLeft /></el-icon>
+          <span>返回</span>
+        </button>
+        <div class="header-left">
+          <h2>任务详情 - {{ task.title }}</h2>
+          <div class="task-info">
+            <span class="task-id">任务ID: {{ taskId }}</span>
+            <span class="task-status" :class="task.status">{{ getStatusText(task.status) }}</span>
+          </div>
         </div>
       </div>
       <div class="header-actions">
@@ -354,8 +360,26 @@
             <div class="body-cell">{{ testCase.caseId || `TC${String(index + 1).padStart(3, '0')}` }}</div>
             <div class="body-cell">{{ testCase.scenario }}</div>
             <div class="body-cell text-limit-2">{{ formatTextForList(testCase.precondition) }}</div>
-            <div class="body-cell text-limit-2">{{ formatTextForList(testCase.steps) }}</div>
-            <div class="body-cell text-limit-2">{{ formatTextForList(testCase.expected) }}</div>
+            <div
+              class="body-cell text-limit-2 clickable-cell"
+              :class="{ 'text-expanded': isCellExpanded(testCase, 'steps') }"
+              @click="toggleCellExpand(testCase, 'steps')"
+              :title="isCellExpanded(testCase, 'steps') ? '点击收起' : '点击展开完整内容'">
+              <div class="cell-content">{{ formatTextForList(testCase.steps) }}</div>
+              <span class="expand-toggle">
+                {{ isCellExpanded(testCase, 'steps') ? '收起 ▲' : '展开 ▼' }}
+              </span>
+            </div>
+            <div
+              class="body-cell text-limit-2 clickable-cell"
+              :class="{ 'text-expanded': isCellExpanded(testCase, 'expected') }"
+              @click="toggleCellExpand(testCase, 'expected')"
+              :title="isCellExpanded(testCase, 'expected') ? '点击收起' : '点击展开完整内容'">
+              <div class="cell-content">{{ formatTextForList(testCase.expected) }}</div>
+              <span class="expand-toggle">
+                {{ isCellExpanded(testCase, 'expected') ? '收起 ▲' : '展开 ▼' }}
+              </span>
+            </div>
             <div class="body-cell">
               <span class="priority-tag" :class="testCase.priority?.toLowerCase()">{{ testCase.priority || 'P2' }}</span>
             </div>
@@ -521,6 +545,21 @@
             </div>
           </div>
 
+          <!-- 关联版本（用于筛选功能模块） -->
+          <div class="form-group">
+            <label>关联版本</label>
+            <select
+              v-model="regenerateForm.version_id"
+              class="form-select"
+              @change="onRegenerateVersionChange"
+            >
+              <option :value="null">不指定版本</option>
+              <option v-for="ver in regenerateVersions" :key="ver.id" :value="ver.id">
+                {{ ver.name }}{{ ver.is_baseline ? ' (基线)' : '' }}
+              </option>
+            </select>
+          </div>
+
           <!-- 功能模块 -->
           <div class="form-group">
             <label>功能模块
@@ -532,9 +571,13 @@
               @change="onRegenerateFeatureModuleChange"
             >
               <option :value="null">不指定功能模块</option>
-              <option v-for="fm in regenerateFeatureModules" :key="fm.id" :value="fm.id">
-                {{ fm.name }}
-              </option>
+              <optgroup v-if="regenerateFeatureModuleGroups.version.length" :label="`已关联 ${regenerateVersionName}`">
+                <option v-for="fm in regenerateFeatureModuleGroups.version" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+              </optgroup>
+              <optgroup v-if="regenerateFeatureModuleGroups.unassociated.length" label="未关联版本">
+                <option v-for="fm in regenerateFeatureModuleGroups.unassociated" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
+              </optgroup>
+              <option v-for="fm in regenerateFeatureModuleGroups.all" :key="fm.id" :value="fm.id">{{ fm.name }}</option>
             </select>
           </div>
 
@@ -674,7 +717,7 @@
 import api from '@/utils/api'
 import { importGeneratedToAICase } from '@/api/requirement-analysis'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { DocumentCopy } from '@element-plus/icons-vue'
+import { DocumentCopy, ArrowLeft } from '@element-plus/icons-vue'
 import * as XLSX from 'xlsx'
 
 export default {
@@ -690,6 +733,8 @@ export default {
       selectedCase: {},
       selectedCaseIndex: 0,
       currentPage: 1,
+      // 展开状态：键为 `${caseId}-${field}`，值为 bool
+      expandedCells: {},
       pageSize: 10,
       isExporting: false,
       isRegenerating: false,
@@ -717,9 +762,11 @@ export default {
       showRegenerateDialog: false,
       regenerateForm: {
         generation_mode: 'smart',
+        version_id: null,
         feature_module_id: null,
         test_point_id: null,
       },
+      regenerateVersions: [],      // 当前项目下的版本列表（用于版本筛选）
       regenerateFeatureModules: [],
       regenerateTestPoints: [],
       // 从头重新生成弹窗
@@ -755,6 +802,33 @@ export default {
       const start = (this.currentPage - 1) * this.pageSize
       const end = start + this.pageSize
       return this.testCases.slice(start, end)
+    },
+
+    // 「基于调整重新生成」弹窗：版本名（用于 optgroup label 显示）
+    regenerateVersionName() {
+      if (!this.regenerateForm.version_id) return ''
+      const v = this.regenerateVersions.find(v => v.id === Number(this.regenerateForm.version_id))
+      return v ? v.name : ''
+    },
+
+    // 「基于调整重新生成」弹窗：功能模块按版本分组（已关联 + 未关联版本）
+    regenerateFeatureModuleGroups() {
+      if (!this.task.project) {
+        return { version: [], unassociated: [], all: this.regenerateFeatureModules || [] }
+      }
+      const base = this.regenerateFeatureModules || []
+      if (!this.regenerateForm.version_id) {
+        return { version: [], unassociated: [], all: base }
+      }
+      const vid = Number(this.regenerateForm.version_id)
+      const versionMods = []
+      const unassociated = []
+      for (const fm of base) {
+        const versions = fm.versions || []
+        if (versions.some(v => v.id === vid)) versionMods.push(fm)
+        else if (versions.length === 0) unassociated.push(fm)
+      }
+      return { version: versionMods, unassociated, all: [] }
     },
 
     paginationStart() {
@@ -796,6 +870,14 @@ export default {
   },
 
   methods: {
+    /** 返回用例记录列表 */
+    goBack() {
+      if (window.history.length > 1) {
+        this.$router.back()
+      } else {
+        this.$router.push('/ai-generation/generated-testcases')
+      }
+    },
     // 复制需求描述文本
     async copyRequirementText() {
       try {
@@ -1027,17 +1109,39 @@ export default {
     async openRegenerateDialog() {
       this.regenerateForm = {
         generation_mode: this.task.generation_mode || 'smart',
+        version_id: this.task.version || null,
         feature_module_id: this.task.feature_module || null,
         test_point_id: this.task.test_point || null,
       }
+      this.regenerateVersions = []
       this.regenerateFeatureModules = []
       this.regenerateTestPoints = []
 
-      // 加载当前项目的功能模块列表
+      // 加载当前项目的版本列表（/versions/?projects=xxx 后端按 'projects' 复数过滤）
       if (this.task.project) {
         try {
-          const res = await api.get('/feature-modules/', { params: { project: this.task.project } })
-          this.regenerateFeatureModules = res.data.results || res.data || []
+          const vres = await api.get('/versions/', { params: { projects: this.task.project, page_size: 200 } })
+          const vdata = vres.data || {}
+          this.regenerateVersions = (vdata.results || vdata || []).filter(v => v)
+        } catch (e) {
+          console.error('加载版本列表失败:', e)
+        }
+      }
+
+      // 加载当前项目的功能模块列表（/feature-modules/ 分页，需翻页拉全）
+      if (this.task.project) {
+        try {
+          const all = []
+          let page = 1
+          while (true) {
+            const res = await api.get('/feature-modules/', { params: { project: this.task.project, page } })
+            const data = res.data || {}
+            const items = data.results || data || []
+            if (Array.isArray(items)) all.push(...items)
+            if (!data.next || !items.length || !Array.isArray(items)) break
+            page += 1
+          }
+          this.regenerateFeatureModules = all
         } catch (e) {
           console.error('加载功能模块失败:', e)
         }
@@ -1055,6 +1159,20 @@ export default {
     async onRegenerateFeatureModuleChange() {
       this.regenerateForm.test_point_id = null
       await this.loadRegenerateTestPoints(this.regenerateForm.feature_module_id)
+    },
+
+    // 切换版本时：若已选的功能模块不关联新版本，就清空，避免点了功能模块但实际不参与
+    onRegenerateVersionChange() {
+      if (!this.regenerateForm.version_id) return
+      const vid = Number(this.regenerateForm.version_id)
+      const matched = this.regenerateFeatureModules.some(fm =>
+        (fm.versions || []).some(v => v.id === vid)
+      )
+      if (!matched) {
+        this.regenerateForm.feature_module_id = null
+        this.regenerateForm.test_point_id = null
+        this.regenerateTestPoints = []
+      }
     },
 
     // 加载指定功能模块的测试点
@@ -1139,11 +1257,20 @@ export default {
       this.regenerateNewFeatureModules = []
       this.regenerateNewTestPoints = []
 
-      // 加载当前项目的功能模块列表
+      // 加载当前项目的功能模块列表（/feature-modules/ 分页，需翻页拉全）
       if (this.task.project) {
         try {
-          const res = await api.get('/feature-modules/', { params: { project: this.task.project } })
-          this.regenerateNewFeatureModules = res.data.results || res.data || []
+          const all = []
+          let page = 1
+          while (true) {
+            const res = await api.get('/feature-modules/', { params: { project: this.task.project, page } })
+            const data = res.data || {}
+            const items = data.results || data || []
+            if (Array.isArray(items)) all.push(...items)
+            if (!data.next || !items.length || !Array.isArray(items)) break
+            page += 1
+          }
+          this.regenerateNewFeatureModules = all
         } catch (e) {
           console.error('加载功能模块失败:', e)
         }
@@ -1426,6 +1553,24 @@ export default {
       if (!text) return ''
       // 将<br>、<br/>、<br />等标签替换为换行符
       return text.replace(/<br\s*\/?>/gi, '\n')
+    },
+
+    /** 是否展开某行某列 */
+    isCellExpanded(testCase, field) {
+      const key = `${testCase.id || testCase.caseId || ''}-${field}`
+      return !!this.expandedCells[key]
+    },
+
+    /** 切换展开/收起 */
+    toggleCellExpand(testCase, field) {
+      const key = `${testCase.id || testCase.caseId || ''}-${field}`
+      this.expandedCells[key] = !this.expandedCells[key]
+    },
+
+    /** 是否需要显示「展开/收起」按钮（只要内容非空就显示） */
+    shouldShowToggle(testCase, field) {
+      const text = testCase[field]
+      return text && typeof text === 'string' && text.trim().length > 0
     },
 
     // 格式化文本，去除markdown标记并保留格式
@@ -2587,13 +2732,38 @@ export default {
   margin-bottom: 20px;
   padding-bottom: 15px;
   border-bottom: 1px solid #eee;
+}
+
+.page-header-top {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.back-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  color: #606266;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.back-link:hover {
+  border-color: #409eff;
+  color: #409eff;
 }
 
 .header-left {
   flex: 1;
+  margin-right: 16px;
 }
 
 .page-header h2 {
@@ -2961,6 +3131,40 @@ export default {
 .body-cell.text-limit-2 {
   align-items: flex-start;
   overflow: hidden;
+}
+
+/* 可点击展开的单元格 */
+.body-cell.clickable-cell {
+  cursor: pointer;
+  position: relative;
+  transition: background-color 0.15s;
+}
+.body-cell.clickable-cell:hover {
+  background-color: #f5f7fa;
+}
+
+/* 展开后的内容样式 */
+.body-cell.text-expanded.text-limit-2 {
+  -webkit-line-clamp: unset;
+  max-height: none;
+  overflow: visible;
+}
+
+.cell-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.expand-toggle {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 0.75rem;
+  color: #409eff;
+  font-weight: 500;
+  user-select: none;
+}
+.expand-toggle:hover {
+  text-decoration: underline;
 }
 
 .checkbox-cell {

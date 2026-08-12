@@ -1,8 +1,13 @@
+import logging
 from django.db import models
+from django.db.models.signals import pre_delete
+from django.dispatch import receiver
 from django.utils import timezone
 from apps.users.models import User
 from apps.projects.models import Project
 from apps.versions.models import Version
+
+logger = logging.getLogger('django')
 
 
 class FeatureModule(models.Model):
@@ -46,3 +51,33 @@ class TestPoint(models.Model):
         verbose_name_plural = '测试点'
         ordering = ['feature_module', 'name']
         unique_together = ['feature_module', 'name']
+
+
+@receiver(pre_delete, sender=FeatureModule)
+def _feature_module_pre_delete(sender, instance, **kwargs):
+    """功能模块删除前的审计日志。
+
+    覆盖任何删除路径（DRF 接口 / Django admin / 后台任务 / parent 级联删子模块）。
+    用于排查"删除几个冗余模块却连带删掉大量正常模块"的问题——
+    这里能记录每次被删模块的完整上下文，以及它是否是被父模块级联删除的。
+    """
+    try:
+        tp_count = instance.test_points.count()
+        child_count = instance.children.count()
+        version_ids = list(instance.versions.values_list('id', flat=True))
+        # 是否被子模块级联删除（parent 为 NULL 的非父模块自身删除时这里无意义）
+        parent_desc = None
+        if instance.parent_id:
+            try:
+                parent_desc = f"name={instance.parent.name!r}(id={instance.parent_id})"
+            except Exception:  # noqa: BLE001
+                parent_desc = f"(id={instance.parent_id})"
+        logger.info(
+            '[FEATURE_MODULE_PRE_DELETE] id=%s name=%r project_id=%s '
+            'test_points=%s children=%s versions=%s parent=%s created_by_id=%s',
+            instance.id, instance.name, instance.project_id,
+            tp_count, child_count, version_ids, parent_desc, instance.created_by_id,
+        )
+    except Exception as e:  # noqa: BLE001 日志失败不影响删除
+        logger.warning('[FEATURE_MODULE_PRE_DELETE] 记录日志失败 id=%s err=%s',
+                       getattr(instance, 'id', None), e)

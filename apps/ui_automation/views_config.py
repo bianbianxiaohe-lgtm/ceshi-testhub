@@ -161,12 +161,15 @@ class EnvironmentConfigViewSet(viewsets.ViewSet):
 import requests
 from apps.requirement_analysis.models import AIModelConfig
 
+# AI智能模式配置支持的角色：browser_use_text=Web文本执行；midscene_vision=APP真机视觉驱动
+AIMODE_ROLE_CHOICES = ['browser_use_text', 'midscene_vision']
+
 class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
     """
-    AI智能模式配置视图集 (Browser-use) - 使用ModelViewSet支持标准CRUD
+    AI智能模式配置视图集 (Browser-use / Midscene) - 使用ModelViewSet支持标准CRUD
     """
     permission_classes = [IsAuthenticated]
-    queryset = AIModelConfig.objects.filter(role='browser_use_text')
+    queryset = AIModelConfig.objects.filter(role__in=AIMODE_ROLE_CHOICES)
 
     def list(self, request):
         """
@@ -176,6 +179,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
         serializer_data = [{
             'id': config.id,
             'name': config.name,
+            'role': config.role,
             'model_type': config.model_type,
             'model_name': config.model_name,
             'base_url': config.base_url,
@@ -202,15 +206,23 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # 如果创建时启用，先禁用其他所有配置
+        # 角色校验，未传或非法时回退到 browser_use_text
+        role = data.get('role') or 'browser_use_text'
+        if role not in AIMODE_ROLE_CHOICES:
+            return Response(
+                {'error': f"role must be one of {AIMODE_ROLE_CHOICES}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 如果创建时启用，先禁用同角色的其他所有配置（不同角色互不干扰）
         if data.get('is_active', True):
-            self.queryset.filter(is_active=True).update(is_active=False)
+            AIModelConfig.objects.filter(role=role, is_active=True).update(is_active=False)
 
         # 创建新配置
         config = AIModelConfig.objects.create(
             name=data['name'],
             model_type=data['model_type'],
-            role='browser_use_text',
+            role=role,
             model_name=data['model_name'],
             api_key=data['api_key'],
             base_url=data.get('base_url', ''),
@@ -221,6 +233,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
         return Response({
             'id': config.id,
             'name': config.name,
+            'role': config.role,
             'model_type': config.model_type,
             'model_name': config.model_name,
             'base_url': config.base_url,
@@ -237,6 +250,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
             return Response({
                 'id': config.id,
                 'name': config.name,
+                'role': config.role,
                 'model_type': config.model_type,
                 'model_name': config.model_name,
                 'base_url': config.base_url,
@@ -258,12 +272,22 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
             config = self.queryset.get(pk=pk)
             data = request.data
 
-            # 如果启用此配置，先禁用其他所有配置
+            # 角色切换（仅允许支持的枚举值）
+            new_role = data.get('role', config.role)
+            if new_role not in AIMODE_ROLE_CHOICES:
+                return Response(
+                    {'error': f"role must be one of {AIMODE_ROLE_CHOICES}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 如果启用此配置，先禁用【同角色】其他所有配置（不同角色互不干扰）
             new_is_active = data.get('is_active', config.is_active)
             disabled_config_names = []
             if new_is_active:
                 # 查找将被禁用的配置
-                active_configs = self.queryset.exclude(pk=pk).filter(is_active=True)
+                active_configs = AIModelConfig.objects.filter(
+                    role=new_role, is_active=True
+                ).exclude(pk=pk)
                 disabled_config_names = [c.name for c in active_configs]
                 # 先禁用其他所有配置（不包括当前配置），避免唯一约束冲突
                 active_configs.update(is_active=False)
@@ -271,6 +295,8 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
             # 更新字段
             if 'name' in data:
                 config.name = data['name']
+            if 'role' in data:
+                config.role = new_role
             if 'model_type' in data:
                 config.model_type = data['model_type']
             if 'model_name' in data:
@@ -287,6 +313,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
             response_data = {
                 'id': config.id,
                 'name': config.name,
+                'role': config.role,
                 'model_type': config.model_type,
                 'model_name': config.model_name,
                 'base_url': config.base_url,
@@ -360,6 +387,8 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 base_url = 'https://api.deepseek.com'
             elif provider == 'anthropic':
                 base_url = 'https://api.anthropic.com'
+            elif provider == 'qwen':
+                base_url = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
         if not base_url:
              return Response(
@@ -441,6 +470,8 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 base_url = 'https://api.deepseek.com'
             elif provider == 'anthropic':
                 base_url = 'https://api.anthropic.com'
+            elif provider == 'qwen':
+                base_url = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
         if not base_url:
             return Response(

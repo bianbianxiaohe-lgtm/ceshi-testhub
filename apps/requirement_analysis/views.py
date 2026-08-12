@@ -7,6 +7,7 @@ import time
 import threading
 from rest_framework import viewsets, status
 from django.conf import settings  # Added import
+from django.db.models import Q
 from rest_framework.decorators import action, permission_classes
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer
@@ -1420,8 +1421,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     def generate(self, request):
         """创建新的测试用例生成任务"""
         try:
+            user_info = f"user={request.user.username if request.user.is_authenticated else 'anon'}"
+            logger.info(f"[CASE-GEN] 开始创建任务 - {user_info}, title={request.data.get('title', '?')[:50]}")
             serializer = TestCaseGenerationRequestSerializer(data=request.data)
             if not serializer.is_valid():
+                logger.warning(f"[CASE-GEN] 参数校验失败: {serializer.errors}")
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             
             validated_data = serializer.validated_data
@@ -1437,6 +1441,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 writer_config = AIModelConfig.objects.filter(role='writer', is_active=True).first()
                 
                 if not writer_config:
+                    logger.error(f"[CASE-GEN] writer 模型未配置或未启用")
                     return Response(
                         {'error': '未找到可用的测试用例编写模型配置'}, 
                         status=status.HTTP_400_BAD_REQUEST
@@ -1444,6 +1449,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 
                 writer_prompt = PromptConfig.get_active_config('writer')
                 if not writer_prompt:
+                    logger.error(f"[CASE-GEN] writer prompt 未配置或未启用")
                     return Response(
                         {'error': '未找到可用的测试用例编写提示词配置'}, 
                         status=status.HTTP_400_BAD_REQUEST
@@ -1454,6 +1460,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 reviewer_config = AIModelConfig.objects.filter(role='reviewer', is_active=True).first()
                 
                 if not reviewer_config:
+                    logger.error(f"[CASE-GEN] reviewer 模型未配置或未启用")
                     return Response(
                         {'error': '未找到可用的测试用例评审模型配置'}, 
                         status=status.HTTP_400_BAD_REQUEST
@@ -1461,6 +1468,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 
                 reviewer_prompt = PromptConfig.get_active_config('reviewer')
                 if not reviewer_prompt:
+                    logger.error(f"[CASE-GEN] reviewer prompt 未配置或未启用")
                     return Response(
                         {'error': '未找到可用的测试用例评审提示词配置'}, 
                         status=status.HTTP_400_BAD_REQUEST
@@ -1523,6 +1531,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             
             if task_serializer.is_valid():
                 task = task_serializer.save()
+                logger.info(f"[CASE-GEN] 任务创建成功 task_id={task.task_id}, mode={task.output_mode}, gen_mode={task.generation_mode}")
                 
                 # 异步执行生成任务
                 def run_generation_task():
@@ -1538,6 +1547,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                 # 更新任务状态
                                 task.status = 'generating'
                                 task.progress = 10
+                                logger.info(f"[CASE-GEN-THREAD] 后台线程启动 task_id={task.task_id}")
                                 task.save()
 
                                 # 读取生成行为配置
@@ -1729,7 +1739,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                             sorted_cases = AIModelService.sort_test_cases_by_id(revised_cases)
                                                             # 重新编号使编号连续
                                                             renumbered_cases = AIModelService.renumber_test_cases(sorted_cases)
-                                                            task.final_test_cases = renumbered_cases
+                                                            task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                                renumbered_cases, task.generation_mode)[0]
                                                             logger.info(f"任务 {task.task_id} 测试用例改进完成 (revised_cases长度: {len(revised_cases)}, 最终保存长度: {len(task.final_test_cases)})")
                                                             task.status = 'completed'
                                                             task.progress = 100
@@ -1743,7 +1754,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                         # 按用例编号排序后再保存
                                                         sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
                                                         # 重新编号使编号连续
-                                                        task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                                        task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                        AIModelService.renumber_test_cases(sorted_cases),
+                                                        task.generation_mode)[0]
                                                         task.status = 'completed'
                                                         task.progress = 100
                                                         task.completed_at = timezone.now()
@@ -1755,7 +1768,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                     # 按用例编号排序后再保存
                                                     sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
                                                     # 重新编号使编号连续
-                                                    task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                                    task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                        AIModelService.renumber_test_cases(sorted_cases),
+                                                        task.generation_mode)[0]
                                                     task.status = 'completed'
                                                     task.progress = 100
                                                     task.completed_at = timezone.now()
@@ -1765,7 +1780,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                 logger.error(f"流式评审任务 {task.task_id} 失败: {review_error}")
                                                 # 按用例编号排序后再保存
                                                 sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
-                                                task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                                task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                    AIModelService.renumber_test_cases(sorted_cases),
+                                                    task.generation_mode)[0]
                                                 task.review_feedback = f"评审失败: {str(review_error)}\n\n建议：测试用例结构完整，可以使用。"
                                                 task.status = 'completed'
                                                 task.progress = 100
@@ -1774,8 +1791,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         else:
                                             # 按用例编号排序后再保存
                                             sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
-                                            # 重新编号使编号连续
-                                            task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                            # 重新编号使编号连续 + 按生成模式截断
+                                            task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                AIModelService.renumber_test_cases(sorted_cases),
+                                                task.generation_mode)[0]
                                             logger.info(f"任务 {task.task_id} 跳过评审，直接使用生成的测试用例")
                                             task.status = 'completed'
                                             task.progress = 100
@@ -1884,7 +1903,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                             sorted_cases = AIModelService.sort_test_cases_by_id(revised_cases)
                                                             # 重新编号使编号连续
                                                             renumbered_cases = AIModelService.renumber_test_cases(sorted_cases)
-                                                            task.final_test_cases = renumbered_cases
+                                                            task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                                renumbered_cases, task.generation_mode)[0]
                                                             logger.info(f"任务 {task.task_id} 测试用例改进完成 (revised_cases长度: {len(revised_cases)}, 最终保存长度: {len(task.final_test_cases)})")
                                                             task.status = 'completed'
                                                             task.progress = 100
@@ -1898,7 +1918,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                         # 按用例编号排序后再保存
                                                         sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
                                                         # 重新编号使编号连续
-                                                        task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                                        task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                        AIModelService.renumber_test_cases(sorted_cases),
+                                                        task.generation_mode)[0]
                                                         task.status = 'completed'
                                                         task.progress = 100
                                                         task.completed_at = timezone.now()
@@ -1910,7 +1932,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                     # 按用例编号排序后再保存
                                                     sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
                                                     # 重新编号使编号连续
-                                                    task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                                    task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                        AIModelService.renumber_test_cases(sorted_cases),
+                                                        task.generation_mode)[0]
                                                     task.status = 'completed'
                                                     task.progress = 100
                                                     task.completed_at = timezone.now()
@@ -1921,7 +1945,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                 # 评审失败时，仍然使用生成的测试用例作为最终结果
                                                 # 按用例编号排序后再保存
                                                 sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
-                                                task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                                task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                    AIModelService.renumber_test_cases(sorted_cases),
+                                                    task.generation_mode)[0]
                                                 task.review_feedback = f"评审失败: {str(review_error)}\n\n建议：测试用例结构完整，可以使用。"
                                                 task.status = 'completed'
                                                 task.progress = 100
@@ -1930,8 +1956,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         else:
                                             # 按用例编号排序后再保存
                                             sorted_cases = AIModelService.sort_test_cases_by_id(generated_cases)
-                                            # 重新编号使编号连续
-                                            task.final_test_cases = AIModelService.renumber_test_cases(sorted_cases)
+                                            # 重新编号使编号连续 + 按生成模式截断
+                                            task.final_test_cases = AIModelService.enforce_case_count_limit(
+                                                AIModelService.renumber_test_cases(sorted_cases),
+                                                task.generation_mode)[0]
                                             logger.info(f"任务 {task.task_id} 跳过评审，直接使用生成的测试用例")
                                             task.status = 'completed'
                                             task.progress = 100
@@ -1970,7 +1998,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                         thread.start()
                         
                     except Exception as e:
-                        logger.error(f"启动生成任务失败: {e}")
+                        logger.error(f"[CASE-GEN-THREAD] 启动生成任务失败 task_id={task.task_id}: {e}", exc_info=True)
                         task.status = 'failed'
                         task.error_message = str(e)
                         task.save()
@@ -1984,10 +2012,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     'task': task_serializer.data
                 }, status=status.HTTP_201_CREATED)
             else:
+                logger.error(f"[CASE-GEN] task_serializer 校验失败: {task_serializer.errors}")
                 return Response(task_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
                 
         except Exception as e:
-            logger.error(f"创建生成任务时出错: {e}")
+            logger.error(f"[CASE-GEN] 创建生成任务时出错: {e}", exc_info=True)
             return Response(
                 {'error': f'创建任务失败: {str(e)}'}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -2934,12 +2963,20 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_200_OK
                 )
 
-            # 后处理：修整不完整用例 → 排序 → 重新编号
+            # 后处理：修整不完整用例 → 排序 → 重新编号 → 去重 → 按生成模式截断
             revised_cases = AIModelService.fix_incomplete_last_case(revised_cases)
             sorted_cases = AIModelService.sort_test_cases_by_id(revised_cases)
             renumbered_cases = AIModelService.renumber_test_cases(sorted_cases)
+            # 强制去重（解决"基于评审意见重新生成"时 LLM 不执行"删除冗余"指令的问题）
+            # 仅按编号完全相同去重，不按标题相似度（避免误删功能相近但不同的用例）
+            deduped_cases, dedup_removed, _ = AIModelService.dedup_duplicate_test_cases(renumbered_cases)
+            if dedup_removed > 0:
+                logger.info(f"任务 {task.task_id} 重新生成后去重: 删除{dedup_removed}条冗余用例")
+                # 重新编号（去重后编号可能不再连续）
+                deduped_cases = AIModelService.renumber_test_cases(deduped_cases)
 
-            task.final_test_cases = renumbered_cases
+            task.final_test_cases = AIModelService.enforce_case_count_limit(
+                deduped_cases, task.generation_mode)[0]
             task.status = 'completed'
             task.progress = 100
             task.completed_at = timezone.now()
@@ -3675,9 +3712,32 @@ class GeneratedRequirementDocViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
-        # 只返回当前用户创建的文档
         if self.request.user.is_authenticated:
-            qs = qs.filter(created_by=self.request.user)
+            # 获取当前用户参与的所有项目ID
+            from apps.projects.models import Project
+            member_project_ids = list(
+                Project.objects.filter(
+                    Q(owner=self.request.user) |
+                    Q(members=self.request.user)
+                ).values_list('id', flat=True).distinct()
+            )
+            # 可选：按请求参数过滤特定项目
+            project_id = self.request.query_params.get('project_id')
+            if project_id:
+                try:
+                    pid = int(project_id)
+                    if pid in member_project_ids:
+                        member_project_ids = [pid]
+                    else:
+                        # 用户不在该项目中，返回空
+                        return qs.none()
+                except (ValueError, TypeError):
+                    pass
+            if member_project_ids:
+                qs = qs.filter(project_id__in=member_project_ids)
+            else:
+                # 用户不属于任何项目，退回到只看自己的
+                qs = qs.filter(created_by=self.request.user)
         return qs.order_by('-created_at')
 
     def partial_update(self, request, *args, **kwargs):
@@ -3713,7 +3773,33 @@ class RequirementAnalysisResultViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         if self.request.user.is_authenticated:
-            qs = qs.filter(created_by=self.request.user)
+            # 获取当前用户参与的所有项目ID
+            from apps.projects.models import Project
+            member_project_ids = list(
+                Project.objects.filter(
+                    Q(owner=self.request.user) |
+                    Q(members=self.request.user)
+                ).values_list('id', flat=True).distinct()
+            )
+            # 可选：按请求参数过滤特定项目
+            project_id = self.request.query_params.get('project_id')
+            if project_id:
+                try:
+                    pid = int(project_id)
+                    if pid in member_project_ids:
+                        member_project_ids = [pid]
+                    else:
+                        return qs.none()
+                except (ValueError, TypeError):
+                    pass
+            if member_project_ids:
+                # 同项目成员可见 OR 创建者自己可见（兼容拆解结果未关联项目的历史数据）
+                qs = qs.filter(
+                    Q(project_id__in=member_project_ids) |
+                    Q(created_by=self.request.user, project__isnull=True)
+                )
+            else:
+                qs = qs.filter(created_by=self.request.user)
         return qs.order_by('-created_at')
 
     def perform_create(self, serializer):
@@ -3795,7 +3881,18 @@ class ClarificationQuestionViewSet(viewsets.ModelViewSet):
         if result_id:
             qs = qs.filter(analysis_result_id=result_id)
         if self.request.user.is_authenticated:
-            qs = qs.filter(analysis_result__created_by=self.request.user)
+            # 同项目成员互相可见（与 GeneratedRequirementDocViewSet 一致）
+            from apps.projects.models import Project
+            member_project_ids = list(
+                Project.objects.filter(
+                    Q(owner=self.request.user) |
+                    Q(members=self.request.user)
+                ).values_list('id', flat=True).distinct()
+            )
+            if member_project_ids:
+                qs = qs.filter(analysis_result__project_id__in=member_project_ids)
+            else:
+                qs = qs.filter(analysis_result__created_by=self.request.user)
         return qs.order_by('order', 'id')
 
     @action(detail=False, methods=['post'], url_path='save-all')
@@ -3814,8 +3911,17 @@ class ClarificationQuestionViewSet(viewsets.ModelViewSet):
             result = RequirementAnalysisResult.objects.get(id=analysis_result_id)
         except RequirementAnalysisResult.DoesNotExist:
             return Response({'error': '拆解结果不存在'}, status=status.HTTP_404_NOT_FOUND)
-        if request.user.is_authenticated and result.created_by_id != request.user.id:
-            return Response({'error': '无权限操作该拆解结果'}, status=status.HTTP_403_FORBIDDEN)
+        if request.user.is_authenticated:
+            # 同项目成员有写入权限（与列表/详情可见性保持一致）
+            from apps.projects.models import Project
+            is_member = Project.objects.filter(
+                Q(id=result.project_id) &
+                (Q(owner=request.user) | Q(members=request.user))
+            ).exists()
+            if not is_member:
+                # 兼容老数据：拆解结果未关联项目时，退回原 created_by 校验
+                if result.created_by_id != request.user.id:
+                    return Response({'error': '无权限操作该拆解结果'}, status=status.HTTP_403_FORBIDDEN)
 
         ClarificationQuestion.objects.filter(analysis_result_id=analysis_result_id).delete()
         created_ids = []

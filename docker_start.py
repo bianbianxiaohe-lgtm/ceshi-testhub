@@ -236,6 +236,32 @@ if not cur.fetchone():
     print('ensured column confirmed_answers on testcase_generation_task')
 else:
     print('confirmed_answers already exists')
+
+# 确保 App 自动化流水线运行记录表存在（新功能：选应用 + 自定义阶段 + 运行记录重跑）。
+# 注意：app_configs / app_devices 库内主键实际为 INT（与模型 BigAutoField 存在漂移），
+# 因此外键列必须显式用 INT，避免 MySQL 3780 外键类型不兼容。
+cur.execute('''
+CREATE TABLE IF NOT EXISTS app_pipeline_runs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    stages JSON,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    log LONGTEXT,
+    result_summary LONGTEXT,
+    snapshot_path VARCHAR(500),
+    report_url VARCHAR(500),
+    created_at DATETIME NOT NULL,
+    started_at DATETIME NULL,
+    finished_at DATETIME NULL,
+    duration DOUBLE NOT NULL DEFAULT 0,
+    app_config_id INT NOT NULL,
+    device_id INT NULL,
+    created_by_id INT NULL,
+    CONSTRAINT fk_pipeline_app_config FOREIGN KEY (app_config_id) REFERENCES app_configs (id),
+    CONSTRAINT fk_pipeline_device FOREIGN KEY (device_id) REFERENCES app_devices (id),
+    CONSTRAINT fk_pipeline_created_by FOREIGN KEY (created_by_id) REFERENCES auth_user (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+''')
+print('ensured table app_pipeline_runs')
 """
     print("Ensuring center_x/center_y columns exist on ui_test_case_steps...")
     subprocess.run([sys.executable, "-c", ensure_script], check=False)

@@ -1,7 +1,13 @@
 <template>
   <div class="requirement-analysis">
     <div class="page-header">
-      <h1>智能测试用例生成</h1>
+      <div class="page-header-top">
+        <button class="back-link" @click="goBack" title="返回上一页">
+          <el-icon><ArrowLeft /></el-icon>
+          <span>返回</span>
+        </button>
+        <h1>智能测试用例生成</h1>
+      </div>
       <p>基于需求描述或文档，AI将直接为您生成高质量的测试用例</p>
     </div>
 
@@ -262,7 +268,7 @@
               <div class="au-header">
                 <el-tag :type="item.confirmed ? 'success' : 'warning'" size="small">待确认 {{ idx + 1 }}</el-tag>
                 <span class="au-question">{{ item.question }}</span>
-                <el-button v-if="!item.confirmed" type="primary" size="small" plain @click="item.confirmed = true">✓ 确认</el-button>
+                <el-button v-if="!item.confirmed" type="primary" size="small" plain @click="confirmUncertainItem(item)">✓ 确认</el-button>
                 <el-tag v-else type="success" size="small">已确认 ✓</el-tag>
               </div>
               <div v-if="item.context" class="au-context"><strong>AI 推测：</strong>{{ item.context }}</div>
@@ -272,6 +278,7 @@
                 :rows="2"
                 placeholder="回复此问题（可选，留空则采纳 AI 推测）"
                 style="margin-top:8px"
+                @input="saveUncertainItems"
               />
             </div>
           </div>
@@ -799,7 +806,8 @@
                   @click="analyzeFromHistoryDoc(doc)"
                   :disabled="analyzeLoading"
                   title="需求拆解">
-                  🧩 拆解
+                  <span v-if="analyzeLoading">🔄 拆解中...</span>
+                  <span v-else>🧩 拆解</span>
                 </button>
                 <button class="history-btn generate" @click="generateFromHistoryDoc(doc)"
                   :disabled="docAnalysisMap[doc.id] && hasUnconfirmedItems"
@@ -1188,6 +1196,7 @@
 <script>
 import api from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowLeft } from '@element-plus/icons-vue'
 import * as XLSX from 'xlsx'
 import { useUserStore } from '@/stores/user'
 import {
@@ -1565,6 +1574,14 @@ export default {
   },
 
   methods: {
+    /** 返回上一页；如果没有历史（如直接打开），跳到 AI 生成用例记录页 */
+    goBack() {
+      if (window.history.length > 1) {
+        this.$router.back()
+      } else {
+        this.$router.push('/ai-generation/generated-testcases')
+      }
+    },
     async loadProjects() {
       try {
         const response = await api.get('/projects/')
@@ -1586,8 +1603,19 @@ export default {
 
     async loadFeatureModules() {
       try {
-        const response = await api.get('/feature-modules/')
-        this.allFeatureModules = response.data.results || response.data || []
+        // 后端 /feature-modules/ 分页（PAGE_SIZE=20），必须翻页拉全，
+        // 否则只会加载第一页，排序靠后的项目/模块（如轻卡日常）加载不出来。
+        const all = []
+        let page = 1
+        while (true) {
+          const response = await api.get('/feature-modules/', { params: { page } })
+          const data = response.data || {}
+          const items = data.results || data || []
+          if (Array.isArray(items)) all.push(...items)
+          if (!data.next || !items.length || !Array.isArray(items)) break
+          page += 1
+        }
+        this.allFeatureModules = all
       } catch (error) {
         console.error('加载功能模块失败:', error)
         this.allFeatureModules = []
@@ -2078,13 +2106,17 @@ export default {
         // 打开确认弹窗，保存待生成的 payload
         this.pendingGeneratePayload = { title, content: fullDoc.markdown_content, source: 'history' }
         // 预填项目（如果历史文档有关联项目）
-        const defaultProjectId = fullDoc.project?.id || null
         this.generateConfirmForm = {
-          project_id: defaultProjectId,
+          project_id: fullDoc.project?.id || null,
           version_id: this.selectedVersion || null,
           feature_module_id: null,
           test_point_id: null,
           generation_mode: 'smart'
+        }
+        // 触发项目切换副作用
+        this.onConfirmProjectChange()
+        if (this.generateConfirmForm.project_id) {
+          this.loadVersions()
         }
         this.showGenerateConfirm = true
       } catch (error) {
@@ -2130,7 +2162,11 @@ export default {
 
     // 确认后开始生成
     async confirmStartGeneration() {
-      if (!this.canConfirmGenerate) return
+      console.log('[DEBUG] confirmStartGeneration 被调用')
+      if (!this.canConfirmGenerate) {
+        console.log('[DEBUG] canConfirmGenerate=false, 直接返回')
+        return
+      }
 
       // 拦截：仅当有拆解结果且存在未确认待确认项时才拦截
       // 没做拆解的用户可以直接走后续用例评审流程
@@ -2505,6 +2541,7 @@ export default {
     },
 
     async useReqDocForGeneration() {
+      console.log('[DEBUG] useReqDocForGeneration 被调用, markdown长度=', this.reqDoc.markdown?.length)
       if (!this.reqDoc.markdown.trim()) return
       const firstLine = this.reqDoc.markdown.split('\n')[0].replace(/^#+\s*/, '').trim()
       const title = firstLine || '需求文档'
@@ -2516,6 +2553,11 @@ export default {
         feature_module_id: null,
         test_point_id: null,
         generation_mode: 'smart'
+      }
+      // 触发项目切换的副作用
+      this.onConfirmProjectChange()
+      if (this.generateConfirmForm.project_id) {
+        this.loadVersions()
       }
       this.showGenerateConfirm = true
     },
@@ -2536,6 +2578,11 @@ export default {
         feature_module_id: null,
         test_point_id: null,
         generation_mode: 'smart'
+      }
+      // 触发项目切换副作用
+      this.onConfirmProjectChange()
+      if (this.generateConfirmForm.project_id) {
+        this.loadVersions()
       }
       this.showGenerateConfirm = true
     },
@@ -2660,6 +2707,11 @@ export default {
         this.analyzeResult = response.data.result_content || ''
         this.currentResultId = cached.id
         this.currentRequirementText = response.data.requirement_text || ''
+        // 从拆解结果恢复关联项目（供后续"生成用例"默认选中）
+        if (response.data.project) {
+          this.reqDoc.selectedProject = String(response.data.project)
+          this.reqDoc.title = doc.title || this.reqDoc.title || '需求文档'
+        }
         this.extractAllUncertainItems()
         // 滚动到结果区并显示
         this.showResults = true
@@ -3046,6 +3098,61 @@ export default {
       }
 
       this.uncertainItems = items
+      // 从服务端恢复已保存的作答（刷新/重开后保留最新回答）
+      this.restoreUncertainItems()
+    },
+
+    /** 确认某条待确认项并即时持久化 */
+    confirmUncertainItem(item) {
+      item.confirmed = true
+      this.saveUncertainItems()
+    },
+
+    /** 将 uncertainItems 的作答/确认状态持久化到服务端（关联 currentResultId，与追问清单合并避免互相覆盖） */
+    async saveUncertainItems() {
+      if (!this.currentResultId) return
+      try {
+        // 合并已保存的追问清单，避免 saveAll 全量重建时互相覆盖丢失
+        const merged = []
+        merged.push(...this.clarificationItems.map(it => ({
+          question: it.question,
+          answer: it.answer || '',
+          category: it.category || '其他',
+          status: it.status || 'pending'
+        })))
+        merged.push(...this.uncertainItems.map(i => ({
+          question: i.question,
+          answer: i.answer || '',
+          category: 'uncertain',
+          status: i.confirmed ? 'confirmed' : (i.answer ? 'answered' : 'pending')
+        })))
+        await saveAllClarifications({ analysis_result: this.currentResultId, items: merged })
+      } catch (e) {
+        console.warn('保存待确认项回答失败:', e)
+      }
+    },
+
+    /** 从服务端恢复已保存的 uncertainItems 作答（刷新/重开后保留最新回答） */
+    async restoreUncertainItems() {
+      if (!this.currentResultId || !this.uncertainItems.length) return
+      try {
+        const res = await getClarifications({ analysis_result: this.currentResultId })
+        const saved = Array.isArray(res.data) ? res.data : (res.data?.results || [])
+        if (!saved.length) return
+        const savedMap = {}
+        saved.forEach(s => { savedMap[String(s.question).trim()] = s })
+        this.uncertainItems.forEach(item => {
+          const key = String(item.question).trim()
+          const s = savedMap[key]
+          if (s) {
+            if (s.answer) item.answer = s.answer
+            if (s.status === 'confirmed') item.confirmed = true
+            else if (s.answer) item.confirmed = true // 已填回答视为已确认
+          }
+        })
+      } catch (e) {
+        console.warn('恢复待确认项回答失败:', e)
+      }
     },
 
     /** 基于已确认项精炼拆解结果（对齐 AI 用例评审 resolve_replies 闭环） */
@@ -3364,19 +3471,20 @@ export default {
     },
 
     async startGeneration(title, requirementText, projectId, outputMode = 'stream', versionId = '', featureModuleId = null, testPointId = null, generationMode = 'smart') {
-      // 在开始生成前，主动刷新token确保生成过程中不会过期
+      console.log('[DEBUG] startGeneration 开始', { title: title?.substring(0, 30), projectId, outputMode })
+      // 设置全局标记，告诉 api.js 拦截器：这是用例生成流程，遇到 401 不要 logout 跳转
+      window.__generation_flow = true
+      // 在开始生成前，强制刷新 token 确保有效；失败则提示用户手动重新登录，不依赖 axios 拦截器兜底
+      const userStore = useUserStore()
       try {
-        const userStore = useUserStore()
-        if (userStore.isTokenExpiringSoon && userStore.refreshToken) {
-          console.log('生成前主动刷新token...')
+        if (userStore.refreshToken) {
           await userStore.refreshAccessToken()
-          console.log('Token刷新成功，可以安全开始生成')
-        } else if (userStore.accessToken) {
-          console.log('Token状态良好，无需刷新')
+        } else if (!userStore.accessToken) {
+          ElMessage.error('未登录，请重新登录')
+          return
         }
       } catch (error) {
-        console.error('Token刷新失败:', error)
-        ElMessage.error('Token刷新失败，请重新登录')
+        ElMessage.error('登录已过期，请刷新页面后重新登录')
         return
       }
 
@@ -3401,14 +3509,27 @@ export default {
         }
 
         // 将需求拆解阶段确认的问答对传入，供用例生成时作为上下文注入（让AI基于确认结论精准出例）
+        // 合并两个来源：①待确认项面板的已确认项 ②深度追问面板的已回复/已确认项（去重合并）
         const confirmedItems = (this.uncertainItems || []).filter(i => i.confirmed)
-        if (confirmedItems.length > 0) {
-          requestData.confirmed_answers = JSON.stringify(
-            confirmedItems.map(i => ({
+        const answeredClarifications = (this.clarificationItems || []).filter(
+          i => i.answer && i.answer.trim() && i.status !== 'pending'
+        )
+        // 收集已有问题文本用于去重
+        const seenQuestions = new Set(confirmedItems.map(i => (i.question || '').trim()))
+        const mergedConfirmed = [
+          ...confirmedItems.map(i => ({
+            question: i.question || '',
+            answer: i.answer || i.context || ''
+          })),
+          ...answeredClarifications
+            .filter(i => !seenQuestions.has((i.question || '').trim()))
+            .map(i => ({
               question: i.question || '',
-              answer: i.answer || i.context || ''
+              answer: i.answer || ''
             }))
-          )
+        ]
+        if (mergedConfirmed.length > 0) {
+          requestData.confirmed_answers = JSON.stringify(mergedConfirmed)
         }
 
         // 如果选择了项目，添加到请求中
@@ -3428,24 +3549,31 @@ export default {
           requestData.test_point = testPointId
         }
 
+        console.log('[DEBUG] 准备调用 api.post /generate/', requestData)
         const response = await api.post('/requirement-analysis/api/testcase-generation/generate/', requestData)
+        console.log('[DEBUG] api.post 成功返回', response.data.task_id)
 
         this.currentTaskId = response.data.task_id
         this.progressText = '任务已创建，正在处理中...'
 
         ElMessage.success('测试用例生成任务已启动')
 
-        // 根据输出模式选择不同的进度获取方式
-        if (outputMode === 'stream') {
-          this.startStreamingProgress()
-        } else {
-          this.startPolling()
-        }
+        // 直接跳转到 AI 用例生成记录列表页（用户可在该页查看任务进度和结果）
+        this.$router.push({
+          path: '/ai-generation/generated-testcases',
+          query: { task_id: response.data.task_id }
+        })
 
       } catch (error) {
         console.error('创建生成任务失败:', error)
-        ElMessage.error('创建任务失败: ' + (error.response?.data?.error || error.message))
+        const errMsg = error.response?.data?.error || error.message || '未知错误'
+        ElMessage.error('创建任务失败: ' + errMsg)
         this.isGenerating = false
+        this.currentStep = 0
+        this.progressText = ''
+      } finally {
+        // 清除全局标记
+        window.__generation_flow = false
       }
     },
 
@@ -3833,10 +3961,11 @@ export default {
     },
 
     resetGeneration() {
+      console.log('[DEBUG] resetGeneration 被调用')
       // 重置生成状态
       this.isGenerating = false;
       this.currentTaskId = null;
-      this.progressText = '准备开始生成...';
+      this.progressText = '';
       this.currentStep = 0;
       this.showResults = false;
       this.generationResult = null;
@@ -3851,8 +3980,41 @@ export default {
         this.pollInterval = null;
       }
 
-      // 刷新页面以获取最新的配置
-      window.location.reload();
+      // 不再强制刷新页面（之前 window.location.reload() 会让用户感觉"被踢回主页"）。
+      // 改为在当前页面恢复初始状态；根据当前上下文自动重新打开生成确认弹窗。
+      const hasReqDocMarkdown = this.reqDoc && this.reqDoc.markdown && this.reqDoc.markdown.trim()
+      const hasAnalyzeResult = this.analyzeResult && this.analyzeResult.trim()
+      if (hasReqDocMarkdown) {
+        // 复用需求文档生成入口，弹窗让用户选项目/版本/模块
+        this.useReqDocForGeneration()
+      } else if (hasAnalyzeResult && this.currentResultId) {
+        // 从"查看拆解"入口进入，analyzeResult 有值但 reqDoc.markdown 没有
+        // 直接基于当前拆解结果触发生成（payload 用拆解结果的内容）
+        this.pendingGeneratePayload = {
+          title: this.reqDoc?.title || '需求文档',
+          content: this.analyzeResult,
+          source: 'analysis'
+        }
+        this.generateConfirmForm = {
+          project_id: this.reqDoc?.selectedProject ? Number(this.reqDoc.selectedProject) : null,
+          version_id: this.selectedVersion || null,
+          feature_module_id: null,
+          test_point_id: null,
+          generation_mode: 'smart'
+        }
+        // 触发项目切换的副作用（清空版本/模块/测试点）
+        this.onConfirmProjectChange()
+        // 如果有项目，加载该项目下的版本列表
+        if (this.generateConfirmForm.project_id) {
+          this.loadVersions()
+        }
+        this.showGenerateConfirm = true
+        console.log('[DEBUG] resetGeneration 走 analysis 分支, project_id=', this.generateConfirmForm.project_id)
+      } else {
+        // 都没数据：提示用户先去生成需求文档
+        ElMessage.warning('请先生成或选择一份需求文档，然后再生成测试用例')
+        console.log('[DEBUG] resetGeneration 两个分支都没数据')
+      }
     },
 
     // 格式化日期时间
@@ -4206,6 +4368,36 @@ export default {
 .page-header {
   text-align: center;
   margin-bottom: 40px;
+}
+
+.page-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  margin-bottom: 10px;
+}
+
+.back-link {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  color: #606266;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.back-link:hover {
+  border-color: #409eff;
+  color: #409eff;
 }
 
 .page-header h1 {

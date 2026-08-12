@@ -36,6 +36,7 @@ from .views import (
     import_airtest_script,
 )
 from .views_config import EnvironmentConfigViewSet, AIIntelligentModeConfigViewSet
+from .pipeline_views import AppPipelineRunViewSet
 
 router = DefaultRouter()
 router.register(r'dashboard', UiDashboardViewSet, basename='dashboard')
@@ -68,6 +69,7 @@ router.register(r'ai-models', AIIntelligentModeConfigViewSet, basename='ai-model
 # App 自动化设备管理
 router.register(r'app-devices', AppDeviceViewSet)
 router.register(r'app-configs', AppConfigViewSet)
+router.register(r'app-pipelines', AppPipelineRunViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),

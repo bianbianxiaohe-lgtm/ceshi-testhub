@@ -216,13 +216,13 @@ const setNeighborData = (items) => {
 const loadNeighborByCaseContext = async () => {
   const currentId = Number(route.params.id)
   // 没有筛选条件时：先全量拉取，与列表页保持一致
-  let items = await fetchNeighborPages({ page_size: 1000, ordering: '-created_at' })
+  let items = await fetchNeighborPages({ page_size: 1000 })
   if (items.length > 0 && items.map(t => t.id).indexOf(currentId) === -1) {
     // 极端情况：当前用例不在全量结果中（理论上不会），回退到 project+version
     const projectId = testcase.value?.project?.id
     const versions = testcase.value?.versions || []
     const versionId = versions.length > 0 ? versions[0].id : null
-    const p = { page_size: 1000, ordering: '-created_at' }
+    const p = { page_size: 1000 }
     if (projectId) p.project = projectId
     if (versionId) p.version = versionId
     items = await fetchNeighborPages(p)
@@ -237,7 +237,7 @@ const loadNeighborList = async () => {
     const filterKeys = ['search', 'project', 'priority', 'status', 'version', 'feature_module', 'test_point']
     const hasFilters = filterKeys.some(k => q[k])
     if (hasFilters) {
-      const params = { page_size: 1000, ordering: '-created_at' }
+      const params = { page_size: 1000 }
       filterKeys.forEach(k => { if (q[k]) params[k] = q[k] })
       const items = await fetchNeighborPages(params)
       setNeighborData(items)

@@ -157,9 +157,29 @@
       <div v-if="proto && proto.requirement_summary" class="artifact">
         <div class="artifact-head">
           <h4>需求摘要</h4>
-          <el-button size="small" plain @click="beginEdit('requirement_summary')"
-            :disabled="editingField && editingField !== 'requirement_summary'">✏️ 编辑</el-button>
+          <div class="artifact-actions">
+            <el-button size="small" plain @click="beginEdit('requirement_summary')"
+              :disabled="editingField && editingField !== 'requirement_summary'">✏️ 编辑</el-button>
+            <el-button size="small" plain type="info"
+              @click="onPreviewXmind" title="预览将要导出的 XMind 结构">👁️ 预览 XMind</el-button>
+            <el-button size="small" plain type="warning" :loading="xmindExporting"
+              @click="onExportXmind" title="导出可编辑的 XMind 图，便于精准理解需求">⬇️ 下载 XMind</el-button>
+            <el-button size="small" plain type="warning" :loading="xmindImporting"
+              @click="triggerXmindUpload" title="上传本地修改后的 XMind，覆盖结构化摘要（不联动下游）">⬆️ 上传 XMind</el-button>
+            <input ref="xmindFile" type="file" accept=".xmind" style="display:none"
+              @change="onXmindFileChange" />
+          </div>
         </div>
+        <el-dialog title="XMind 预览（将要导出的结构）" :visible.sync="xmindPreviewVisible" width="560px"
+          @closed="xmindPreviewTree = []">
+          <el-tree v-if="xmindPreviewTree.length" :data="xmindPreviewTree" :props="{ label: 'label', children: 'children' }"
+            node-key="label" default-expand-all :expand-on-click-node="false" class="xmind-preview-tree" />
+          <p v-else class="xmind-preview-empty">暂无可预览的内容</p>
+          <div slot="footer">
+            <el-button size="small" @click="xmindPreviewVisible = false">关闭</el-button>
+            <el-button size="small" type="warning" :loading="xmindExporting" @click="onExportXmind">确认无误，下载</el-button>
+          </div>
+        </el-dialog>
         <pre v-if="editingField !== 'requirement_summary'" class="md-box">{{ proto.requirement_summary }}</pre>
         <template v-else>
           <el-input v-model="editBuffer" type="textarea" :rows="12" />
@@ -367,6 +387,8 @@
             <div class="main-page-card-head">
               <span class="generic-card-index">{{ i + 1 }}</span>
               <b v-if="tp.title">{{ tp.title }}</b>
+              <el-button size="mini" type="danger" plain style="margin-left:auto"
+                :loading="removingTpIndex === i" @click="removeMainTpItem(i)">🗑 删除</el-button>
             </div>
             <div class="main-page-card-desc">{{ tp.description || tp.issue || '' }}</div>
           </div>
@@ -512,11 +534,18 @@
         </div>
 
         <!-- 合并测试点：卡片列表 -->
-        <div v-else-if="editField === 'final_testpoints_json' && parsedTestpoints.length">
-          <div v-for="(tp, i) in parsedTestpoints" :key="i" class="tp-card">
-            <b>{{ tp.title || ('测试点 #' + (i+1)) }}</b>
+        <div v-else-if="editField === 'final_testpoints_json' && tpEditItems.length">
+          <div class="tp-toolbar" style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+            <el-button size="small" type="success" @click="addTpItem">➕ 新增测试点</el-button>
+            <span class="hint-text">共 {{ tpEditItems.length }} 条测试点</span>
+          </div>
+          <div v-for="(tp, i) in tpEditItems" :key="i" class="tp-card">
+            <div class="tp-card-head" style="display:flex;align-items:center;gap:8px">
+              <b>{{ tp.title || ('测试点 #' + (i+1)) }}</b>
+              <el-button size="mini" type="danger" plain style="margin-left:auto" @click="removeTpItem(i)">🗑 删除</el-button>
+            </div>
             <p>{{ tp.description || tp.issue || '' }}</p>
-            <el-input v-model="parsedTestpoints[i]._raw" type="textarea" :rows="2"
+            <el-input v-model="tpEditItems[i]._raw" type="textarea" :rows="2"
               placeholder="修改此条内容…" />
           </div>
         </div>
@@ -715,6 +744,10 @@ export default {
       proto: null,
       busy: false,
       terminating: false,
+      xmindExporting: false,
+      xmindImporting: false,
+      xmindPreviewVisible: false,
+      xmindPreviewTree: [],
       pollTimer: null,
       smokeDecision: '',
       rejectEmail: '',
@@ -734,6 +767,9 @@ export default {
       editField: 'testcases_json',
       editFieldValue: '',
       editRawMode: false,
+      // 合并测试点结构化编辑：稳定工作数组（v-model 绑定它，删除/修改才能落库）
+      tpEditItems: [],
+      removingTpIndex: -1,  // 主页面删除中的测试点索引（用于按钮 loading）
       // PCI / Risks 逐条回复
       pciReplies: [],
       riskReplies: [],
@@ -1168,6 +1204,77 @@ export default {
       if (this.editField === 'risks_json') {
         this.riskReplies = (this.parsedRiskItems || []).map(it => (it && it.mitigation) || '')
       }
+      // ── 合并测试点 final_testpoints_json：填充稳定工作数组（供删除/修改真正落库）──
+      if (this.editField === 'final_testpoints_json') {
+        this.rebuildTpEditItems()
+      }
+    },
+
+    // 从 editFieldValue 解析出测试点数组并填充 tpEditItems（兼容裸数组 / {testpoints:[...]} 包裹）
+    parseTpArray() {
+      try {
+        const v = JSON.parse(this.editFieldValue || 'null')
+        if (Array.isArray(v)) return { arr: v, wrapped: false }
+        if (v && Array.isArray(v.testpoints)) return { arr: v.testpoints, wrapped: true }
+        return { arr: [], wrapped: false }
+      } catch (e) { return { arr: [], wrapped: false } }
+    },
+
+    rebuildTpEditItems() {
+      const { arr } = this.parseTpArray()
+      this.tpEditItems = arr.map(tp => ({ ...tp, _raw: JSON.stringify(tp, null, 2) }))
+    },
+
+    addTpItem() {
+      this.tpEditItems.push({ title: '新测试点', _raw: JSON.stringify({ title: '新测试点', description: '' }, null, 2) })
+    },
+
+    removeTpItem(i) {
+      if (i >= 0 && i < this.tpEditItems.length) {
+        this.tpEditItems.splice(i, 1)
+        this.$message.info(`已删除第 ${i + 1} 条测试点（保存后生效）`)
+      }
+    },
+
+    // 主页面直接删除某条测试点：解析→移除→重建→PATCH 落库
+    async removeMainTpItem(i) {
+      const raw = this.proto && this.proto.final_testpoints_json
+      if (!raw) return
+      let arr = []
+      let wrapped = null
+      try {
+        const v = JSON.parse(raw)
+        if (Array.isArray(v)) {
+          arr = v
+        } else if (v && Array.isArray(v.testpoints)) {
+          arr = v.testpoints
+          wrapped = v
+        } else {
+          this.$message.error('测试点数据格式无法解析')
+          return
+        }
+      } catch (e) {
+        this.$message.error('测试点数据格式无法解析')
+        return
+      }
+      if (i < 0 || i >= arr.length) return
+      const removed = arr[i]
+      arr.splice(i, 1)
+      const value = wrapped ? JSON.stringify({ ...wrapped, testpoints: arr }, null, 2)
+                           : JSON.stringify(arr, null, 2)
+      this.removingTpIndex = i
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+          data: { field: 'final_testpoints_json', value },
+        })
+        this.proto.final_testpoints_json = value
+        this.$message.success(`已删除测试点「${(removed && removed.title) || ('#' + (i + 1))}」`)
+      } catch (e) {
+        this.$message.error('删除失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.removingTpIndex = -1
+      }
     },
     // ---------- PCI 子问题拆解与逐条解答 ----------
     // 纯前端本地快速拆分（按中文标点，零等待）
@@ -1471,6 +1578,44 @@ export default {
       }
       if (this.editField === 'risks_json') {
         await this.saveRiskReplies()
+        this.editDialogVisible = false
+        return
+      }
+      // ── 合并测试点 final_testpoints_json：从 tpEditItems（已删除/已修改）重建并保存 ──
+      if (this.editField === 'final_testpoints_json') {
+        const { wrapped } = this.parseTpArray()
+        // 剥离 _raw 内部字段，还原纯测试点对象
+        const clean = (this.tpEditItems || []).map(tp => {
+          const { _raw, ...rest } = tp
+          return rest
+        })
+        // 兼容裸数组 / {testpoints:[...]} 包裹：写回原容器结构
+        let value = ''
+        try {
+          const v = JSON.parse(this.editFieldValue || 'null')
+          if (wrapped && v && typeof v === 'object') {
+            v.testpoints = clean
+            value = JSON.stringify(v, null, 2)
+          } else {
+            value = JSON.stringify(clean, null, 2)
+          }
+        } catch (e) {
+          value = JSON.stringify(clean, null, 2)
+        }
+        try {
+          await request({
+            url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+            data: { field: 'final_testpoints_json', value },
+          })
+          this.proto.final_testpoints_json = value
+          this.editFieldValue = value
+          this.rebuildTpEditItems()
+          this.clearDraft('final_testpoints_json')
+          this.$message.success('合并测试点已保存')
+        } catch (e) {
+          this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+          return
+        }
         this.editDialogVisible = false
         return
       }
@@ -1815,6 +1960,117 @@ export default {
       }
     },
     onStruct() { this.runStage('struct') },
+    // 阶段1：预览将要导出的 XMind 结构（与后端导出层级一致）
+    onPreviewXmind() {
+      if (!this.proto || !this.proto.requirement_summary) {
+        this.$message.warning('尚未生成结构化摘要，无法预览')
+        return
+      }
+      let tree = []
+      try {
+        const doc = yamlLoad(this.proto.requirement_summary)
+        const modules = (doc && doc.modules) || []
+        const rootTitle = (this.proto.title || '需求结构化').trim() || '需求结构化'
+        const root = { label: rootTitle, children: [] }
+        modules.forEach((m) => {
+          if (!m || !m.name) return
+          const mNode = { label: m.name, children: [] }
+          if (m.priority) mNode.children.push({ label: `⚑ 优先级: ${m.priority}` })
+          if (m.priority_source) mNode.children.push({ label: `📌 优先级来源: ${m.priority_source}` })
+          const kfs = m.key_features || []
+          if (kfs.length) {
+            const kfChildren = kfs.map((f) => {
+              if (typeof f === 'string') return { label: f }
+              const t = f.title || f.name || ''
+              return { label: t + (f.desc || f.description ? `（${f.desc || f.description}）` : '') }
+            }).filter((n) => n.label)
+            if (kfChildren.length) mNode.children.push({ label: '🔑 关键特征', children: kfChildren })
+          }
+          const sps = m.sub_pages || []
+          if (sps.length) {
+            const spChildren = sps.map((s) => ({ label: typeof s === 'string' ? s : (s.title || s.name || '') }))
+              .filter((n) => n.label)
+            if (spChildren.length) mNode.children.push({ label: '📄 子页面', children: spChildren })
+          }
+          root.children.push(mNode)
+        })
+        tree = [root]
+      } catch (e) {
+        // 解析失败不阻断：弹出对话框并在树区展示原始文本，保证有可见反馈
+        this.$message.warning('结构化摘要非标准 YAML，已按原文展示')
+        tree = [{ label: (this.proto.title || '需求结构化'), children: [
+          { label: '（原始摘要）', children: [{ label: this.proto.requirement_summary }] }
+        ] }]
+      }
+      this.xmindPreviewTree = tree
+      this.xmindPreviewVisible = true
+    },
+    // 阶段1：导出结构化摘要为可编辑 XMind
+    async onExportXmind() {
+      if (!this.proto || !this.proto.requirement_summary) {
+        this.$message.warning('尚未生成结构化摘要，无法导出 XMind')
+        return
+      }
+      this.xmindExporting = true
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/export-xmind/`,
+          method: 'get',
+          responseType: 'blob'
+        })
+        const blob = res.data
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        const safeTitle = (this.proto.title || 'requirement').replace(/[\\/:*?"<>|]/g, '_')
+        a.href = url
+        a.download = `${safeTitle}.xmind`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        window.URL.revokeObjectURL(url)
+        this.$message.success('XMind 已导出，可在本地用 XMind 打开编辑')
+      } catch (e) {
+        this.$message.error('导出失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.xmindExporting = false
+      }
+    },
+    triggerXmindUpload() {
+      if (!this.proto || !this.proto.requirement_summary) {
+        this.$message.warning('请先生成结构化摘要再上传 XMind')
+        return
+      }
+      this.$refs.xmindFile && this.$refs.xmindFile.click()
+    },
+    async onXmindFileChange(e) {
+      const file = e.target.files && e.target.files[0]
+      if (!file) return
+      this.xmindImporting = true
+      try {
+        const formData = new FormData()
+        formData.append('file', file)
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/import-xmind/`,
+          method: 'post',
+          data: formData,
+          headers: { 'Content-Type': 'multipart/form-data' }
+        })
+        // 用返回的最新摘要刷新本地展示
+        if (res.data && res.data.requirement_summary) {
+          this.proto.requirement_summary = res.data.requirement_summary
+        } else {
+          const detail = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+          if (detail && detail.data) this.proto = detail.data
+        }
+        this.$message.success(res.data?.detail || 'XMind 已覆盖结构化摘要')
+      } catch (err) {
+        const detail = err.response?.data?.detail || err.message
+        this.$message.error('上传失败：' + detail)
+      } finally {
+        this.xmindImporting = false
+        e.target.value = ''  // 允许重复选同一文件
+      }
+    },
     onClarify() { this.runStage('clarify') },
     onDesign() { this.runStage('design') },
     async onGenerateCases() {

@@ -1088,6 +1088,7 @@ const onProjectChange = async () => {
   executionResult.value = null
 
   realProjectId.value = await resolveUiProjectId(projectId.value)
+  await loadAppDevicesAndConfigs()
   await Promise.all([
     loadTestCases(),
     loadElements()
@@ -1714,7 +1715,7 @@ const loadAppDevicesAndConfigs = async () => {
     const [devicesRes, newDevicesRes, configsRes] = await Promise.allSettled([
       getAppDevices({ status: 'online', page_size: 999 }),
       getNewDeviceList({ status: 'online', page_size: 999 }),
-      getAppConfigs({ page_size: 999 })
+      getAppConfigs({ page_size: 999, project: projectId.value || undefined })
     ])
     // 合并新旧设备源，按 udid/device_id 去重（新版优先）
     const oldDevices = (devicesRes.status === 'fulfilled')

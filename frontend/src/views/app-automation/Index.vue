@@ -30,6 +30,14 @@
           <div class="feature-title">{{ $t('appAutomation.nav.elementManagement') }}</div>
           <div class="feature-desc">{{ $t('appAutomation.nav.elementManagementDesc') }}</div>
         </el-card>
+
+        <el-card shadow="hover" class="feature-card" @click="$router.push('/app-automation/pipeline')">
+          <div class="feature-icon bg-blue">
+            <el-icon><VideoPlay /></el-icon>
+          </div>
+          <div class="feature-title">流水线运行</div>
+          <div class="feature-desc">选择应用与设备，自定义阶段执行并保留运行记录</div>
+        </el-card>
         
         <el-card shadow="hover" class="feature-card" @click="$router.push('/app-automation/test-cases')">
           <div class="feature-icon bg-orange">
@@ -52,7 +60,7 @@
 </template>
 
 <script setup>
-import { DataAnalysis, Cellphone, Picture, Document, Aim } from '@element-plus/icons-vue'
+import { DataAnalysis, Cellphone, Picture, Document, Aim, VideoPlay } from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">

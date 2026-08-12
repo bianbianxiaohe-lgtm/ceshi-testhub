@@ -166,25 +166,25 @@
         @selection-change="handleSelectionChange">
         <el-table-column type="selection" width="45" :show-overflow-tooltip="false" />
         <el-table-column type="index" label="序号" width="60" :index="getSerialNumber" :show-overflow-tooltip="false" />
-        <el-table-column prop="title" label="用例标题" min-width="200">
+        <el-table-column prop="title" label="用例标题" min-width="280">
           <template #default="{ row }">
             <el-link @click="goToTestCase(row.id)" type="primary">
               {{ row.title }}
             </el-link>
           </template>
         </el-table-column>
-        <el-table-column prop="project.name" label="关联项目" min-width="90">
+        <el-table-column prop="project.name" label="关联项目" min-width="120">
           <template #default="{ row }">
             {{ row.project?.name || '-' }}
           </template>
         </el-table-column>
-        <el-table-column prop="versions" label="关联版本" min-width="110">
+        <el-table-column prop="versions" label="关联版本" min-width="140">
           <template #default="{ row }">
             <div v-if="row.versions && row.versions.length > 0" class="version-tags">
-              <el-tag 
-                v-for="version in row.versions.slice(0, 2)" 
-                :key="version.id" 
-                size="small" 
+              <el-tag
+                v-for="version in row.versions.slice(0, 2)"
+                :key="version.id"
+                size="small"
                 :type="version.is_baseline ? 'warning' : 'info'"
                 class="version-tag"
               >
@@ -199,13 +199,13 @@
             <span v-else class="no-version">未关联版本</span>
           </template>
         </el-table-column>
-        <el-table-column prop="feature_modules" label="功能模块" min-width="100">
+        <el-table-column prop="feature_modules" label="功能模块" min-width="140">
           <template #default="{ row }">
             <div v-if="row.feature_modules && row.feature_modules.length > 0" class="version-tags">
-              <el-tag 
-                v-for="fm in row.feature_modules.slice(0, 2)" 
-                :key="fm.id" 
-                size="small" 
+              <el-tag
+                v-for="fm in row.feature_modules.slice(0, 2)"
+                :key="fm.id"
+                size="small"
                 type="success"
                 class="version-tag"
               >
@@ -220,7 +220,7 @@
             <span v-else class="no-version">-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="test_point" label="测试点" min-width="90">
+        <el-table-column prop="test_point" label="测试点" min-width="120">
           <template #default="{ row }">
             <div v-if="row.test_point && row.test_point.name">
               <el-tag size="small" type="warning" class="version-tag">
@@ -252,8 +252,8 @@
             {{ getTypeText(row.test_type) }}
           </template>
         </el-table-column>
-        <el-table-column prop="author.username" label="作者" min-width="75" />
-        <el-table-column prop="created_at" label="创建时间" min-width="130">
+        <el-table-column prop="author.username" label="作者" min-width="100" />
+        <el-table-column prop="created_at" label="创建时间" min-width="160">
           <template #default="{ row }">
             {{ formatDate(row.created_at) }}
           </template>
@@ -464,7 +464,7 @@ const saveQuickFeatureModule = async () => {
     await api.post('/feature-modules/', payload)
     ElMessage.success(`功能模块「${quickFeatureModuleForm.name}」创建成功`)
     showQuickCreateFeatureModule.value = false
-    await fetchFeatureModules()
+    await fetchFeatureModules(projectFilter.value)
   } catch (error) {
     // 优先提取字段级错误（DRF ValidationError格式）
     const errData = error.response?.data
@@ -613,6 +613,8 @@ const handleProjectFilterChange = () => {
   currentPage.value = 1
   syncFiltersToUrl()
   fetchTestCases()
+  // 切换项目后刷新功能模块下拉（按新项目过滤）
+  fetchFeatureModules(projectFilter.value)
 }
 
 const handleFeatureModuleChange = () => {
@@ -1257,9 +1259,11 @@ const fetchVersions = async () => {
   }
 }
 
-const fetchFeatureModules = async () => {
+const fetchFeatureModules = async (projectId) => {
   try {
-    const response = await api.get('/feature-modules/')
+    const params = {}
+    if (projectId) params.project = projectId
+    const response = await api.get('/feature-modules/', { params })
     allFeatureModules.value = response.data.results || response.data || []
   } catch (error) {
     console.error('获取功能模块列表失败:', error)
@@ -1270,7 +1274,7 @@ onMounted(async () => {
   fetchProjects()
   fetchVersions()
   // 关键：先加载功能模块列表，等 options 就位后再恢复筛选值渲染
-  await fetchFeatureModules()
+  await fetchFeatureModules(projectFilter.value)
   // 如果 URL 中恢复了功能模块筛选，加载对应的测试点列表
   if (featureModuleFilter.value) {
     await fetchTestPoints(featureModuleFilter.value)
@@ -1281,7 +1285,7 @@ onMounted(async () => {
 
 <style lang="scss" scoped>
 .table-wrapper {
-  max-width: 1400px;
+  width: 100%;
   overflow-x: auto;
 }
 

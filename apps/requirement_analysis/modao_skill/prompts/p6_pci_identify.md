@@ -128,6 +128,10 @@
 stage2 已识别的模糊/缺失/边界问题：
 {stage2_issues}
 
+当前模块的跨模块关联影响与特有风险：
+{cross_module_impact}
+
 ⚠️ **重要：如果上述 stage2 问题已包含人工填写的 `resolution`（非空答案），则该问题已被产品确认，不得在 PCI 中重复生成。仅当 stage2 问题 `resolution` 为空或无答案时，才可纳入 PCI。**
+⚠️ **重要：结合 `cross_module_impact`（跨模块关联影响）分析 PCI，不要只停留在本模块内部；若某问题已在该模块的 module_risks/ambiguous_points 中通过 current_guess 收敛为确定结论，不得重复生成 PCI。**
 
 ## 📤 输出（直接输出 JSON）

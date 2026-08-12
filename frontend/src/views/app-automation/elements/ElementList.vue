@@ -273,10 +273,11 @@ const loadElements = async () => {
   loading.value = true
   try {
     const params = {
-      page: currentPage.value,
-      page_size: pageSize.value,
-      element_type: typeFilter.value
+      page: Number(currentPage.value) || 1,
+      page_size: Number(pageSize.value) || 20
     }
+    // 只有筛选条件不为空时才添加，避免传 '' 导致后端 choices/NumberFilter 校验 400
+    if (typeFilter.value) params.element_type = typeFilter.value
     if (projectFilter.value) params.project = projectFilter.value
     
     // 只有搜索关键词不为空时才添加 search 参数
@@ -470,7 +471,11 @@ const getTypeName = (type) => {
 // formatDateTime 已从 app-automation-helpers 导入
 
 onMounted(() => {
-  getAppProjects({ page_size: 100 }).then(res => { projectList.value = res.data.results || res.data || [] }).catch(() => {})
+  getAppProjects({ page_size: 100 }).then(res => {
+    const list = res.data.results || res.data || []
+    // AI 项目 id 为 'proj_xxx' 字符串，不能作为 AppElement.project（外键指向 AppProject 整数主键）
+    projectList.value = list.filter(p => p.source !== 'ai')
+  }).catch(() => {})
   loadElements()
 })
 </script>

@@ -280,16 +280,17 @@ const batchDeleteRecords = async () => {
 
 // 轮询更新状态
 const startPolling = () => {
+  let pollingActive = false  // 防止轮询请求堆积
   pollTimer = setInterval(() => {
     // 只有在第一页且没有打开详情框且没有正在加载时才轮询
-    if (pagination.currentPage === 1 && !showDetailDialog.value && !loading.value) {
-      // 优化：检查当前列表是否有正在运行的任务，如果没有运行中的任务，则不轮询（或者降低频率）
+    if (pagination.currentPage === 1 && !showDetailDialog.value && !loading.value && !pollingActive) {
+      // 优化：检查当前列表是否有正在运行的任务，如果没有运行中的任务，则不轮询
       const hasActiveTasks = records.value.some(r => r.status === 'running' || r.status === 'pending')
       if (!hasActiveTasks) {
         return
       }
 
-      // 静默刷新，不显示 loading
+      pollingActive = true
       getAIExecutionRecords({
         page: 1,
         page_size: pagination.pageSize
@@ -299,7 +300,9 @@ const startPolling = () => {
           records.value = response.data.results || []
           total.value = response.data.count || 0
         }
-      }).catch(console.error)
+      }).catch(console.error).finally(() => {
+        pollingActive = false
+      })
     }
   }, 5000)
 }

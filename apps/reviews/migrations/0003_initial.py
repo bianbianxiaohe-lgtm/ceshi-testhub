@@ -10,6 +10,7 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
+        ('reviews', '0002_initial'),
         ('projects', '0007_remove_project_idx_project_owner_and_more'),
         ('reviews', '0002_initial'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),

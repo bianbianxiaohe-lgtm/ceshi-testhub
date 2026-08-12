@@ -137,6 +137,7 @@ class ProjectKnowledgeListCreateView(generics.ListCreateAPIView):
     """列出 / 创建 某项目的知识库条目"""
     serializer_class = ProjectKnowledgeSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None  # 不分页，直接返回数组（前端 v-for 不需要分页包裹）
 
     def get_queryset(self):
         project_id = self.kwargs['project_id']
@@ -153,10 +154,16 @@ class ProjectKnowledgeListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         project_id = self.kwargs['project_id']
-        serializer.save(
+        entry = serializer.save(
             project_id=project_id,
             created_by=self.request.user
         )
+        # 方案C：新条目同步向量到 Chroma（懒导入避免循环依赖）
+        try:
+            from apps.requirement_analysis.models import AIModelService
+            AIModelService.sync_kb_entry_to_vector(entry, 'upsert')
+        except Exception as e:
+            logger.warning(f'[KB] 创建条目向量同步失败（可忽略）: {e}')
 
 
 class ProjectKnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -167,6 +174,24 @@ class ProjectKnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         project_id = self.kwargs['project_id']
         return ProjectKnowledge.objects.filter(project_id=project_id)
+
+    def perform_update(self, serializer):
+        entry = serializer.save()
+        # 方案C：更新条目（含 is_active 切换）同步向量；is_active=False 时自动删除向量
+        try:
+            from apps.requirement_analysis.models import AIModelService
+            AIModelService.sync_kb_entry_to_vector(entry, 'upsert')
+        except Exception as e:
+            logger.warning(f'[KB] 更新条目向量同步失败（可忽略）: {e}')
+
+    def perform_destroy(self, instance):
+        # 方案C：先删 Chroma 向量再删 DB 行
+        try:
+            from apps.requirement_analysis.models import AIModelService
+            AIModelService.sync_kb_entry_to_vector(instance, 'delete')
+        except Exception as e:
+            logger.warning(f'[KB] 删除条目向量同步失败（可忽略）: {e}')
+        instance.delete()
 
 
 # ============================================================
@@ -213,9 +238,20 @@ def knowledge_fs_tree(request, project_id):
     except Project.DoesNotExist:
         return Response({'error': '项目不存在'}, status=404)
 
-    kb_path = _resolve_knowledge_path(project)
-    if not kb_path:
-        return Response({'files': [], 'path': '', 'message': '未配置知识库目录或目录不存在'})
+    # 支持 ?dir=appium_workspace/cases 访问全局用例文档（不依赖项目的 knowledge_base_path）
+    sub_dir = request.query_params.get('dir', '').strip()
+    if sub_dir and not sub_dir.startswith('/'):
+        # 安全检查：必须以 appium_workspace 开头
+        if sub_dir.startswith('appium_workspace'):
+            kb_path = os.path.join('/app', sub_dir)
+            if not os.path.isdir(kb_path):
+                return Response({'files': [], 'path': '', 'message': f'目录不存在: {sub_dir}'})
+        else:
+            return Response({'error': 'dir 参数必须以 appium_workspace 开头'}, status=400)
+    else:
+        kb_path = _resolve_knowledge_path(project)
+        if not kb_path:
+            return Response({'files': [], 'path': '', 'message': '未配置知识库目录或目录不存在'})
 
     def scan_dir(dir_path: str, rel_prefix: str = '') -> list:
         """递归扫描目录，返回文件/目录列表"""
@@ -279,9 +315,13 @@ def knowledge_fs_file(request, project_id, file_path):
     except Project.DoesNotExist:
         return Response({'error': '项目不存在'}, status=404)
 
-    kb_path = _resolve_knowledge_path(project)
-    if not kb_path:
-        return Response({'error': '未配置知识库目录或目录不存在'}, status=404)
+    # 如果路径以 appium_workspace 开头，使用 /app/ 根目录
+    if file_path.startswith('appium_workspace'):
+        kb_path = '/app'
+    else:
+        kb_path = _resolve_knowledge_path(project)
+        if not kb_path:
+            return Response({'error': '未配置知识库目录或目录不存在'}, status=404)
 
     # 对路径参数进行 URL 解码（前端 encodeURIComponent 编码的子目录路径需要还原）
     file_path = unquote(file_path)
@@ -390,9 +430,17 @@ def knowledge_fs_file_create(request, project_id):
     except Project.DoesNotExist:
         return Response({'error': '项目不存在'}, status=404)
 
-    kb_path = _resolve_knowledge_path(project)
-    if not kb_path:
-        return Response({'error': '未配置知识库目录或目录不存在'}, status=404)
+    rel_path = (request.data.get('path', '') or '').strip().lstrip('/')
+    if not rel_path or not rel_path.endswith('.md'):
+        return Response({'error': '文件名必须以 .md 结尾'}, status=400)
+
+    # 路径以 appium_workspace 开头 → 使用 /app/ 根目录
+    if rel_path.startswith('appium_workspace'):
+        kb_path = '/app'
+    else:
+        kb_path = _resolve_knowledge_path(project)
+        if not kb_path:
+            return Response({'error': '未配置知识库目录或目录不存在'}, status=404)
 
     rel_path = (request.data.get('path', '') or '').strip().lstrip('/')
     if not rel_path or not rel_path.endswith('.md'):

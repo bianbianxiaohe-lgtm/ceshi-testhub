@@ -35,6 +35,9 @@
 17. **状态卡片按状态归并**：同一功能的多张状态卡片必须形成state_matrix，逐状态保留标题、副标题、计时、文案、展示条件和点击行为
 18. **多标签允许**：同一区域可以同时形成互补结构，例如订阅页同时具有ui_screen、pricing_matrix和interaction_flow
 19. **未知内容保留**：无法确认类型时保留unknown、raw_text、source_elements和截图证据，不得静默删除
+20. **先推测后提问**：对每个歧义/缺失/边界点，必须先给出 current_guess（基于原文+知识库+行业惯例的推测结论）。若推测结论唯一且无产品自定义空间，则该问题收敛为确定结论，不再列为待确认；只有真正需要产品拍板的事项才保留在 ambiguous/missing/boundary_points 中提问
+21. **跨模块影响必查**：每个模块必须分析 cross_module_impact，列出该改动会影响的其他模块/全局逻辑/数据流，禁止只停留在本模块内部
+22. **禁止凑数提问**：不得为填充列表而生成低质量问题；确无问题则该列表为空数组
 
 ## 📝 输出格式（YAML）
 
@@ -61,6 +64,10 @@ modules:
     key_features:
       - <核心功能1，来自原文>
       - <核心功能2>
+    cross_module_impact:
+      - <该模块修改/新增后，会影响的【其他模块/全局数据/跳转/统计/缓存】及具体影响方式；无影响则输出空数组>
+    module_risks:
+      - <该模块特有的业务/技术风险点（原文风险或测试分析建议，二选一标注）>
 decision_tables:
   - name: <决策表标题>
     related_module: <所属模块名>
@@ -99,16 +106,19 @@ ambiguous_points:
   - location: <原文位置，如 "第3页/标注2">
     evidence: <触发问题的原文；无直接原文则填 "未找到直接原文">
     issue: <问题描述>
-    suggested_question: <建议向产品确认的具体问题>
+    current_guess: <基于现有信息/知识库/行业惯例的推测结论；若推测唯一且无产品自定义空间，则此问题可收敛为确定结论，标为已确定并给出结论>
+    suggested_question: <建议向产品确认的具体问题；若 current_guess 已确定为唯一结论，则 suggested_question 填空>
     priority: 高/中/低
 missing_points:
   - scenario: <完成当前明确流程所缺少的信息>
     basis: <为什么该信息是当前流程必需的>
     impact: <影响哪些模块>
+    current_guess: <基于现有信息的最合理推测；若可确定则给出结论，否则留待确认>
 boundary_points:
   - issue: <与现有功能的边界问题>
     evidence: <相关原文或 "未找到直接原文">
     impact: <影响范围>
+    current_guess: <基于现有信息的最合理推测；若可确定则给出结论，否则留待确认>
 ```
 
 ## 🔍 P0/P1/P2 判定规则

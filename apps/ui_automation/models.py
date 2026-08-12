@@ -1098,11 +1098,39 @@ class AppConfig(models.Model):
 
 
 class AICase(models.Model):
-    """AI测试用例"""
+    """AI测试用例
+
+    支持两种执行模式：
+    - text: 原 browser-use 文本模式（沿用 task_description 自然语言）
+    - midscene: 基于 Midscene + 真机的 APP UI 自动化，使用结构化 steps
+    """
+    EXECUTION_MODE_CHOICES = [
+        ('text', '文本模式(browser-use)'),
+        ('midscene', 'Midscene APP 自动化'),
+    ]
+
     project = models.ForeignKey(UiProject, on_delete=models.CASCADE, null=True, blank=True, verbose_name='所属项目')
     name = models.CharField(max_length=200, verbose_name='用例名称')
     description = models.TextField(blank=True, null=True, verbose_name='描述')
-    task_description = models.TextField(verbose_name='任务描述', help_text='自然语言任务描述')
+    task_description = models.TextField(blank=True, null=True, verbose_name='任务描述', help_text='自然语言任务描述（text 模式使用）')
+    execution_mode = models.CharField(
+        max_length=20, choices=EXECUTION_MODE_CHOICES, default='text',
+        verbose_name='执行模式', help_text='text=浏览器文本模式；midscene=Midscene 真机 APP 自动化'
+    )
+    # Midscene 模式的结构化步骤（业务无关，每步可 extract 任意业务数据存入上下文，后续步骤用 ${{key}} 引用）
+    steps = models.JSONField(
+        default=list, blank=True, verbose_name='步骤',
+        help_text='Midscene 模式的结构化步骤列表，元素含 action/prompt/value/extract/assert 等字段'
+    )
+    # Midscene 模式关联被测应用与设备
+    app_config = models.ForeignKey(
+        AppConfig, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ai_cases', verbose_name='应用配置'
+    )
+    device = models.ForeignKey(
+        AppDevice, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ai_cases', verbose_name='执行设备'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, verbose_name='创建者')
@@ -1130,7 +1158,7 @@ class AIExecutionRecord(models.Model):
     ai_case = models.ForeignKey(AICase, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='关联AI用例')
     case_name = models.CharField(max_length=200, verbose_name='用例名称快照')
     task_description = models.TextField(blank=True, default='', verbose_name='任务描述', help_text='用户输入的原始任务描述')
-    execution_mode = models.CharField(max_length=20, choices=[('text', '文本模式')], default='text', verbose_name='执行模式')
+    execution_mode = models.CharField(max_length=20, choices=[('text', '文本模式'), ('midscene', 'Midscene APP 自动化')], default='text', verbose_name='执行模式')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='执行状态')
     start_time = models.DateTimeField(auto_now_add=True, verbose_name='开始时间')
     end_time = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
@@ -1150,4 +1178,62 @@ class AIExecutionRecord(models.Model):
 
     def __str__(self):
         return f"{self.case_name} - {self.get_status_display()}"
+
+
+# ==================== App 自动化流水线运行记录 ====================
+
+class AppPipelineRun(models.Model):
+    """App 自动化流水线运行记录
+
+    把「capture(抓快照) → gen_pytest(生成用例) → run_pytest(执行测试) → allure(生成报告)」
+    封装成可参数化的一次运行。支持从历史记录一键重跑。
+    """
+    STAGE_CHOICES = [
+        ('capture', '抓取快照'),
+        ('gen_pytest', '生成用例'),
+        ('run_pytest', '执行测试'),
+        ('allure', '生成报告'),
+    ]
+
+    STATUS_CHOICES = [
+        ('pending', '待执行'),
+        ('running', '执行中'),
+        ('success', '成功'),
+        ('failed', '失败'),
+    ]
+
+    app_config = models.ForeignKey(
+        AppConfig, on_delete=models.CASCADE, related_name='pipeline_runs', verbose_name='应用配置'
+    )
+    device = models.ForeignKey(
+        AppDevice, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='pipeline_runs', verbose_name='设备'
+    )
+    stages = models.JSONField(
+        default=list, verbose_name='执行阶段',
+        help_text='选中的阶段列表, 如 ["capture","gen_pytest","run_pytest","allure"]'
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态'
+    )
+    log = models.TextField(blank=True, verbose_name='执行日志')
+    result_summary = models.TextField(blank=True, verbose_name='结果摘要')
+    snapshot_path = models.CharField(max_length=500, blank=True, verbose_name='快照路径')
+    report_url = models.CharField(max_length=500, blank=True, verbose_name='报告地址')
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, verbose_name='创建人'
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+    duration = models.FloatField(default=0, verbose_name='耗时(秒)')
+
+    class Meta:
+        db_table = 'app_pipeline_runs'
+        verbose_name = 'App流水线运行记录'
+        verbose_name_plural = 'App流水线运行记录'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Pipeline #{self.id} - {self.app_config.name} - {self.get_status_display()}"
 

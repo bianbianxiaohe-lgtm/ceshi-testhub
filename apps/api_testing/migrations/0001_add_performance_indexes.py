@@ -7,6 +7,7 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
+        ('api_testing', '0003_initial'),
         ('api_testing', '0002_initial'),
     ]
 

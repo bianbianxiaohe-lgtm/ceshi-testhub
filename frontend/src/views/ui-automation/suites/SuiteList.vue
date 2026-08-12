@@ -432,6 +432,7 @@ const onProjectChange = async () => {
   pagination.currentPage = 1
   // 解析统一 ID，获取实际 UiProject ID
   realProjectId.value = await resolveUiProjectId(projectId.value)
+  await loadAppDevicesAndConfigs()
   await loadSuites()
 }
 
@@ -585,7 +586,7 @@ const loadAppDevicesAndConfigs = async () => {
   try {
     const [devicesRes, configsRes] = await Promise.allSettled([
       getAppDevices({ status: 'online', page_size: 999 }),
-      getAppConfigs({ page_size: 999 })
+      getAppConfigs({ page_size: 999, project: projectId.value || undefined })
     ])
     if (devicesRes.status === 'fulfilled') {
       appDevices.value = devicesRes.value.data.results || devicesRes.value.data || []
@@ -822,6 +823,7 @@ onMounted(async () => {
   if (allProjects.value.length > 0) {
     projectId.value = allProjects.value[0].id
     realProjectId.value = await resolveUiProjectId(projectId.value)
+    await loadAppDevicesAndConfigs()
     await loadSuites()
   }
 })

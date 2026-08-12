@@ -209,6 +209,7 @@ class AIModelConfig(models.Model):
         ('analyzer', '需求拆解专家'),
         ('browser_use_text', 'Browser Use - 文本模式'),
         ('writer_vision_ocr', '视觉分析专家（OCR专用，可配更快模型）'),
+        ('midscene_vision', 'Midscene 视觉驱动模型（APP 真机自动化）'),
         ('embedder', '向量化模型（Embedding）'),
     ]
 
@@ -1417,6 +1418,51 @@ class AIModelService:
         return '\n'.join(lines)
 
     @staticmethod
+    def _build_human_feedback_context(task: 'TestCaseGenerationTask') -> str:
+        """
+        从 task.human_feedback（评审确认卡片）解析出「已真正填写」的人工确认项，
+        格式化为可在 writer/改进 prompt 中注入的上下文段。
+
+        只包含「确认回复」非空（即非"(未填写)"）的项，避免把待确认的空项误当已确认结论。
+        兼容两种历史分隔格式：换行分隔（\n\n 以【确认项 开头）与单行内嵌。
+        """
+        import re as _re
+        raw = (task.human_feedback or '').strip()
+        if not raw:
+            return ''
+
+        blocks = _re.split(r'\n\n(?=【确认项)', raw)
+        answered = []
+        for b in blocks:
+            b = b.strip()
+            if not b:
+                continue
+            m = _re.search(r'确认回复[：:]\s*(.+)', b, _re.DOTALL)
+            if not m:
+                continue
+            reply = m.group(1).strip()
+            if not reply or reply == '(未填写)':
+                continue
+            q = _re.search(r'不确定需求[：:]\s*(.+?)(?:\n确认回复|\Z)', b, _re.DOTALL)
+            question = q.group(1).strip() if q else ''
+            answered.append((question, reply))
+
+        if not answered:
+            return ''
+
+        lines = ['【人工已确认的事项（按确认回复优先）】']
+        lines.append('以下为人工在评审确认卡片中已明确填写回复的事项，生成用例时：')
+        lines.append('  - 对确认回复表明"不存在/无此功能/不显示/未实现"的项，**禁止**再设计任何相关用例或步骤；')
+        lines.append('  - 对确认了具体边界值 / 交互细节 / 新行为的项，**必须**将其固化为用例并围绕其边界补充分支；')
+        lines.append('  - 不得因为某项"已确认"就跳过它对应的边界用例。')
+        lines.append('')
+        for i, (q, a) in enumerate(answered, 1):
+            lines.append(f'{i}. **不确定需求**：{q or "（未记录问题原文）"}')
+            lines.append(f'   **确认回复**：{a}')
+            lines.append('')
+        return '\n'.join(lines)
+
+    @staticmethod
     async def generate_test_cases(task: TestCaseGenerationTask) -> str:
         """生成测试用例"""
         writer_prompt = task.writer_prompt_config.content
@@ -1684,49 +1730,44 @@ class AIModelService:
         """
         writer_prompt = task.writer_prompt_config.content
 
-        # 构建改进指令
-        human_feedback_block = ""
+        # 构建改进指令：优先用外部传入的 human_feedback；未传入时回退读取 task 上已保存的确认项
+        # （defect D 修复：首次自动流水线未传 human_feedback，导致 writer 拿不到人工确认）
         if human_feedback and human_feedback.strip():
             human_feedback_block = (
                 f"【人工确认回复】\n{human_feedback.strip()}\n\n"
                 f"⚠️ 以上是人工对评审中不确定需求的确认/补充说明。请务必据此调整测试用例的预期结果和场景设计，"
                 f"人工确认的信息优先级最高。\n\n"
             )
+        else:
+            _confirmed_block = AIModelService._build_human_feedback_context(task)
+            human_feedback_block = (
+                f"{_confirmed_block}\n\n" if _confirmed_block else ""
+            )
 
         user_message = (
-            f"请根据以下专家评审意见，改进和完善测试用例。\n\n"
-            f"【原始测试用例】\n{original_test_cases}\n\n"
-            f"【评审意见】\n{review_feedback}\n\n"
+            f"## 任务：基于评审意见和人工确认，逐条改进测试用例\n\n"
+            f"你是一位高级测试工程师。请严格根据下面的【评审意见】和【人工确认回复】，"
+            f"逐条对照处理，生成一份**修正后的最终版测试用例**。\n\n"
+            f"## 核心原则（优先级从高到低）\n"
+            f"1. **人工确认 > 评审意见 > 原始用例 > 你的猜测**\n"
+            f"2. **评审明确标记为「冗余/重复」的用例 → 必须删除，不要保留两份**\n"
+            f"3. **评审标记为「内容被错误重复/分割」的用例 → 必须合并为完整的一条**\n"
+            f"4. **评审标记为「缺失」的场景 → 必须补充（但仅限与现有功能点直接相关的）**\n"
+            f"5. **评审标记为「修正」的步骤/预期 → 必须按建议修改**\n\n"
+            f"## 工作步骤（必须按顺序执行）\n"
+            f"第一步：通读【评审意见】，列出所有被明确指出的问题（冗余/缺失/错误/修正）。\n"
+            f"第二步：对每个问题，给出你的处理决策（删除/合并/补充/修正）。\n"
+            f"第三步：基于上述决策，输出修正后的最终版用例。\n\n"
+            f"## 原始测试用例\n{original_test_cases}\n\n"
+            f"## 评审意见\n{review_feedback}\n\n"
             f"{human_feedback_block}"
-            f"【改进要求】\n"
-            f"1. 严格根据评审意见指出的问题进行修改\n"
-            f"2. 补充缺失的测试场景\n"
-            f"3. 修正不合理的预期结果\n"
-            f"4. 删除冗余的测试用例\n"
-            f"5. 保持测试用例的格式规范\n"
-            f"6. **加粗标记规则（必须严格执行）**：\n"
-            f"   **6.1 新增测试用例**：对整个新增的测试用例进行加粗\n"
-            f"   - 示例：**TC-004 测试用例标题**\\n**测试步骤：**\\n**1. 步骤内容**\\n**预期结果：**\\n**2. 预期内容**\n"
-            f"   - 注意：新增用例的编号、标题、步骤、预期结果等所有内容都要加粗\n"
-            f"   **6.2 修改现有用例**：只对被修改的具体部分进行加粗\n"
-            f"   - 修改标题：**TC-001 修改后的新标题**（其他内容保持原样）\n"
-            f"   - 修改步骤：1. 原步骤\\n2. **修改后的步骤内容**（只有步骤2加粗）\n"
-            f"   - 修改预期结果：预期结果：**修改后的预期内容**（只有预期内容加粗）\n"
-            f"   - 新增步骤：1. 原步骤\\n**2. 新增的步骤内容**（新增的步骤整体加粗）\n"
-            f"   **6.3 注意事项**：\n"
-            f"   - 未修改的部分不要加粗\n"
-            f"   - 原始测试用例中已经存在的用例，如果没有改动就不要加粗\n"
-            f"   - 只有根据评审意见新增或修改的部分才需要加粗\n"
-            f"7. **⚠️ 输出顺序要求（必须严格执行）**：\n"
-            f"   - **必须按用例编号从小到大的顺序输出**（如：001, 002, 003...或LOGIN_001, LOGIN_002, LOGIN_003...）\n"
-            f"   - **绝对不能跳号、重复或乱序输出**\n"
-            f"   - **编号必须连续，中间不能有遗漏**\n"
-            f"   - **所有用例必须一次性完整输出，不能中断**\n"
-            f"8. **必须输出完整**：请确保输出所有改进后的测试用例，不要因为篇幅原因省略任何用例，"
-            f"即使是第30条、第40条甚至更多的用例，也必须完整输出。\n"
-            f"9. **测试用例编号规则**：新增的测试用例必须按照原有编号规则继续编号（例如原最后一个用例是TC-003，新增的第一个用例应该是TC-004），"
-            f"绝不能使用'新增'、'用例1'等作为编号，必须是正式的测试用例编号。\n\n"
-            f"请直接输出改进后的完整测试用例，不要包含任何说明性文字。"
+            f"## 格式要求\n"
+            f"1. 最终版用例按用例编号从小到大的顺序输出\n"
+            f"2. 编号必须连续，不能跳号、重复或乱序\n"
+            f"3. **新增/修改的用例用 Markdown 表格格式输出**\n"
+            f"4. 新增用例编号按原有规则继续编号（如原最后一个 TC-003，新增 TC-004）\n"
+            f"5. **必须输出完整的最终版用例（不要因为篇幅省略任何一条）**\n"
+            f"6. **不要输出第一步/第二步的分析过程，直接输出第三步的最终用例表格**\n"
         )
 
         messages = [
@@ -1890,6 +1931,136 @@ class AIModelService:
             return fixed_content
 
         return test_cases_content
+
+    @staticmethod
+    def enforce_case_count_limit(test_cases_content: str, generation_mode: str) -> tuple:
+        """根据 generation_mode 硬性截断用例数量（防止 LLM 超出 prompt 数量限制）。
+
+        限制规则：
+        - quick（快速模式）: 上限 20 条
+        - standard（标准模式）: 上限 40 条
+        - comprehensive（全面模式）: 不限制
+        - smart（智能模式）: 不限制（让 AI 自适应）
+
+        Args:
+            test_cases_content: 测试用例 Markdown 表格字符串
+            generation_mode: 任务生成模式
+
+        Returns:
+            (截断后内容, 原数量, 截断后数量) 元组
+        """
+        if not test_cases_content or generation_mode in ('comprehensive', 'smart', None, ''):
+            return test_cases_content, 0, 0
+        limit_map = {'quick': 20, 'standard': 40}
+        limit = limit_map.get(generation_mode)
+        if not limit:
+            return test_cases_content, 0, 0
+        # 解析 Markdown 表格，统计用例行数
+        lines = test_cases_content.split('\n')
+        # 用例行以 '| ' 开头且不是表头/分隔行
+        case_lines = []
+        header_idx = None
+        sep_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith('|'):
+                continue
+            if header_idx is None:
+                header_idx = i
+                continue
+            if sep_idx is None and set(stripped.replace('|', '').strip()) <= set('-: '):
+                sep_idx = i
+                continue
+            case_lines.append(i)
+        original_count = len(case_lines)
+        if original_count <= limit:
+            return test_cases_content, original_count, original_count
+        # 截断：保留前 limit 条用例 + 头（header + sep）
+        keep_indices = set(case_lines[:limit])
+        new_lines = [l for i, l in enumerate(lines) if i <= (sep_idx or 0) or i in keep_indices]
+        truncated = '\n'.join(new_lines)
+        logger.info(
+            f"[数量截断] generation_mode={generation_mode} 原{original_count}条→保留{limit}条"
+        )
+        return truncated, original_count, limit
+
+    @staticmethod
+    def dedup_duplicate_test_cases(test_cases_content: str) -> tuple:
+        """去除编号完全相同的重复用例（保守去重，避免误删）。
+
+        解决问题：基于评审意见重新生成时，AI 经常"保留原样"导致新旧用例编号重复，
+        而 prompt 里的"删除冗余"指令 LLM 经常不执行。本方法在后处理阶段强制去重。
+
+        判定逻辑：仅删除「用例编号完全相同」的重复行（如两条 ANDROID_008），保留第一条。
+        不会按标题相似度删除（避免误删"功能相近但不同的用例"）。
+
+        Args:
+            test_cases_content: 测试用例 Markdown 表格字符串
+
+        Returns:
+            (去重后内容, 重复数量, 去重审计列表) 元组
+        """
+        if not test_cases_content:
+            return test_cases_content, 0, []
+
+        import re
+
+        lines = test_cases_content.split('\n')
+        # 找表格分隔线
+        separator_idx = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('|') and '---' in stripped and set(stripped.replace('|', '').strip()) <= set('-: '):
+                separator_idx = i
+                break
+        if separator_idx == -1:
+            return test_cases_content, 0, []
+
+        # 收集每个用例行
+        case_rows = []
+        for i in range(separator_idx + 1, len(lines)):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped.startswith('|'):
+                continue
+            parts = [p.strip() for p in line.split('|')[1:-1]] if line.count('|') >= 2 else []
+            if len(parts) < 1:
+                continue
+            case_id = re.sub(r'\*+', '', parts[0]).strip()
+            if not case_id:
+                continue
+            case_rows.append({'idx': i, 'case_id': case_id, 'line': line})
+
+        if not case_rows:
+            return test_cases_content, 0, []
+
+        # 按编号去重：保留第一次出现的行
+        seen_ids = set()
+        keep_indices = set()
+        removed_count = 0
+        audit = []
+
+        for row in case_rows:
+            cid = row['case_id']
+            if cid in seen_ids:
+                removed_count += 1
+                audit.append({
+                    "removed_case_id": cid,
+                    "reason": f"编号 {cid} 重复"
+                })
+            else:
+                seen_ids.add(cid)
+                keep_indices.add(row['idx'])
+
+        if removed_count == 0:
+            return test_cases_content, 0, []
+
+        # 重建内容
+        new_lines = [l for i, l in enumerate(lines) if i <= separator_idx or i in keep_indices]
+        deduped = '\n'.join(new_lines)
+
+        logger.info(f"[去重] 删除{removed_count}条重复用例（仅按编号完全相同判断）")
+        return deduped, removed_count, audit
 
     @staticmethod
     def renumber_test_cases(test_cases_content: str) -> str:

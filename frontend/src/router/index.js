@@ -282,6 +282,11 @@ const routes = [
         path: 'notification-logs',
         name: 'UiNotificationLogs',
         component: () => import('@/views/ui-automation/notification/NotificationLogs.vue')
+      },
+      {
+        path: 'app',
+        name: 'UiAppConfig',
+        component: () => import('@/views/ui-automation/app/AppConfigList.vue')
       }
     ]
   },
@@ -353,6 +358,11 @@ const routes = [
         path: 'packages',
         name: 'AppPackages',
         component: () => import('@/views/app-automation/packages/PackageList.vue')
+      },
+      {
+        path: 'pipeline',
+        name: 'AppPipeline',
+        component: () => import('@/views/app-automation/pipeline/PipelineRun.vue')
       },
       {
         path: 'settings',
@@ -442,6 +452,11 @@ const routes = [
         path: 'execution-records',
         name: 'AIExecutionRecords',
         component: () => import('@/views/ui-automation/ai/AIExecutionRecords.vue')
+      },
+      {
+        path: 'midscene-playground',
+        name: 'MidscenePlayground',
+        component: () => import('@/views/ui-automation/ai/MidscenePlayground.vue')
       }
     ]
   },

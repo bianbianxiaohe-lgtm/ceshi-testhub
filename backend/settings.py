@@ -56,6 +56,7 @@ LOCAL_APPS = [
     'apps.data_factory',
     'apps.analytics',
     'apps.app_automation.apps.AppAutomationConfig',
+    'apps.api_agent',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS

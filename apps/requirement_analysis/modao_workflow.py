@@ -892,31 +892,29 @@ class ModaoWorkflow:
             data = json.loads(self.prototype.extracted_json)
         except Exception:
             return ''
-        # ① 优先：fused_requirements 按 module 精确匹配
-        fused = data.get('fused_requirements') or []
-        if fused:
-            rel = [x for x in fused if isinstance(x, dict) and (x.get('module') or '').strip() == mod_name]
-            if rel:
-                parts = [f'\n\n【该模块已提取的结构化需求（LLM+OCR 逐条）】以下为模块「{mod_name}」的 {len(rel)} 条需求，'
-                         f'请严格基于这些具体需求生成测试点，不要泛化或臆造：']
-                used_len = 0
-                max_total = 5000
-                for i, r in enumerate(rel, 1):
-                    if used_len >= max_total:
-                        break
-                    feature = r.get('feature', '') or ''
-                    interaction = r.get('interaction', '') or ''
-                    ev = r.get('evidence', '') or ''
-                    block = f'{i}. 【{feature}】{interaction}'
-                    if ev:
-                        block += f'（证据等级：{ev}）'
-                    if len(block) > 600:
-                        block = block[:600]
-                    if used_len + len(block) > max_total:
-                        block = block[:max_total - used_len]
-                    used_len += len(block)
-                    parts.append(block)
-                return '\n'.join(parts)
+        # ① 优先：fused_requirements 按 module 匹配（兼容细分后的「父模块-来源页」子模块名）
+        rel = self._fused_entries_for_module(mod_name)
+        if rel:
+            parts = [f'\n\n【该模块已提取的结构化需求（LLM+OCR 逐条）】以下为模块「{mod_name}」的 {len(rel)} 条需求，'
+                     f'请严格基于这些具体需求生成测试点，不要泛化或臆造：']
+            used_len = 0
+            max_total = 5000
+            for i, r in enumerate(rel, 1):
+                if used_len >= max_total:
+                    break
+                feature = r.get('feature', '') or ''
+                interaction = r.get('interaction', '') or ''
+                ev = r.get('evidence', '') or ''
+                block = f'{i}. 【{feature}】{interaction}'
+                if ev:
+                    block += f'（证据等级：{ev}）'
+                if len(block) > 600:
+                    block = block[:600]
+                if used_len + len(block) > max_total:
+                    block = block[:max_total - used_len]
+                used_len += len(block)
+                parts.append(block)
+            return '\n'.join(parts)
         # ② 回退：页面 text 匹配（fused 无该模块时用）
         pages = [p for p in data.get('pages', []) if not p.get('duplicate_of_page')]
         if not pages:
@@ -972,6 +970,133 @@ class ModaoWorkflow:
             used_len += len(block)
             parts.append(f"\n### 页面「{p.get('page_name','未命名')}」（第{p.get('page_no')}页）\n{block}")
         return '\n'.join(parts) if len(parts) > 1 else ''
+
+    def _extract_module_context(self, mod_name: str) -> str:
+        """从阶段1 requirement_summary 提取当前模块的跨模块关联影响与特有风险，
+        注入 PCI 生成 prompt，让 PCI 具备全局关联视角（类似 PDF 的『待确认风险列+跨模块影响』）。
+        """
+        summary = (self.prototype.requirement_summary or '').strip()
+        if not summary:
+            return ''
+        try:
+            data = _parse_yaml(summary)
+        except Exception:
+            return ''
+        if not isinstance(data, dict):
+            return ''
+        modules = data.get('modules') or []
+        if not isinstance(modules, list):
+            return ''
+        target = None
+        for m in modules:
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get('name', '') or '').strip()
+            if name == mod_name or mod_name in name or name in mod_name:
+                target = m
+                break
+        if not target:
+            return ''
+        impact = target.get('cross_module_impact') or []
+        risks = target.get('module_risks') or []
+        parts = []
+        if isinstance(impact, list) and impact:
+            parts.append('跨模块关联影响：\n' + '\n'.join(f'- {i}' for i in impact))
+        if isinstance(risks, list) and risks:
+            parts.append('本模块特有风险：\n' + '\n'.join(f'- {r}' for r in risks))
+        if not parts:
+            return ''
+        return '\n'.join(parts)
+
+    def _fused_entries_for_module(self, mod_name: str) -> list:
+        """按模块名匹配返回 fused_requirements 条目列表。
+
+        兼容两种形式：
+        1) 阶段1 原生模块名（如「日记贴纸模板」）→ 精确匹配 module 字段
+        2) 细分后的子模块名（如「日记贴纸模板-删除」）→ 剥离「-来源页」后缀匹配父模块，
+           并按来源页过滤出该子模块对应的 fused 条目
+        """
+        if not self.prototype.extracted_json:
+            return []
+        try:
+            data = json.loads(self.prototype.extracted_json)
+        except Exception:
+            return []
+        fused = data.get('fused_requirements') or []
+        if not isinstance(fused, list):
+            return []
+        base = mod_name
+        sub_page = None
+        if '-' in mod_name:
+            base, _, sub_page = mod_name.rpartition('-')
+        rel = [x for x in fused if isinstance(x, dict) and (x.get('module') or '').strip() == base]
+        if sub_page and rel:
+            rel = [x for x in rel if x.get('source_pages') and str(x.get('source_pages')[0]) == sub_page]
+        return rel
+
+
+    def _split_heavy_module_by_fused(self, modules: list) -> list:
+        """对「细节特别多」的模块做再细分，缓解 P2 单次生成超容导致的漏子功能。
+
+        背景：阶段1 会把多个页面（如贴纸的 切换模板/删除/添加/编辑/分享）锁成 1 个业务模块，
+        P1「阶段1对齐铁律」强制保留该粗粒度模块名，导致 P2 一次要吞几十条 fused 需求，
+        max_tokens 装不下 → LLM 聚焦主流程、静默丢弃删除/添加等子功能。
+
+        本方法：对 fused 条目数超过阈值的模块，按其 fused 条目的 feature/source 聚类拆成子模块，
+        （类似部署前的细粒度拆分），P2 将逐个细模块生成，避免超容漏项。
+        父模块名保留（作为统一前缀），不破坏阶段1 业务语义。
+        """
+        threshold = 12  # 单模块 fused 条目超过该值则细分
+        if not modules:
+            return modules
+
+        out = []
+        for mod in modules:
+            if not isinstance(mod, dict):
+                out.append(mod)
+                continue
+            name = str(mod.get('name', '') or '').strip()
+            rel = self._fused_entries_for_module(name)
+            if len(rel) < threshold:
+                out.append(mod)
+                continue
+
+            # 按 source_pages 首个来源页聚类（删除/添加/编辑/分享/切换模板...）
+            groups = {}
+            for r in rel:
+                pages = r.get('source_pages') or []
+                key = str(pages[0]) if isinstance(pages, list) and pages else '其他'
+                groups.setdefault(key, []).append(r)
+
+            # 生成子模块：父模块名 + 来源页作为子模块标识
+            sub_modules = []
+            for i, (page_key, entries) in enumerate(groups.items(), 1):
+                sub_name = f"{name}-{page_key}" if page_key != '其他' else f"{name}-其他{i}"
+                sub_features = [e.get('feature', '') for e in entries if isinstance(e, dict) and e.get('feature')]
+                sub = {
+                    'name': sub_name,
+                    'priority': mod.get('priority', 'P0'),
+                    'sub_pages': [page_key] if page_key != '其他' else [],
+                    'features': sub_features or [],
+                    'risks': mod.get('risks', []),
+                    'estimated_testcases': max(len(entries) * 2, 5),
+                    'estimated_smoke': 1,
+                    '_parent_module': name,
+                    '_fused_source': page_key,
+                    '_fused_count': len(entries),
+                }
+                sub_modules.append(sub)
+
+            if len(sub_modules) <= 1:
+                # 聚类没有区分度（几乎全挤在一个来源页），退回原模块，交由 P2 分批处理
+                out.append(mod)
+                continue
+
+            self._log(f'  ⚙️ 模块[{name}] 细节过多（{len(rel)} 条 fused），细分为 {len(sub_modules)} 个子模块：'
+                      + ', '.join(s['name'] for s in sub_modules))
+            out.extend(sub_modules)
+
+        return out
 
     def _source_decision_tables(self):
         """Return decision tables from vision extraction as authoritative source data."""
@@ -1413,10 +1538,19 @@ class ModaoWorkflow:
                 candidates = modules
             for module in candidates:
                 module.setdefault('visual_structures', []).append(structure)
-        if isinstance(split_yaml, dict):
-            import yaml
-            split_out = yaml.safe_dump(split_yaml, allow_unicode=True, sort_keys=False, width=120)
+        # 模块再细分：对细节特别多的阶段1模块（如贴纸的 切换/删除/添加/编辑 被锁成 1 个粗模块）
+        # 按 fused 来源聚类拆成细模块，避免 P2 单次生成超容漏子功能（方案2）
+        if not missing_modules:
+            sub_modules = self._split_heavy_module_by_fused(modules)
+            if len(sub_modules) != len(modules):
+                modules = sub_modules
+                # 重新序列化回 module_split
+                if isinstance(split_yaml, dict):
+                    split_yaml['modules'] = modules
+                import yaml
+                split_out = yaml.safe_dump(split_yaml, allow_unicode=True, sort_keys=False, width=120)
         self.prototype.module_split = split_out
+
         if missing_modules:
             self.prototype.status = 'failed'
             self.prototype.error_message = (
@@ -1428,6 +1562,7 @@ class ModaoWorkflow:
             return {'modules': len(modules), 'final_testpoints': 0, 'error': 'module_coverage_failed',
                     'missing_modules': missing_modules, 'phase': 1}
         self._log(f'3.1 模块拆分完成，共 {len(modules)} 个模块')
+
 
         all_final_tps = []      # 全部模块的最终测试点
         all_risks = []
@@ -1451,11 +1586,38 @@ class ModaoWorkflow:
                     )
                 # 注入对应原型的页面 text（按模块名模糊匹配），让 LLM 看到便签/批注等具体需求
                 page_text_hint = self._match_page_text_for_module(mod_name, mod)
-                tp_prompt = render_prompt(P2_TESTPOINT_GEN, module_info_yaml=mod_ctx) + feature_count_hint + page_text_hint + self._kb_suffix(query_hint=mod_name)
-                tp_out = self._llm(self.analyzer_config, tp_prompt, max_tokens=6000, temperature=0)
-                tp_yaml = _parse_yaml(_extract_block(tp_out, 'yaml')) or {}
-                draft_tps = tp_yaml.get('test_points', []) if isinstance(tp_yaml, dict) else []
-                self._log(f'  模块[{mod_name}] 基础测试点生成：{len(draft_tps)} 条')
+                # 方案3：P2 自动分批。若本模块 fused 条目过多，拆成多批分别生成测试点再合并，
+                # 避免单次 max_tokens=6000 装不下导致 LLM 聚焦主流程、静默丢弃删除/添加等子功能。
+                fused_rel = self._fused_entries_for_module(mod_name)
+                batch_size = 15  # 每批最多注入的 fused 条目数
+                if len(fused_rel) > batch_size:
+                    # 分批：每批取一个连续切片，单独生成该子集的测试点
+                    batches = [fused_rel[i:i + batch_size] for i in range(0, len(fused_rel), batch_size)]
+                    draft_tps = []
+                    for bi, batch in enumerate(batches, 1):
+                        batch_hint = (
+                            f'\n\n【该模块已提取的结构化需求（第 {bi}/{len(batches)} 批，共 {len(batch)} 条）】'
+                            f'请严格基于以下具体需求生成该批测试点，不要泛化或臆造，也不要把本批内容漏掉：\n'
+                            + '\n'.join(
+                                f'{j}. 【{r.get("feature", "")}】{r.get("interaction", "")}'
+                                f'（证据等级：{r.get("evidence", "")}）'
+                                for j, r in enumerate(batch, 1)
+                            )
+                        )
+                        batch_prompt = render_prompt(P2_TESTPOINT_GEN, module_info_yaml=mod_ctx) + feature_count_hint + batch_hint + self._kb_suffix(query_hint=mod_name)
+                        tp_out = self._llm(self.analyzer_config, batch_prompt, max_tokens=6000, temperature=0)
+                        tp_yaml = _parse_yaml(_extract_block(tp_out, 'yaml')) or {}
+                        batch_tps = tp_yaml.get('test_points', []) if isinstance(tp_yaml, dict) else []
+                        batch_tps = [t for t in batch_tps if isinstance(t, dict)]
+                        draft_tps.extend(batch_tps)
+                        self._log(f'  模块[{mod_name}] 第{bi}批（{len(batch)}条fused）生成 {len(batch_tps)} 条测试点')
+                    self._log(f'  模块[{mod_name}] 分批生成汇总：{len(draft_tps)} 条测试点（{len(fused_rel)}条fused / 每批{batch_size}条）')
+                else:
+                    tp_prompt = render_prompt(P2_TESTPOINT_GEN, module_info_yaml=mod_ctx) + feature_count_hint + page_text_hint + self._kb_suffix(query_hint=mod_name)
+                    tp_out = self._llm(self.analyzer_config, tp_prompt, max_tokens=6000, temperature=0)
+                    tp_yaml = _parse_yaml(_extract_block(tp_out, 'yaml')) or {}
+                    draft_tps = tp_yaml.get('test_points', []) if isinstance(tp_yaml, dict) else []
+                    self._log(f'  模块[{mod_name}] 基础测试点生成：{len(draft_tps)} 条')
                 if isinstance(mod_features, list) and len(mod_features) > 0 and len(draft_tps) < max(len(mod_features) * 2, 5):
                     self._log(f'  ⚠️ 模块[{mod_name}] 测试点({len(draft_tps)})偏少（功能点{len(mod_features)}个），可能覆盖不足或产生泛化输出')
                 # 过滤非 dict 的测试点（LLM 偶发返回字符串元素）
@@ -1514,10 +1676,12 @@ class ModaoWorkflow:
                         })
 
                 # 3.3.6 PCI 识别 (pci)
+                cross_module_impact = self._extract_module_context(mod_name)
                 pci_prompt = render_prompt(P6_PCI_IDENTIFY,
                                            test_points_json=json.dumps(draft_tps, ensure_ascii=False),
                                            requirement_text=self._source_text(),
-                                           stage2_issues=self.prototype.clarification_log)
+                                           stage2_issues=self.prototype.clarification_log,
+                                           cross_module_impact=cross_module_impact or '无（该模块未分析出跨模块影响）')
                 pci_out = self._llm(self.analyzer_config, pci_prompt, max_tokens=6000, temperature=0)
                 pci_json = _parse_json(_extract_block(pci_out, 'json')) or {}
                 # 后处理去重：剔除与已澄清问题（resolution 非空）重复的 PCI 条目
@@ -1728,6 +1892,14 @@ class ModaoWorkflow:
     def _code_quality_check(self, all_cases, smoke_json, all_final_tps):
         #type: (...) -> dict   
         import re as _re
+        # C1 兼容性归一化：把「{module:X, testcase:{...}}」嵌套结构中外层 module 同步到内层 testcase，
+        # 避免 LLM 把 module 放外层而 C1 只查内层导致误判"缺 module"。
+        for tc in all_cases:
+            if not isinstance(tc, dict):
+                continue
+            inner = tc.get('testcase', tc) if isinstance(tc, dict) else tc
+            if isinstance(inner, dict) and not inner.get('module') and tc.get('module'):
+                inner['module'] = tc.get('module')
         total_cases = len(all_cases)
         smoke_cases = smoke_json.get('smoke_testcases',[]) if isinstance(smoke_json,dict) else (smoke_json if isinstance(smoke_json,list) else [])
         total_smoke = len(smoke_cases)
@@ -1893,6 +2065,14 @@ class ModaoWorkflow:
         all_cases = []
         for _, cases in module_testcases:
             all_cases.extend(cases)
+        # module 归一化：把「{module:X, testcase:{...}}」外层 module 同步到内层 testcase，
+        # 保证 testcases_json 与 C1 质量检查都能取到 module
+        for tc in all_cases:
+            if not isinstance(tc, dict):
+                continue
+            inner = tc.get('testcase', tc) if isinstance(tc, dict) else tc
+            if isinstance(inner, dict) and not inner.get('module') and tc.get('module'):
+                inner['module'] = tc.get('module')
         self.prototype.testcases_json = json.dumps(all_cases, ensure_ascii=False)
         self._log(f'3.4 用例生成完成，共 {len(all_cases)} 条用例')
 

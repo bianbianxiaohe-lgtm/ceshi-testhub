@@ -146,6 +146,10 @@
               <el-icon><Bell /></el-icon>
               <span>通知列表</span>
             </el-menu-item>
+            <el-menu-item index="/ui-automation/app">
+              <el-icon><Cellphone /></el-icon>
+              <span>应用配置</span>
+            </el-menu-item>
           </template>
 
           <!-- App自动化测试模块菜单 -->
@@ -181,6 +185,10 @@
             <el-menu-item index="/app-automation/executions">
               <el-icon><VideoPlay /></el-icon>
               <span>执行记录</span>
+            </el-menu-item>
+            <el-menu-item index="/app-automation/pipeline">
+              <el-icon><MagicStick /></el-icon>
+              <span>流水线运行</span>
             </el-menu-item>
             <el-menu-item index="/app-automation/reports">
               <el-icon><DataAnalysis /></el-icon>
@@ -242,6 +250,10 @@
               <el-icon><Document /></el-icon>
               <span>AI 用例管理</span>
             </el-menu-item>
+            <el-menu-item index="/ai-intelligent-mode/midscene-playground">
+              <el-icon><MagicStick /></el-icon>
+              <span>Midscene Playground</span>
+            </el-menu-item>
             <el-menu-item index="/ai-intelligent-mode/execution-records">
               <el-icon><Timer /></el-icon>
               <span>AI 测试报告</span>
@@ -297,7 +309,12 @@
             <div class="header-left">
               <el-breadcrumb separator="/">
                 <el-breadcrumb-item :to="{ path: '/home' }">首页</el-breadcrumb-item>
-                <el-breadcrumb-item v-if="moduleName">{{ moduleName }}</el-breadcrumb-item>
+                <el-breadcrumb-item
+                  v-if="moduleName && moduleHomePath"
+                  :to="{ path: moduleHomePath }">
+                  {{ moduleName }}
+                </el-breadcrumb-item>
+                <el-breadcrumb-item v-else-if="moduleName">{{ moduleName }}</el-breadcrumb-item>
                 <el-breadcrumb-item>{{ breadcrumbTitle }}</el-breadcrumb-item>
               </el-breadcrumb>
             </div>
@@ -337,7 +354,7 @@ import {
   Monitor, Folder, Document, Flag, Check, Collection, VideoPlay, 
   DataAnalysis, ChatDotRound, DocumentCopy, Link, MagicStick,
   Odometer, Timer, Setting, AlarmClock, Bell, Aim, Edit, Cpu, User,
-  Iphone, SetUp, Box, Plus
+  Iphone, SetUp, Box, Plus, Cellphone
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
@@ -370,10 +387,24 @@ const moduleName = computed(() => {
   return map[currentModule.value] || ''
 })
 
+const moduleHomePath = computed(() => {
+  const map = {
+    'ai-generation': '/ai-generation/requirement-analysis',
+    'api-testing': '/api-testing',
+    'ui-automation': '/ui-automation',
+    'app-automation': '/app-automation',
+    'defects': '/defects',
+    'data-factory': '/data-factory',
+    'ai-intelligent-mode': '/ai-intelligent-mode',
+    'configuration': '/configuration'
+  }
+  return map[currentModule.value] || ''
+})
+
 const breadcrumbTitle = computed(() => {
   const routeMap = {
     // AI用例生成
-    '/ai-generation/requirement-analysis': 'AI用例生成',
+    '/ai-generation/requirement-analysis': '需求拆解与用例生成',
     '/ai-generation/generated-testcases': 'AI生成用例记录',
     '/ai-generation/prompt-config': '提示词配置',
     '/ai-generation/projects': '项目管理',
@@ -437,6 +468,7 @@ const breadcrumbTitle = computed(() => {
     // AI 智能模式
     '/ai-intelligent-mode/testing': 'AI 智能测试',
     '/ai-intelligent-mode/cases': 'AI 用例管理',
+    '/ai-intelligent-mode/midscene-playground': 'Midscene Playground',
     '/ai-intelligent-mode/execution-records': 'AI 测试报告',
 
     

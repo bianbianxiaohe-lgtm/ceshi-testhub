@@ -1014,14 +1014,14 @@ export default {
         ElMessage.info('用例正在生成中，请稍后查看！')
         return
       }
-      
+
       // completed / failed 都允许查看详情
       if (task.status === 'completed' || task.status === 'failed') {
-        const url = this.$router.resolve({
+        // 改为当前页面跳转，不再新开窗口
+        this.$router.push({
           name: 'TaskDetail',
           params: { taskId: task.task_id }
-        }).href
-        window.open(url, '_blank')
+        })
       }
     },
 

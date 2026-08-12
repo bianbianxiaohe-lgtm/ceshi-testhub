@@ -35,6 +35,7 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.requirement_analysis.models import ModaoPrototype
 from apps.requirement_analysis.serializers import ModaoPrototypeSerializer
 from apps.requirement_analysis.modao_workflow import ModaoWorkflow, _parse_yaml, _extract_block
+from apps.requirement_analysis import modao_xmind
 from apps.feature_modules.models import FeatureModule, TestPoint
 from apps.testcases.models import TestCase
 
@@ -258,6 +259,11 @@ def _sync_stage3(proto, user):
         mname = _canonical_module_name(m.get('name'), proto=proto, project=proto.project)
         if not mname:
             continue
+        # 该模块是否有测试点或用例（避免创建既无测试点也无用例的空模块）
+        has_tp = bool(tps_by_mod.get(mname))
+        has_cases = bool(cases_by_mod.get(mname))
+        if not has_tp and not has_cases:
+            continue
         child, _ = FeatureModule.objects.get_or_create(
             project=proto.project, name=mname, parent=parent,
             defaults={'description': m.get('description') or '墨刀流程子模块', 'created_by': user},
@@ -265,6 +271,7 @@ def _sync_stage3(proto, user):
         if proto.version_id:
             child.versions.add(proto.version)
         counts['modules'] += 1
+
 
         # 测试点
         for t in tps_by_mod.get(mname, []):
@@ -1048,3 +1055,75 @@ def modao_log_raw(request):
         except Exception:
             pass
     return JsonResponse({'content': content, 'lines': lines, 'finished': finished, 'proto_status': proto_status})
+
+
+# ---------- 阶段1 结构化摘要 ⇄ XMind（方案 A：上传仅覆盖结构化摘要，不联动下游）----------
+
+@api_view(['GET'])
+def modao_export_xmind(request, pk):
+    """导出阶段1结构化摘要为可编辑 XMind 文件。"""
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    if not (proto.requirement_summary or '').strip():
+        return Response({'detail': '尚未生成结构化摘要，无法导出 XMind'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    summary = _parse_yaml(_extract_block(proto.requirement_summary, 'yaml')) or {}
+    if not isinstance(summary, dict):
+        summary = {}
+    data = modao_xmind.export_xmind_bytes(proto, summary)
+    safe_title = re.sub(r'[\\/:*?"<>|]', '_', (proto.title or 'requirement').strip()) or 'requirement'
+    filename = f'{safe_title}.xmind'
+    resp = HttpResponse(data, content_type='application/vnd.xmind.workbook')
+    resp['Content-Disposition'] = f'attachment; filename="{filename}"; filename*=UTF-8\'\'{filename}'
+    return resp
+
+
+@api_view(['POST'])
+def modao_import_xmind(request, pk):
+    """上传本地修改后的 XMind，解析后仅覆盖结构化摘要（requirement_summary）。
+
+    约定（方案 A）：不联动阶段2/3，避免把未经验证的局部修改扩散到下游。
+    上传前自动备份当前摘要到 requirement_summary 之外的临时字段（_xmind_backup），
+    便于需要时回退。层级校验为宽松策略：仅识别约定前缀节点，其余节点忽略。
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    upload = request.FILES.get('file') or request.data.get('file')
+    if not upload:
+        return Response({'detail': '缺少 XMind 文件（字段名 file）'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    try:
+        raw = upload.read()
+    except Exception as e:
+        return Response({'detail': f'读取上传文件失败：{e}'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    root_title, modules = modao_xmind.parse_xmind_bytes(raw)
+    if root_title is None:
+        return Response({'detail': '无法解析 XMind（仅支持 content.json 格式，请用本系统导出的 XMind 修改后回传）'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    if not modules:
+        return Response({'detail': 'XMind 中未识别到任何模块节点（二级节点应作为模块名）'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    # 宽松校验：模块名必须非空
+    modules = [m for m in modules if (m.get('name') or '').strip()]
+    if not modules:
+        return Response({'detail': 'XMind 模块名不能为空'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+
+    # 保留原摘要中的非 modules 顶层字段（如决策表、结构等），仅替换 modules 列表
+    prev = _parse_yaml(_extract_block(proto.requirement_summary, 'yaml')) or {}
+    if not isinstance(prev, dict):
+        prev = {}
+    prev['modules'] = modules
+    new_yaml = modao_xmind.modules_to_yaml(modules)
+    backup = (proto.requirement_summary or '')
+    proto.requirement_summary = new_yaml
+    try:
+        proto.save(update_fields=['requirement_summary'])
+    except Exception as e:
+        return Response({'detail': f'保存失败：{e}'},
+                        status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+    return Response({
+        'detail': f'已用 XMind 覆盖结构化摘要，共 {len(modules)} 个模块',
+        'module_count': len(modules),
+        'backup_length': len(backup),
+        'requirement_summary': new_yaml,
+    })
