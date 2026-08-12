@@ -3218,8 +3218,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # 获取测试用例内容（优先使用生成内容，其次最终内容）
-            test_cases = task.generated_test_cases or task.final_test_cases
+            # 获取测试用例内容（优先使用最新的最终用例，其次初次生成内容）
+            test_cases = task.final_test_cases or task.generated_test_cases
             if not test_cases or not test_cases.strip():
                 return Response(
                     {'error': '该任务没有测试用例内容，无法重新评审'},
@@ -3394,8 +3394,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # 获取测试用例和评审反馈
-            test_cases = task.generated_test_cases or task.final_test_cases
+            # 获取测试用例和评审反馈（优先使用最新的最终用例）
+            test_cases = task.final_test_cases or task.generated_test_cases
             if not test_cases or not test_cases.strip():
                 return Response(
                     {'error': '该任务没有测试用例内容，无法审计'},
@@ -3420,7 +3420,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     django.db.connections.close_all()
                     
                     task_in_thread = TestCaseGenerationTask.objects.get(task_id=task_id)
-                    test_cases_val = task_in_thread.generated_test_cases or task_in_thread.final_test_cases
+                    test_cases_val = task_in_thread.final_test_cases or task_in_thread.generated_test_cases
                     review_val = task_in_thread.review_feedback or ""
                     
                     async def run_audit():
