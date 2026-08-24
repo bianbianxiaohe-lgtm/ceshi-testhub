@@ -125,7 +125,7 @@ def _parse_json(text: str):
 def _normalize_evidence_text(value) -> str:
     """Normalize text for conservative evidence matching."""
     text = str(value or '').lower()
-    return re.sub(r'[\s，。；：、,.!?！？:;（）()【】\[\]"""\'''\-—_]+', '', text)
+    return re.sub(r'[\s，。；：、,.!?！？:;（）()【】\[\]"""\'''_—-]+', '', text)
 
 
 def _repair_source_coverage(all_fused_requirements, valid_pages):
@@ -339,6 +339,25 @@ def _postprocess_requirement_summary(data, source_text: str):
 
     invalid_count = 0
     checked_count = 0
+    converged_conclusions = []
+
+    def _classify(item, module_name):
+        """按「先推测后提问」判定歧义点是否可收敛：
+        current_guess 唯一且无待确认问题（suggested_question 为空）→ converged，不再追问。"""
+        guess = str(item.get('current_guess') or '').strip()
+        question = str(item.get('suggested_question') or '').strip()
+        status = str(item.get('status') or '').strip()
+        converged = status in ('converged', '已确定', '确定') or (guess and not question)
+        item['status'] = 'converged' if converged else 'pending'
+        if converged:
+            converged_conclusions.append({
+                'module': module_name,
+                'point': item.get('issue') or item.get('scenario') or item.get('description') or '',
+                'conclusion': guess or item.get('suggested_answer') or '',
+                'evidence': item.get('evidence') or item.get('basis') or '',
+            })
+        return converged
+
     priority_is_explicit = bool(re.search(r'(?<![A-Za-z0-9])P[012](?![A-Za-z0-9])', source_text, re.I))
     for module in merged_modules:
         if not priority_is_explicit:
@@ -361,7 +380,8 @@ def _postprocess_requirement_summary(data, source_text: str):
                 valid = _validate_evidence(item.get('evidence'), source_text)
                 item['evidence_valid'] = valid
                 item['evidence_level'] = 'A' if valid else 'D'
-                item['human_confirmation_required'] = True
+                converged = _classify(item, module.get('name', ''))
+                item['human_confirmation_required'] = (not converged) or (not valid)
                 checked_count += 1
                 invalid_count += int(not valid)
 
@@ -371,7 +391,8 @@ def _postprocess_requirement_summary(data, source_text: str):
                 valid = _validate_evidence(item.get('evidence'), source_text)
                 item['evidence_valid'] = valid
                 item['evidence_level'] = 'A' if valid else 'D'
-                item['human_confirmation_required'] = True
+                converged = _classify(item, '全局')
+                item['human_confirmation_required'] = (not converged) or (not valid)
                 checked_count += 1
                 if not valid:
                     invalid_count += 1
@@ -391,8 +412,81 @@ def _postprocess_requirement_summary(data, source_text: str):
     for item in data.get('missing_points') or []:
         if isinstance(item, dict):
             item['evidence_level'] = 'C'
-            item['human_confirmation_required'] = True
+            converged = _classify(item, '全局')
+            item['human_confirmation_required'] = not converged
+    for key in ('ambiguous_points', 'missing_points', 'boundary_points'):
+        data.setdefault(key, [])
+    data['converged_conclusions'] = converged_conclusions
     return data, merge_count, invalid_count
+
+
+def _normalize_pci_dispositions(all_pci: list) -> dict:
+    """机器侧收敛：low/medium 且 suggested_answer 是具体结论的 PCI，
+    自动标记 disposition=assumed（按默认假设处理），不计入人工确认负担；
+    high/blocker 或建议答案空泛的保持 disposition=confirm；
+    含「修改/新增规则、数值阈值、文案」等可能改变产品决策的答案标记 suspicious（需人工确认）；
+    assumed 中跨模块重复的问题合并为一条（标记 dedup_assumed）。"""
+    import difflib
+    import re
+    stats = {
+        'total': 0, 'assumed': 0, 'confirm': 0, 'suspicious': 0, 'dedup': 0,
+        'by_impact': {}, 'by_disposition': {},
+    }
+    vague_markers = ('待确认', '待定', '需产品', '需要产品', '无法给出', '待进一步', '确认后', '待明确')
+    # 答案若涉及修改/新增产品规则、具体数值阈值或文案，属于产品决策，不静默收敛
+    change_markers = ('改为', '修改为', '调整为', '新增', '上限', '阈值', '固定为', '统一为', '设为', '文案')
+
+    def _norm(text: str) -> str:
+        text = re.sub(r'「[^」]*」', '', text or '')
+        text = re.sub(r'\s+', '', text)
+        text = re.sub(r'[，。；：、,.!?！？:;（）()【】\[\]"\'\-—_]+', '', text)
+        return text
+
+    seen_keys = []
+    for mod in all_pci:
+        data = mod.get('data') if isinstance(mod, dict) else None
+        if not isinstance(data, dict):
+            continue
+        items = data.get('pci_list')
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            impact = str(it.get('impact') or '').lower()
+            stats['total'] += 1
+            stats['by_impact'][impact] = stats['by_impact'].get(impact, 0) + 1
+            if impact in ('low', 'medium'):
+                answer = str(it.get('suggested_answer') or '').strip()
+                if not answer or len(answer) < 4 or any(m in answer for m in vague_markers):
+                    it['disposition'] = 'confirm'
+                    stats['confirm'] += 1
+                elif any(m in answer for m in change_markers):
+                    it['disposition'] = 'suspicious'
+                    stats['suspicious'] += 1
+                else:
+                    # 跨模块去重：规范化后与已有 assumed 问题高度相似则合并
+                    key = _norm(it.get('description') or '')
+                    dup = None
+                    for k in seen_keys:
+                        if difflib.SequenceMatcher(None, k, key).ratio() >= 0.9:
+                            dup = k
+                            break
+                    if dup is not None:
+                        it['disposition'] = 'dedup_assumed'
+                        it['merged_into'] = '见首个模块的同类假设'
+                        stats['dedup'] += 1
+                    else:
+                        seen_keys.append(key)
+                        it['disposition'] = 'assumed'
+                        it['assumed_answer'] = answer
+                        stats['assumed'] += 1
+            else:
+                it['disposition'] = 'confirm'
+                stats['confirm'] += 1
+            disp = it.get('disposition')
+            stats['by_disposition'][disp] = stats['by_disposition'].get(disp, 0) + 1
+    return stats
 
 
 class ModaoWorkflow:
@@ -426,11 +520,13 @@ class ModaoWorkflow:
         return analyzer, writer, embedder
 
     # ---------- LLM / 向量 基础 ----------
-    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 300, temperature: float = None):
+    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 300, temperature: float = None, return_meta: bool = False):
         """调用 LLM。带超时保护：单条调用超过 timeout 秒即抛 asyncio.TimeoutError，
         由上层（run_design_phase1 模块级 try/except）捕获并降级，避免窗口永久卡死。
 
-        temperature: None=沿用config.temperature, 0=确定性输出(推荐用于结构化生成)。"""
+        temperature: None=沿用config.temperature, 0=确定性输出(推荐用于结构化生成)。
+        return_meta: True 时返回 dict(content, finish_reason)，便于上层检测 max_tokens 截断；
+                     默认 False 维持仅返回 content 字符串，不影响其他调用方。"""
         import time as _time
         if not config:
             raise Exception('缺少可用的 AI 模型配置（analyzer/writer）')
@@ -453,8 +549,15 @@ class ModaoWorkflow:
                 f'LLM 调用超时（>{timeout}s），请检查模型服务是否可用或网络是否通畅'
             )
         content = result['choices'][0]['message']['content']
+        finish_reason = None
+        try:
+            finish_reason = result['choices'][0].get('finish_reason')
+        except Exception:
+            pass
         elapsed = _time.time() - t0
-        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s', flush=True)
+        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s finish_reason={finish_reason}', flush=True)
+        if return_meta:
+            return {'content': content, 'finish_reason': finish_reason}
         return content
 
     def _embed(self, texts):
@@ -472,6 +575,22 @@ class ModaoWorkflow:
             return None
         except Exception as e:
             logger.warning(f'向量化失败（降级为无去重）: {e}')
+            return None
+
+    def _cosine_sim(self, texts_a, texts_b):
+        """两组文本的余弦相似度矩阵（len(a) x len(b)）；embedder 不可用或失败返回 None，调用方自行降级。"""
+        if not self.embedder_config or not texts_a or not texts_b:
+            return None
+        vecs = self._embed(list(texts_a) + list(texts_b))
+        if not vecs:
+            return None
+        try:
+            arr = np.array(vecs, dtype=float)
+            arr = arr / np.clip(np.linalg.norm(arr, axis=1, keepdims=True), 1e-9, None)
+            na = len(texts_a)
+            return arr[:na] @ arr[na:].T
+        except Exception as e:
+            logger.warning(f'PCI 语义相似度计算失败: {e}')
             return None
 
     # ---------- 向量语义去重（方案 A）----------
@@ -572,14 +691,21 @@ class ModaoWorkflow:
             parts = [r.get('issue', ''), r.get('suggested_question', ''), r.get('resolution', '')]
             resolved_texts.append(_clean(' '.join(parts)))
 
-        # 对每条 PCI，计算其与已澄清问题的最优相似度
+        # 对每条 PCI，计算其与已澄清问题的最优相似度（向量余弦主判抓改写重复，字面 difflib 兜底）
         import difflib
+        pci_raw_texts = [(pci.get('description') or '') + ' ' + (pci.get('title') or '')
+                         for pci in pci_list if isinstance(pci, dict)]
+        ref_question_texts = [((r.get('issue') or '') + ' ' + (r.get('suggested_question') or '')).strip()
+                              for r in resolved]
+        cos_sim = self._cosine_sim(pci_raw_texts, ref_question_texts)
         keep = []
         removed = []
+        raw_idx = -1
         for pci in pci_list:
             if not isinstance(pci, dict):
                 keep.append(pci)
                 continue
+            raw_idx += 1
             pci_text = _clean((pci.get('description') or '') + ' ' + (pci.get('title') or ''))
             if not pci_text:
                 keep.append(pci)
@@ -591,10 +717,16 @@ class ModaoWorkflow:
                 ratio = difflib.SequenceMatcher(None, pci_text, rt).ratio()
                 if ratio > max_ratio:
                     max_ratio = ratio
-            # 阈值：相似度 >= 0.55 视为重复（经验值，平衡去重力度与误杀）
-            if max_ratio >= 0.55:
+            max_cos = 0.0
+            if cos_sim is not None:
+                try:
+                    max_cos = float(max(cos_sim[raw_idx]))
+                except Exception:
+                    max_cos = 0.0
+            # 判重：向量余弦 >= dedup_threshold（改写重复）或字面 >= 0.55
+            if max_cos >= self.dedup_threshold or max_ratio >= 0.55:
                 removed.append({'title': pci.get('title', ''), 'description': pci.get('description', ''),
-                                'max_similarity': round(max_ratio, 3)})
+                                'max_similarity': round(max_ratio, 3), 'max_cosine': round(max_cos, 3)})
             else:
                 keep.append(pci)
         return keep, len(removed), removed
@@ -605,7 +737,8 @@ class ModaoWorkflow:
         ts = dt.now().strftime('%H:%M:%S')
         entry = f"[{ts}] {msg}\n"
         self.prototype.work_log = (self.prototype.work_log or '') + entry
-        self.prototype.save(update_fields=['work_log'])
+        # 同时更新 updated_at，保证超时看门狗能感知任务仍在推进，避免误判为卡死
+        self.prototype.save(update_fields=['work_log', 'updated_at'])
 
     def ask_question(self, stage: int, question: str, max_tokens: int = 4000) -> str:
         """针对某阶段产物进行答疑（人工疑点解答），返回 AI 回答文本。"""
@@ -1294,6 +1427,20 @@ class ModaoWorkflow:
         out = self._llm(self.analyzer_config, prompt, max_tokens=8000, temperature=0)
         parsed = _parse_yaml(_extract_block(out, 'yaml'))
         if isinstance(parsed, dict):
+            missing_sections = [
+                k for k in ('ambiguous_points', 'missing_points', 'boundary_points') if k not in parsed
+            ]
+            if missing_sections:
+                self._log(f'结构化输出缺少 {"、".join(missing_sections)} 字段，自动重试一次...')
+                retry_prompt = (
+                    prompt
+                    + '\n\n【格式校验反馈】你上一次输出缺少以下字段：'
+                    + '、'.join(missing_sections)
+                    + '。请重新输出完整 YAML，这三个字段必须出现（确实没有时写空列表 []），并严格按模板结构输出。'
+                )
+                out = self._llm(self.analyzer_config, retry_prompt, max_tokens=8000, temperature=0)
+                parsed = _parse_yaml(_extract_block(out, 'yaml'))
+        if isinstance(parsed, dict):
             parsed = self._restore_authoritative_decision_tables(parsed)
             parsed = self._restore_authoritative_visual_structures(parsed)
             parsed, merge_count, invalid_count = _postprocess_requirement_summary(
@@ -1314,6 +1461,17 @@ class ModaoWorkflow:
         self._log('需求结构化完成，已生成摘要')
         return out
 
+    def _converged_conclusions(self) -> list:
+        """读取阶段1已收敛为确定结论的歧义点清单（供阶段2/阶段3避免重复追问）。"""
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(self.prototype.requirement_summary or '{}') or {}
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        return data.get('converged_conclusions') or []
+
     # ---------- 阶段2：需求澄清 ----------
     @_timed_stage('阶段2 澄清')
     def run_clarify(self):
@@ -1331,6 +1489,14 @@ class ModaoWorkflow:
             if structured and source_text else
             '当前没有独立的结构化摘要，请直接基于原始内容审查。'
         )
+        converged = self._converged_conclusions()
+        converged_note = ''
+        if converged:
+            converged_note = (
+                '\n### 已收敛结论（阶段1已按默认假设确定，直接采纳、不得重复追问）\n'
+                + json.dumps(converged, ensure_ascii=False)
+                + '\n\n'
+            )
         prompt = (
             '你是一名严格、保守的需求审查员。你的任务不是补写需求，而是对照原始内容审查'
             '已确认范围中的模糊点、完成当前流程所必需但缺失的信息，以及功能边界。\n\n'
@@ -1338,6 +1504,7 @@ class ModaoWorkflow:
             f'===== 原始原型/需求内容（仅用于证据核对与查漏） =====\n'
             f'{source_text}\n===== 原始内容结束 =====\n\n'
             f'### 范围规则\n{scope_note}\n\n'
+            f'{converged_note}'
             '### 审查规则\n'
             '1. 每个问题必须能指向具体页面、标注、字段或结构化条目。\n'
             '2. 原文明确写出的内容不是缺失点；不得重复追问。\n'
@@ -1677,13 +1844,44 @@ class ModaoWorkflow:
 
                 # 3.3.6 PCI 识别 (pci)
                 cross_module_impact = self._extract_module_context(mod_name)
+                converged = self._converged_conclusions()
+                clarified_qa = []
+                for _ci in self.prototype.clarification_items():
+                    _cq = (_ci.get('issue') or _ci.get('suggested_question') or '').strip()
+                    _ca = str(_ci.get('resolution') or _ci.get('answer') or '').strip()
+                    if _cq and _ca:
+                        clarified_qa.append(f'Q: {_cq}\nA: {_ca}')
+                stage2_text = self.prototype.clarification_log or ''
+                if clarified_qa:
+                    stage2_text += (
+                        '\n\n### 产品已回答的确认结论（以下答案视为已确认需求，'
+                        '禁止就同一问题再生成 PCI，不得出现在 pci_list 中）：\n'
+                        + '\n'.join(clarified_qa)
+                    )
                 pci_prompt = render_prompt(P6_PCI_IDENTIFY,
                                            test_points_json=json.dumps(draft_tps, ensure_ascii=False),
                                            requirement_text=self._source_text(),
-                                           stage2_issues=self.prototype.clarification_log,
-                                           cross_module_impact=cross_module_impact or '无（该模块未分析出跨模块影响）')
+                                           stage2_issues=stage2_text,
+                                           cross_module_impact=cross_module_impact or '无（该模块未分析出跨模块影响）',
+                                           converged_conclusions=(
+                                               json.dumps(converged, ensure_ascii=False) if converged else '无'
+                                           ))
                 pci_out = self._llm(self.analyzer_config, pci_prompt, max_tokens=6000, temperature=0)
                 pci_json = _parse_json(_extract_block(pci_out, 'json')) or {}
+                if not pci_json:
+                    pci_json = _parse_yaml(_extract_block(pci_out, 'yaml')) or {}
+                if not pci_json:
+                    logger.warning(f'模块[{mod_name}] P6 JSON 解析失败，自动重试一次...')
+                    self._log(f'  模块[{mod_name}] P6 输出解析失败，自动重试...')
+                    repair_prompt = (
+                        pci_prompt
+                        + '\n\n【格式校验反馈】你上一次输出的 JSON 无法解析（可能混入解释文字、被截断或缺少 pci_list）。'
+                        '请重新输出完整 JSON，严格按模板结构，只输出 JSON 本身，不要任何前言或结尾说明。'
+                    )
+                    pci_out = self._llm(self.analyzer_config, repair_prompt, max_tokens=6000, temperature=0)
+                    pci_json = _parse_json(_extract_block(pci_out, 'json')) or {}
+                    if not pci_json:
+                        pci_json = _parse_yaml(_extract_block(pci_out, 'yaml')) or {}
                 # 后处理去重：剔除与已澄清问题（resolution 非空）重复的 PCI 条目
                 pci_raw_list = pci_json.get('pci_list') or pci_json.get('data', {}).get('pci_list') or []
                 if pci_raw_list:
@@ -1787,10 +1985,10 @@ class ModaoWorkflow:
             # 过滤掉停用词，保留有业务含义的词
             return {w for w in words if w not in stops and len(w) >= 2}
 
-        def _pci_similar(a, b, ta, tb):
+        def _pci_similar(a, b, ta, tb, cos=None):
             """判定两条 PCI 的相似等级：
-            - 'merge': 高置信重复（字面 >=0.7，或字面 0.55~0.7 且关键词高度重叠）→ 自动合并
-            - 'mark': 中等相似（字面 0.45~0.55，或关键词中等重叠）→ 标记供人工核对
+            - 'merge': 高置信重复（字面 >=0.7，或字面 0.55~0.7 且关键词高度重叠，或向量余弦 >=0.85）→ 自动合并
+            - 'mark': 中等相似（字面 0.45~0.55，或关键词中等重叠，或向量余弦 >=0.75）→ 标记供人工核对
             - 'none': 不相似
             """
             ratio = difflib.SequenceMatcher(None, a, b).ratio()
@@ -1799,13 +1997,30 @@ class ModaoWorkflow:
             shared_ratio = len(shared) / max(len(ka), 1) if ka else 0
             kw_overlap = len(shared) >= 2 and shared_ratio >= 0.4
             # 高置信重复 → 自动合并
-            if ratio >= 0.7 or (ratio >= 0.55 and kw_overlap):
+            if ratio >= 0.7 or (ratio >= 0.55 and kw_overlap) or (cos is not None and cos >= 0.85):
                 return 'merge', ratio, shared_ratio
             # 中等相似 → 标记保留供人工核对
-            if ratio >= 0.45 or (kw_overlap and ratio >= 0.35):
+            if ratio >= 0.45 or (kw_overlap and ratio >= 0.35) or (cos is not None and cos >= 0.75):
                 return 'mark', ratio, shared_ratio
             return 'none', ratio, shared_ratio
 
+        # 预计算全部 PCI 描述的向量（余弦相似度捕捉跨模块改写重复）
+        _pci_vec_list = []
+        _pci_vec_index = {}
+        for _mp in all_pci:
+            for _pc in (_mp.get('data', {}).get('pci_list') or _mp.get('data', {}).get('data', {}).get('pci_list') or []):
+                if isinstance(_pc, dict) and ((_pc.get('description') or '').strip() or (_pc.get('title') or '').strip()):
+                    _pci_vec_index[id(_pc)] = len(_pci_vec_list)
+                    _pci_vec_list.append((_pc.get('description') or '').strip() or (_pc.get('title') or '').strip())
+        _pci_vecs = self._embed(_pci_vec_list) if _pci_vec_list else None
+        if _pci_vecs is not None:
+            try:
+                _varr = np.array(_pci_vecs, dtype=float)
+                _varr = _varr / np.clip(np.linalg.norm(_varr, axis=1, keepdims=True), 1e-9, None)
+                _pci_vecs = _varr
+            except Exception:
+                _pci_vecs = None
+        _seen_vecs = []  # 代表向量，与 seen_pci_texts 对齐
         seen_pci_texts = []   # 保留组的代表文本
         seen_pci_keywords = []  # 保留组的关键词集合
         merged_count = 0
@@ -1830,7 +2045,10 @@ class ModaoWorkflow:
                 dup_sim = 0
                 dup_kw = 0
                 for i, prev_text in enumerate(seen_pci_texts):
-                    lv, ratio, kratio = _pci_similar(desc, prev_text, text, prev_text)
+                    cos = None
+                    if _pci_vecs is not None and id(pci) in _pci_vec_index and i < len(_seen_vecs) and _seen_vecs[i] is not None:
+                        cos = float(np.dot(_pci_vecs[_pci_vec_index[id(pci)]], _seen_vecs[i]))
+                    lv, ratio, kratio = _pci_similar(desc, prev_text, text, prev_text, cos)
                     if lv != 'none':
                         level = lv
                         dup_ref = i
@@ -1854,6 +2072,7 @@ class ModaoWorkflow:
                     # 不相似 → 作为新代表
                     seen_pci_texts.append(desc)
                     seen_pci_keywords.append(_pci_keywords(text))
+                    _seen_vecs.append(_pci_vecs[_pci_vec_index[id(pci)]] if (_pci_vecs is not None and id(pci) in _pci_vec_index) else None)
                 keep.append(pci)  # 保留非重复 + 标记条（供人工核对）
             # 写回
             if 'pci_list' in (mod_pci.get('data') or {}):
@@ -1872,6 +2091,14 @@ class ModaoWorkflow:
                 self._log('  待核对 PCI：' + _json.dumps(marked_items[:10], ensure_ascii=False))
 
         # 第一段产物落库（测试点合并完成，等待人工确认）
+        pci_stats = _normalize_pci_dispositions(all_pci)
+        self._log(
+            f'PCI 机器收敛：共 {pci_stats["total"]} 条，'
+            f'按默认假设收敛 {pci_stats["assumed"]} 条，'
+            f'疑似改动产品规则 {pci_stats["suspicious"]} 条，'
+            f'跨模块重复合并 {pci_stats["dedup"]} 条，'
+            f'需人工确认 {pci_stats["confirm"]} 条'
+        )
         self.prototype.risks_json = json.dumps(all_risks, ensure_ascii=False)
         self.prototype.pci_json = json.dumps(all_pci, ensure_ascii=False)
         self.prototype.final_testpoints_json = json.dumps(all_final_tps, ensure_ascii=False)
@@ -1985,6 +2212,40 @@ class ModaoWorkflow:
             'smoke_count': total_smoke,
             'c1_failed': len(c1_failed),
         }
+    def _repair_missing_steps(self, case: dict, mod_name: str) -> dict:
+        """缺步骤用例自愈：把该条用例回喂 LLM 重生成一次操作步骤；仍失败则标记缺失。"""
+        title = case.get('title') or case.get('scenario') or case.get('name') or '该用例'
+        repair_prompt = (
+            '以下是生成的一条测试用例，但缺少「操作步骤」。'
+            '请根据用例标题、前置条件和预期结果，补充 2~5 条具体的、可执行的测试操作步骤。\n\n'
+            f'模块：{mod_name}\n'
+            f'标题：{title}\n'
+            f'前置条件：{case.get("precondition") or ""}\n'
+            f'预期结果：{case.get("expected") or ""}\n\n'
+            '只输出 JSON，格式：{"steps": ["步骤1", "步骤2", ...]}\n'
+            '不要输出任何解释文字。'
+        )
+        try:
+            out = self._llm(self.writer_config or self.analyzer_config, repair_prompt,
+                            max_tokens=1500, temperature=0, timeout=120)
+            data = _parse_json(_extract_block(out, 'json')) or {}
+            steps_new = data.get('steps') or []
+            if isinstance(steps_new, list) and any(str(s).strip() for s in steps_new):
+                case['steps'] = [str(s).strip() for s in steps_new if str(s).strip()]
+                case['steps_repaired'] = True
+                self._log(f'  用例「{title}」步骤缺失，已自动补全 {len(case["steps"])} 条')
+                return case
+        except Exception as e:
+            logger.warning(f'用例步骤自愈失败（{title}）: {e}')
+        case['steps'] = '【步骤缺失，请补充操作步骤】'
+        case['steps_missing'] = True
+        case['notes'] = (
+            ((case.get('notes') or '') + '；' if case.get('notes') else '')
+            + '步骤缺失，需人工补充'
+        )
+        self._log(f'  ⚠️ 用例「{title}」步骤自愈失败，标记待人工补充')
+        return case
+
     def run_design_phase2(self):
         """读取（可能被人工编辑过的）final_testpoints_json，生成测试用例、冒烟、质量报告、Excel。"""
         self.prototype.status = 'designing'
@@ -2016,46 +2277,58 @@ class ModaoWorkflow:
             mod_name = (tp.get('module') if isinstance(tp, dict) else None) or '未分组'
             tps_by_mod.setdefault(mod_name, []).append(tp)
 
-        # 3.4 用例生成（按模块批量）
+        # 3.4 用例生成（按模块批量，模块内再按 CASE_BATCH_SIZE 拆批，避免 max_tokens 截断残缺）
+        CASE_BATCH_SIZE = 12  # 单批测试点上限（线上实测单模块 p95=30，12 为安全余量与调用次数的甜点）
         module_testcases = []
         for mod_name, final_tps in tps_by_mod.items():
             if not final_tps:
                 continue
             mod = mod_map.get(mod_name, {'name': mod_name})
             mod_ctx = json.dumps(mod, ensure_ascii=False)
+            # 注入人工已确认的 PCI 答案 + 风险处置结论，让 AI 基于确认结论精准出例
+            confirmed_ctx = self._build_confirmed_context()
+            # 模块内拆批
+            batches = [final_tps[i:i + CASE_BATCH_SIZE] for i in range(0, len(final_tps), CASE_BATCH_SIZE)]
+            mod_cases = []
             try:
-                self._log(f'  模块[{mod_name}] 正在生成测试用例（{len(final_tps)} 测试点）...')
-                case_prompt = (render_prompt(P3_CASE_GEN,
-                                             test_point_yaml=json.dumps(final_tps, ensure_ascii=False),
-                                             module_context=mod_ctx)
-                               + "\n\n### 附加指令\n请为上面列出的【每一条】最终测试点生成一条结构化测试用例，"
-                                 "以 YAML 列表返回，列表项为 `testcase:` 字典（字段同 p3 输出规范）。"
-                               + self._kb_suffix(query_hint=mod_name))
-                # 注入人工已确认的 PCI 答案 + 风险处置结论，让 AI 基于确认结论精准出例
-                confirmed_ctx = self._build_confirmed_context()
-                if confirmed_ctx:
-                    case_prompt += (
-                        "\n\n### 已确认的待确认问题答案与风险处置结论（人工已确认，请务必作为用例设计依据）\n"
-                        + confirmed_ctx)
-                case_out = self._llm(self.writer_config, case_prompt, max_tokens=16000, temperature=0)
-                case_yaml = _parse_yaml(_extract_block(case_out, 'yaml')) or {}
-                # 兼容三种 LLM 输出形态：
-                #   1) {testcases: [...]}  推荐，列表
-                #   2) {testcase: {...}}   旧 prompt，单条
-                #   3) [...]               裸数组
-                cases = []
-                if isinstance(case_yaml, dict):
-                    cases = case_yaml.get('testcases') or []
-                    if not cases and 'testcase' in case_yaml:
-                        cases = [case_yaml['testcase']]
-                elif isinstance(case_yaml, list):
-                    cases = case_yaml
-                # 过滤掉空字典（LLM 偶发返回的空占位）
-                cases = [c for c in cases if isinstance(c, dict) and c]
-                for c in cases:
-                    if not c.get('module'):
-                        c['module'] = mod_name
-                module_testcases.append((mod_name, cases))
+                for bi, batch_tps in enumerate(batches):
+                    self._log(f'  模块[{mod_name}] 正在生成测试用例（第 {bi + 1}/{len(batches)} 批，本批 {len(batch_tps)} 测试点，共 {len(final_tps)}）...')
+                    case_prompt = (render_prompt(P3_CASE_GEN,
+                                                 test_point_yaml=json.dumps(batch_tps, ensure_ascii=False),
+                                                 module_context=mod_ctx)
+                                   + "\n\n### 附加指令\n请为上面列出的【每一条】最终测试点生成一条结构化测试用例，"
+                                     "以 YAML 列表返回，列表项为 `testcase:` 字典（字段同 p3 输出规范）。"
+                                   + self._kb_suffix(query_hint=mod_name))
+                    if confirmed_ctx:
+                        case_prompt += (
+                            "\n\n### 已确认的待确认问题答案与风险处置结论（人工已确认，请务必作为用例设计依据）\n"
+                            + confirmed_ctx)
+                    meta = self._llm(self.writer_config, case_prompt, max_tokens=16000, temperature=0, return_meta=True)
+                    case_out = meta.get('content', '') if isinstance(meta, dict) else meta
+                    finish_reason = meta.get('finish_reason') if isinstance(meta, dict) else None
+                    if finish_reason == 'length':
+                        # max_tokens 用满被截断：本批用例可能残缺，记录告警但不静默丢弃已生成部分
+                        logger.warning(f'模块[{mod_name}] 第{bi + 1}批用例生成被 max_tokens 截断(finish_reason=length)，本批可能残缺')
+                        self._log(f'  ⚠ 模块[{mod_name}] 第{bi + 1}批输出被 max_tokens 截断，本批用例可能不完整（请检查该模块用例覆盖）')
+                    case_yaml = _parse_yaml(_extract_block(case_out, 'yaml')) or {}
+                    # 兼容三种 LLM 输出形态：
+                    #   1) {testcases: [...]}  推荐，列表
+                    #   2) {testcase: {...}}   旧 prompt，单条
+                    #   3) [...]               裸数组
+                    cases = []
+                    if isinstance(case_yaml, dict):
+                        cases = case_yaml.get('testcases') or []
+                        if not cases and 'testcase' in case_yaml:
+                            cases = [case_yaml['testcase']]
+                    elif isinstance(case_yaml, list):
+                        cases = case_yaml
+                    # 过滤掉空字典（LLM 偶发返回的空占位）
+                    cases = [c for c in cases if isinstance(c, dict) and c]
+                    for c in cases:
+                        if not c.get('module'):
+                            c['module'] = mod_name
+                    mod_cases.extend(cases)
+                module_testcases.append((mod_name, mod_cases))
             except Exception as e:
                 logger.error(f'模块[{mod_name}] 用例生成失败: {e}')
                 self._log(f'  模块[{mod_name}] 用例生成失败: {e}')
@@ -2065,14 +2338,30 @@ class ModaoWorkflow:
         all_cases = []
         for _, cases in module_testcases:
             all_cases.extend(cases)
-        # module 归一化：把「{module:X, testcase:{...}}」外层 module 同步到内层 testcase，
-        # 保证 testcases_json 与 C1 质量检查都能取到 module
+        # 用例归一化：统一为扁平结构（解包 {module, testcase:{...}}），
+        # 并给缺失操作步骤的用例补兜底步骤，避免入库后出现「无步骤用例」。
+        flat_cases = []
         for tc in all_cases:
             if not isinstance(tc, dict):
                 continue
-            inner = tc.get('testcase', tc) if isinstance(tc, dict) else tc
-            if isinstance(inner, dict) and not inner.get('module') and tc.get('module'):
-                inner['module'] = tc.get('module')
+            inner = tc.get('testcase', tc) if isinstance(tc.get('testcase'), dict) else tc
+            if isinstance(inner, dict):
+                if not inner.get('module') and tc.get('module'):
+                    inner['module'] = tc.get('module')
+                steps = inner.get('steps')
+                steps_txt = ''
+                if isinstance(steps, list):
+                    steps_txt = ';'.join(
+                        str(x.get('content') or x.get('action') or x) if isinstance(x, dict) else str(x)
+                        for x in steps
+                    )
+                elif isinstance(steps, str):
+                    steps_txt = steps
+                if not steps_txt.strip():
+                    # 先自愈：回喂 LLM 重生成一次操作步骤；仍失败才显式标记缺失
+                    inner = self._repair_missing_steps(inner, inner.get('module') or '?')
+                flat_cases.append(inner)
+        all_cases = flat_cases
         self.prototype.testcases_json = json.dumps(all_cases, ensure_ascii=False)
         self._log(f'3.4 用例生成完成，共 {len(all_cases)} 条用例')
 
