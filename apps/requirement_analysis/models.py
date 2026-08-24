@@ -211,6 +211,7 @@ class AIModelConfig(models.Model):
         ('writer_vision_ocr', '视觉分析专家（OCR专用，可配更快模型）'),
         ('midscene_vision', 'Midscene 视觉驱动模型（APP 真机自动化）'),
         ('embedder', '向量化模型（Embedding）'),
+        ('reranker', '重排序模型（Reranker）'),
     ]
 
     name = models.CharField(max_length=100, verbose_name='配置名称')
@@ -586,17 +587,24 @@ class AIModelService:
         # 方案 C：默认以需求文本为查询锚点做语义检索（调用方可显式覆盖 query_text）
         q = query_text if query_text else (getattr(task, 'requirement_text', '') or '')
         if q:
-            rag_ctx = AIModelService._rag_retrieve_kb(project, q, top_k=8)
+            rag_ctx = AIModelService._rag_retrieve_kb(
+                project, q, top_k=8,
+                version_id=getattr(task, 'version_id', None),
+            )
             if rag_ctx:
                 fs_ctx = ''
                 kb_path = AIModelService._resolve_knowledge_path(project)
                 if kb_path:
-                    fs_ctx = AIModelService._read_knowledge_files(kb_path) or ''
+                    # 文件库按当前需求关键词只读相关业务模块子目录，避免全量灌入
+                    fs_ctx = AIModelService._read_knowledge_files(
+                        kb_path, query_text=q, max_files=3, module_dir_match=True,
+                    ) or ''
                 parts = []
                 if fs_ctx:
                     parts.append(fs_ctx)
                 parts.append(rag_ctx)
-                return '\n\n'.join(parts)
+                ctx = '\n\n'.join(parts)
+                return AIModelService._append_impact_analysis_guide(ctx, q)
 
         # 以下为降级/展示用全量逻辑（原行为）
 
@@ -609,10 +617,21 @@ class AIModelService:
 
         # 回退：数据库知识库条目
         try:
+            from django.db.models import Q
+
             entries = ProjectKnowledge.objects.filter(
                 project_id=task.project_id,
                 is_active=True
-            ).order_by('category', 'sort_order', '-created_at')
+            )
+            task_version_id = getattr(task, 'version_id', None)
+            if task_version_id:
+                # 版本化知识只对同版本生效；无版本标注的通用知识全局生效
+                entries = entries.filter(
+                    Q(version_id__isnull=True) | Q(version_id=task_version_id)
+                )
+            else:
+                entries = entries.filter(version_id__isnull=True)
+            entries = entries.order_by('category', 'sort_order', '-created_at')
 
             if not entries.exists():
                 return ''
@@ -636,7 +655,7 @@ class AIModelService:
             return ''
 
     @staticmethod
-    def build_knowledge_context_from_project(project, query_text=None, max_chunks=None) -> str:
+    def build_knowledge_context_from_project(project, query_text=None, max_chunks=None, version_id=None) -> str:
         """基于项目对象构造知识库上下文（不依赖 task），用于知识库生成前的参考。
 
         合并两个来源：
@@ -649,34 +668,52 @@ class AIModelService:
         max_chunks: 限制检索 top-K 数量，默认 8。较小值（如 3）可减少 prompt 大小。
         """
         top_k = max_chunks if max_chunks else 8
-        # 方案 C：语义检索 DB 知识条目（文件系统 .md 仍全量保留）
+        # 方案 C：语义检索 DB 知识条目（文件系统 .md 按当前需求只读相关业务模块）
         if query_text:
-            rag_ctx = AIModelService._rag_retrieve_kb(project, query_text, top_k=top_k)
+            rag_ctx = AIModelService._rag_retrieve_kb(
+                project, query_text, top_k=top_k, version_id=version_id,
+            )
             if rag_ctx:
                 parts = []
                 kb_path = AIModelService._resolve_knowledge_path(project)
                 if kb_path:
-                    fs_ctx = AIModelService._read_knowledge_files(kb_path, query_text=query_text, max_files=5)
+                    fs_ctx = AIModelService._read_knowledge_files(
+                        kb_path, query_text=query_text, max_files=5, module_dir_match=True,
+                    )
                     if fs_ctx:
                         parts.append(fs_ctx)
                 parts.append(rag_ctx)
-                return '\n\n'.join(parts)
+                return AIModelService._append_impact_analysis_guide('\n\n'.join(parts), query_text)
 
         parts = []
 
-        # 来源①：文件系统 Markdown 知识库（query_text 非空时按相关性取 top 5）
+        # 来源①：文件系统 Markdown 知识库（按需求关键词优先匹配子目录整读，避免全量灌入）
         kb_path = AIModelService._resolve_knowledge_path(project)
         if kb_path:
-            fs_ctx = AIModelService._read_knowledge_files(kb_path, query_text=query_text or '', max_files=5 if query_text else 0)
+            fs_ctx = AIModelService._read_knowledge_files(
+                kb_path,
+                query_text=query_text or '',
+                max_files=5 if query_text else 0,
+                module_dir_match=True,
+            )
             if fs_ctx:
                 parts.append(fs_ctx)
 
         # 来源②：数据库知识库条目（自适应回填的新知识落在这里）
         try:
+            from django.db.models import Q
+
             entries = ProjectKnowledge.objects.filter(
                 project_id=project.id,
                 is_active=True
-            ).order_by('category', 'sort_order', '-created_at')
+            )
+            if version_id:
+                entries = entries.filter(
+                    Q(version_id__isnull=True) | Q(version_id=version_id)
+                )
+            else:
+                entries = entries.filter(version_id__isnull=True)
+            entries = entries.order_by('category', 'sort_order', '-created_at')
             if entries.exists():
                 category_map = {}
                 for entry in entries:
@@ -695,7 +732,33 @@ class AIModelService:
 
         if not parts:
             return ''
-        return '\n\n'.join(parts)
+        return AIModelService._append_impact_analysis_guide('\n\n'.join(parts), query_text or '')
+
+    @staticmethod
+    def _append_impact_analysis_guide(ctx: str, query_text: str = '') -> str:
+        """在知识库上下文末尾追加「本次改动影响分析」引导段。
+
+        文件知识库按业务模块组织，反映各模块功能/前置条件。新版本需求常是对已有
+        功能的优化或新增依赖。此引导让 AI 在生成用例时显式思考：
+        当前需求改动会影响哪些业务模块/功能 → 用例补充对应回归点。
+        仅当上下文非空且确有需求文本时才追加，避免污染纯 DB 条目注入。
+        """
+        if not ctx or not query_text:
+            return ctx
+        try:
+            guide = (
+                '\n\n'
+                '【影响分析与用例补充指引】\n'
+                '请结合上面的项目业务知识库，回答并在用例中体现：\n'
+                '1. 本次需求改动涉及哪些业务模块/功能（对应上面知识库的子模块）？\n'
+                '2. 这些功能有哪些既有入口、前置条件和业务规则，是否与本次改动相关？\n'
+                '3. 本次改动可能对哪些既有功能产生回归影响？请在用例中补充受影响点的回归用例。\n'
+                '4. 若是新功能，确认它依赖哪些原有前置条件/模块才能可用，用例需覆盖该依赖关系。'
+            )
+            return ctx + guide
+        except Exception as e:
+            logger.warning(f'追加影响分析引导失败: {e}')
+            return ctx
 
     # ------------------------------------------------------------------
     # 知识库 RAG 检索（方案 C）：按语义相似度召回 top-K 知识条目，
@@ -748,23 +811,62 @@ class AIModelService:
             )
 
     @staticmethod
-    def _rag_retrieve_kb(project, query_text, top_k=8):
+    def _chunk_query_text(query_text: str, chunk_size: int = 5000,
+                          overlap: int = 200, max_chunks: int = 20) -> List[str]:
+        """把长需求 query 切成多段（带少量重叠），避免单条 embedding 超限，同时覆盖全文。
+        切分时优先在换行处断开；超过 max_chunks 的尾部丢弃（正常需求文本不会触发）。"""
+        text = (query_text or '').strip()
+        if not text:
+            return []
+        if len(text) <= chunk_size:
+            return [text]
+        chunks = []
+        start = 0
+        while start < len(text) and len(chunks) < max_chunks:
+            end = min(start + chunk_size, len(text))
+            if end < len(text):
+                cut = text.rfind('\n', start + chunk_size // 2, end)
+                if cut != -1:
+                    end = cut + 1
+            chunks.append(text[start:end])
+            start = max(end - overlap, start + 1)
+        return chunks
+
+    @staticmethod
+    def _rag_retrieve_kb(project, query_text, top_k=8, version_id=None):
         """RAG 检索 DB 知识条目 top-K，返回拼接文本；失败/无结果返回 ''。"""
         from .vector_store import get_project_kb_collection, query_kb
         embedder = AIModelConfig.get_active_embedder()
         if not embedder or not query_text or not query_text.strip():
             return ''
         try:
-            vec = AIModelService.embed_texts_sync([query_text], embedder)
-            if not vec:
+            chunks = AIModelService._chunk_query_text(query_text)
+            if len(chunks) > 1:
+                logger.info(f'RAG 长需求分段检索: {len(chunks)} 段')
+            vecs = AIModelService.embed_texts_sync(chunks, embedder)
+            if not vecs:
                 return ''
-            vec = vec[0]
             collection = get_project_kb_collection(project.id)
             if collection.count() == 0:
                 AIModelService._ensure_kb_indexed(project, embedder)
             if collection.count() == 0:
                 return ''
-            hits = query_kb(collection, vec, top_k)
+            per_chunk_top = max(2, top_k)
+            merged = {}
+            for vec in vecs:
+                for hit in query_kb(collection, vec, per_chunk_top):
+                    key = str(hit.get('id') or hit.get('text') or '')
+                    if not key:
+                        continue
+                    # 版本化知识只对同版本生效（metadata 中的 version_id）
+                    hit_version = (hit.get('meta') or {}).get('version_id')
+                    if version_id and hit_version and str(hit_version) != str(version_id):
+                        continue
+                    if not version_id and hit_version:
+                        continue
+                    if key not in merged or hit.get('distance', 1.0) < merged[key].get('distance', 1.0):
+                        merged[key] = hit
+            hits = sorted(merged.values(), key=lambda h: h.get('distance', 1.0))[:top_k]
             if not hits:
                 return ''
             lines = [f'【项目知识库参考（按当前需求语义检索 top-{len(hits)}）】', '']
@@ -793,7 +895,12 @@ class AIModelService:
             upsert_kb_item(
                 collection, f'pk_{entry.id}', vec[0],
                 f'【{entry.get_category_display()}】{entry.title}：{entry.content}',
-                {'source': 'db', 'entry_id': entry.id, 'category': entry.category},
+                {
+                    'source': 'db',
+                    'entry_id': entry.id,
+                    'category': entry.category,
+                    'version_id': entry.version_id,
+                },
             )
         except Exception as e:
             logger.warning(f'同步知识库向量失败（可忽略）: {e}')
@@ -985,10 +1092,21 @@ class AIModelService:
         return os.path.abspath(path)
 
     @staticmethod
-    def _read_knowledge_files(kb_path: str, query_text: str = '', max_files: int = 0) -> str:
+    def _read_knowledge_files(
+        kb_path: str,
+        query_text: str = '',
+        max_files: int = 0,
+        module_dir_match: bool = True,
+        max_dirs: int = 3,
+    ) -> str:
         """递归读取知识库目录下 .md 文件，拼接为上下文。
-        query_text 非空时按相关性排序只取 top max_files 个文件；
-        max_files=0 表示全量读取（旧行为）。
+
+        读取策略（优先级从高到低）：
+        1. module_dir_match=True 且 query_text 非空：按需求关键词**优先匹配子目录名**，
+           命中的子目录**整目录读取**（业务模块文档常按子目录组织，整读可保持模块上下文完整），
+           最多读 max_dirs 个子目录。
+        2. 未命中子目录但 query_text 非空且 max_files>0：按标题/内容相关性排序取 top max_files 个文件。
+        3. 兜底：max_files=0（全量读取，旧行为）或都没有匹配时全读。
         """
         if not kb_path or not os.path.isdir(kb_path):
             return ''
@@ -999,6 +1117,7 @@ class AIModelService:
         ]
         try:
             all_files = []
+            dir_index = {}  # dir_path -> list[file]
             def collect(dir_path: str, depth: int = 0):
                 items = sorted(os.scandir(dir_path), key=lambda e: e.name)
                 for entry in items:
@@ -1010,17 +1129,55 @@ class AIModelService:
                                 content = f.read()
                             title = re.sub(r'^\d{1,3}[-_]', '', entry.name)
                             title = re.sub(r'\.md$', '', title)
-                            all_files.append({'path': entry.path, 'title': title, 'content': content, 'depth': depth})
+                            all_files.append({
+                                'path': entry.path,
+                                'dir': os.path.dirname(entry.path),
+                                'title': title,
+                                'content': content,
+                                'depth': depth,
+                            })
                         except Exception as e:
                             logger.warning(f'读取知识库文件失败 {entry.path}: {e}')
                     elif entry.is_dir() and depth < 2:
                         collect(entry.path, depth + 1)
 
             collect(kb_path)
+            for f in all_files:
+                dir_index.setdefault(f['dir'], []).append(f)
 
-            # 如果指定了 max_files 且 query_text 非空，按标题/内容与 query 的相关性排序
             selected = all_files
-            if max_files > 0 and query_text and len(all_files) > max_files:
+
+            # 策略1：按需求关键词优先匹配子目录，整目录读取
+            if module_dir_match and query_text:
+                query_words = set(re.findall(r'[\u4e00-\u9fff\w]+', query_text.lower()))
+                if query_words:
+                    def dir_score(dir_path: str) -> int:
+                        dir_name = os.path.basename(dir_path) or ''
+                        # 去掉数字前缀和分隔符，如 03-记录tab -> 记录tab
+                        normalized = re.sub(r'^\d{1,3}[-_]?\s*', '', dir_name)
+                        hit = 0
+                        for w in query_words:
+                            if len(w) < 2:
+                                continue
+                            if w in dir_name or (normalized and w in normalized):
+                                hit += 1
+                        return hit
+                    # 子目录命中优先；命中数相同的再按文件内容补充（取相关文件数最多的目录）
+                    matched_dirs = [
+                        d for d in dir_index if dir_score(d) > 0
+                    ]
+                    if matched_dirs:
+                        ranked_dirs = sorted(
+                            matched_dirs,
+                            key=lambda d: (-dir_score(d), -len(dir_index[d])),
+                        )[:max_dirs]
+                        selected = []
+                        for d in ranked_dirs:
+                            selected.extend(dir_index[d])
+                        selected.sort(key=lambda f: (f['depth'], f['title']))
+
+            # 策略2：未命中子目录时，按文件相关性取 top-N
+            if selected is all_files and max_files > 0 and query_text and len(all_files) > max_files:
                 query_words = set(re.findall(r'[\u4e00-\u9fff\w]+', query_text.lower()))
                 def score(f):
                     text = (f['title'] + ' ' + f['content'][:500]).lower()
@@ -1048,6 +1205,7 @@ class AIModelService:
         messages: List[Dict[str, Any]],
         max_tokens: int = None,
         temperature: float = None,
+        timeout: float = None,
     ) -> Dict[str, Any]:
         """
         调用OpenAI兼容格式的API
@@ -1057,6 +1215,8 @@ class AIModelService:
             messages: 消息列表
             max_tokens: 可选的最大token数，如果不指定则使用config.max_tokens
             temperature: 可选的温度参数，如果不指定则使用config.temperature
+            timeout: 可选读取超时（秒）。默认 900s（支持大文档），
+                     但对"非关键/可降级的辅助分析调用"可传更短超时（如 120s）避免长时间挂起。
 
         Returns:
             API响应字典
@@ -1078,6 +1238,10 @@ class AIModelService:
             'top_p': config.top_p,
             'stream': False
         }
+        # 推理模型（deepseek-v4-pro）降低思考强度：思考与回答共用 max_tokens 总预算，
+        # 全量思考易把预算耗尽导致 content 为空；low 后思考骤减、耗时显著下降。
+        if config.model_name == 'deepseek-v4-pro':
+            data['reasoning_effort'] = 'low'
         
         # 确保base_url不以/结尾
         base_url = config.base_url.rstrip('/')
@@ -1102,9 +1266,11 @@ class AIModelService:
             # 增加HTTP超时时间到900秒（15分钟），支持大文档生成
             # 禁用HTTP/2，使用HTTP/1.1以提高兼容性
             # 显式设置所有超时参数，避免默认的连接超时导致请求失败
+            # 若调用方显式传了 timeout（如覆盖率分析辅助判断），则用它覆盖读取超时
+            read_timeout = timeout if timeout is not None else 900.0
             timeout_config = httpx.Timeout(
                 connect=60.0,      # 连接超时：60秒
-                read=900.0,        # 读取超时：900秒（15分钟）
+                read=read_timeout, # 读取超时：默认900秒（15分钟），可被调用方覆盖
                 write=60.0,        # 写入超时：60秒
                 pool=60.0          # 连接池超时：60秒
             )
@@ -1124,22 +1290,36 @@ class AIModelService:
 
                 response.raise_for_status()
                 result = response.json()
+                # 兼容推理模型（如 DeepSeek deepseek-v4-pro）：正文可能在 reasoning_content，content 为空
+                try:
+                    _message = result['choices'][0].get('message') or {}
+                    if not _message.get('content') and _message.get('reasoning_content'):
+                        _message['content'] = _message['reasoning_content']
+                except Exception:
+                    pass
                 logger.info(f"API调用成功，响应内容: {str(result)[:200]}...")
                 return result
         except httpx.HTTPStatusError as e:
             provider_name = config.get_model_type_display()
-            error_msg = f"{provider_name} API返回错误 {e.response.status_code}: {e.response.text}"
+            error_msg = (
+                f"{provider_name}({config.model_name}) API返回错误 "
+                f"{e.response.status_code}: {e.response.text}"
+            )
             logger.error(error_msg)
             raise Exception(error_msg)
         except httpx.TimeoutException as e:
             provider_name = config.get_model_type_display()
-            logger.error(f"{provider_name} API请求超时: {repr(e)}")
-            raise Exception(f"{provider_name} API请求超时，请稍后再试或检查网络连接")
-        except Exception as e:
+            logger.error(f"{provider_name}({config.model_name}) API请求超时: {repr(e)}")
+            raise Exception(
+                f"{provider_name}({config.model_name}) API请求超时，请稍后再试或检查网络连接"
+            )
+        except BaseException as e:
             provider_name = config.get_model_type_display()
             # Use repr(e) to capture the full exception type and message, especially if str(e) is empty
-            logger.error(f"{provider_name} API调用失败: {repr(e)}")
-            raise Exception(f"{provider_name} API调用失败: {str(e) or repr(e)}")
+            logger.error(f"{provider_name}({config.model_name}) API调用失败: {repr(e)}")
+            raise Exception(
+                f"{provider_name}({config.model_name}) API调用失败: {str(e) or repr(e)}"
+            )
     
     @staticmethod
     async def embed_texts(config: AIModelConfig, texts: List[str]) -> List[List[float]]:
@@ -1155,6 +1335,16 @@ class AIModelService:
         """
         if not texts:
             return []
+        # dashscope 兼容模式单条输入上限约 8192 tokens（实测真实文本约 1.2 万字符），
+        # 超长输入会返回 400 并导致整批降级；这里统一截断到安全长度。
+        EMBED_MAX_INPUT_CHARS = 8000
+        texts = [str(t) if t is not None else '' for t in texts]
+        for i, t in enumerate(texts):
+            if len(t) > EMBED_MAX_INPUT_CHARS:
+                logger.warning(
+                    f'Embedding 输入超长，截断到 {EMBED_MAX_INPUT_CHARS} 字符（原 {len(t)} 字符）'
+                )
+                texts[i] = t[:EMBED_MAX_INPUT_CHARS]
         headers = {
             'Authorization': f'Bearer {config.api_key}',
             'Content-Type': 'application/json'
@@ -1191,10 +1381,23 @@ class AIModelService:
                     # OpenAI 兼容返回：data[i].embedding（顺序与输入一致）
                     all_embeddings.extend(item['embedding'] for item in result['data'])
             return all_embeddings
+        except httpx.HTTPStatusError as e:
+            provider_name = config.get_model_type_display()
+            response_body = e.response.text[:500] if e.response is not None else ''
+            logger.error(
+                f"{provider_name}({config.model_name}) Embedding 调用失败: {e} | response={response_body}"
+            )
+            raise Exception(
+                f"{provider_name}({config.model_name}) Embedding 调用失败: {e} | response={response_body}"
+            )
         except Exception as e:
             provider_name = config.get_model_type_display()
-            logger.error(f"{provider_name} Embedding 调用失败: {repr(e)}")
-            raise Exception(f"{provider_name} Embedding 调用失败: {str(e) or repr(e)}")
+            logger.error(
+                f"{provider_name}({config.model_name}) Embedding 调用失败: {repr(e)}"
+            )
+            raise Exception(
+                f"{provider_name}({config.model_name}) Embedding 调用失败: {str(e) or repr(e)}"
+            )
 
     @staticmethod
     async def call_deepseek_api(config: AIModelConfig, messages: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -1239,7 +1442,7 @@ class AIModelService:
         # 续写控制
         current_messages = list(messages)  # 浅拷贝
         continuation_count = 0
-        MAX_CONTINUATIONS = 5  # 最大续写次数，防止死循环
+        MAX_CONTINUATIONS = 8  # 最大续写次数，防止死循环（长需求 comprehensive 易触发，放宽到 8）
         
         while continuation_count <= MAX_CONTINUATIONS:
             data = {
@@ -1250,6 +1453,8 @@ class AIModelService:
                 'top_p': config.top_p,
                 'stream': True
             }
+            if config.model_name == 'deepseek-v4-pro':
+                data['reasoning_effort'] = 'low'
 
             logger.info(f"发起流式请求 (第{continuation_count+1}次), messages数量: {len(current_messages)}")
 
@@ -1307,21 +1512,45 @@ class AIModelService:
                 if finish_reason == 'length':
                     logger.warning(f"检测到生成被截断 (finish_reason='length')，准备自动续写。当前已续写 {continuation_count} 次。")
                     continuation_count += 1
-                    
-                    # 将本次生成的内容作为 assistant 回复加入历史
+
+                    # 续写拼接防污染（治本）：
+                    # 剥离本次生成内容末尾的孤立 markdown 标题行（如 "# 桌面娃娃...（续）"），
+                    # 避免它被原样带入上下文、被下一轮当作表格单元格内容塞进用例行内，
+                    # 从而破坏 markdown 表格结构。
+                    def _strip_trailing_heading(buf):
+                        lines = buf.split('\n')
+                        while lines and lines[-1].strip():
+                            s = lines[-1].strip()
+                            # 识别孤立标题行：以 1-6 个 # 开头，且不含表格分隔符 |
+                            if re.match(r'^#{1,6}\s+\S', s) and '|' not in s:
+                                lines.pop()
+                            else:
+                                break
+                        return '\n'.join(lines)
+
+                    clean_buffer = _strip_trailing_heading(chunk_content_buffer)
+
+                    # 将本次生成的内容（已清理）作为 assistant 回复加入历史
                     # 注意：如果之前已经有assistant消息，需要追加内容而不是新增消息
                     if current_messages[-1]['role'] == 'assistant':
-                        current_messages[-1]['content'] += chunk_content_buffer
+                        current_messages[-1]['content'] += clean_buffer
                     else:
-                        current_messages.append({"role": "assistant", "content": chunk_content_buffer})
-                    
+                        current_messages.append({"role": "assistant", "content": clean_buffer})
+
                     # 只有当上一条不是user的续写指令时，才添加新的user指令
                     # 防止多次续写时堆叠重复的 user 指令
                     if current_messages[-1]['role'] != 'user':
-                        current_messages.append({"role": "user", "content": "请继续输出剩余的内容，不要重复已输出的部分，紧接着上文继续。"})
-                    
+                        current_messages.append({
+                            "role": "user",
+                            "content": (
+                                "请严格接着上文最后一行继续输出，不要输出任何标题、不要重复已输出的内容，"
+                                "直接从上一个未完成的表格行继续补全或新增下一行用例（保持 markdown 表格格式，"
+                                "每行以 | 开头、以 | 结尾）。"
+                            )
+                        })
+
                     # 发送换行符以分隔续写内容（可选，视模型而定，通常不需要，但为了保险）
-                    # yield "\n" 
+                    # yield "\n"
                     continue
                 else:
                     logger.info(f"流式生成正常结束 (finish_reason={finish_reason})")
@@ -1372,20 +1601,116 @@ class AIModelService:
             ),
             'comprehensive': (
                 f"【生成指令 - 全面模式】\n"
-                f"1. **数量原则**：请根据需求内容的实际复杂度，自动决定生成用例的数量。务必覆盖所有功能点、异常场景和边界条件，不设数量上限，应写尽写。\n"
+                f"1. **数量原则（去冗余，不堆量）**：按需求实际复杂度定档生成，覆盖所有功能点、异常场景与边界条件，"
+                f"但严禁为凑数量生成同质化冗余用例。多参数/多条件场景必须采用两两组合（Pairwise）策略："
+                f"对 N 个因子各取关键取值做正交组合，用最少组合数达成关键路径 100% 覆盖，不得对每个字段做全排列式拆分。\n"
                 f"2. **深度遍历策略**：\n"
-                f"   - 请按文档结构逐章节分析，不要遗漏末尾的功能点。\n"
-                f"   - 对每个功能点，必须设计：1个正常场景 + 2-3个异常/边界场景。\n"
-                f"3. **拒绝合并**：严禁将多个验证点合并在一条用例中。例如'验证输入框'应拆分为'输入为空'、'输入超长'、'输入特殊字符'等独立用例。\n"
-                f"4. **场景扩展库**：\n"
+                f"   - 按文档结构逐章节分析，不要遗漏末尾功能点。\n"
+                f"   - 每个功能点：1 个正常场景 + 必要的异常/边界场景；'必要'以等价类划分判定，同类同质输入取代表性用例。\n"
+                f"3. **同类归并原则（取消滥拆）**：相同等价类下的同质化输入合并为一条代表性用例"
+                f"（如多个整型输入框的边界可合并为一条'输入框边界校验'）。\n"
+                f"   - ⚠️ 豁免：若需求文档明确把'逐字段/逐边界独立举证'作为验收标准（如金融合规、医疗监管），则该字段仍须独立设计用例，不得合并。\n"
+                f"4. **单因子异常剪枝**：异常用例每次仅暴露一个参数异常，避免多负向因子叠加被程序 Fail-fast 拦截形成无区分度的死用例。\n"
+                f"   - ⚠️ 豁免：交易/库存类的并发、幂等、弱网叠加等复杂业务场景，确需多因子叠加暴露组合缺陷时允许叠加，"
+                f"但须在用例 notes 中说明叠加理由与预期失败点。\n"
+                f"5. **场景扩展库**：\n"
                 f"   - 数据完整性（必填项、默认值、数据类型）\n"
                 f"   - 业务逻辑约束（状态流转、权限控制、重复操作）\n"
                 f"   - 外部接口异常（超时、断网、返回错误）\n"
                 f"   - UI交互体验（提示文案、跳转逻辑、防误触）\n"
+                f"6. **🚫 标题与范围硬约束（最高优先级，违反即判无效）**：\n"
+                f"   - 每条用例标题必须只描述【一个验证点】，只能包含单一主语动作（如'分享按钮点击后弹出分享面板'）。\n"
+                f"   - **严禁用'且''同时''后'把多个独立验证点串成一条**，例如禁止：'点击分享按钮后编辑框消失且分享图片中贴纸旋转/缩放/拖拽状态正确'。\n"
+                f"   - 正确拆法：'分享按钮点击后编辑框正确收起'（一条）；'分享图片正确包含当前贴纸的旋转状态'（一条）；'分享图片正确包含贴纸缩放状态'（一条）。\n"
+                f"   - 一条用例的【前置条件】与【步骤】只服务于该单一验证点，不得罗列一组并列的属性状态。\n"
+                f"   - 若一个功能点存在 N 个可独立验证的状态/属性，必须拆成 N 条并列用例，不得用'且'合并成 1 条。\n"
+                f"7. **Pairwise 输出示例（须照此粒度）**：\n"
+                f"   - 假设因子 A={{开关开,开关关}}，因子 B={{权限有,权限无}}，则仅生成 2 条正交用例：\n"
+                f"       · 用例1：开关=开 且 权限=有时，分享功能正常可用\n"
+                f"       · 用例2：开关=关 且 权限=无时，分享入口置灰不可点\n"
+                f"   - 不要为 A 的 2 值 × B 的 2 值 生成 4 条全排列；更不要为 A×B×C×D 做全排列。\n"
+                f"   - 当某因子明显不影响被测功能时（如'背景颜色'不影响'分享按钮是否可点'），直接剔除该因子，不纳入组合。\n"
+                f"8. **自检门槛（生成后逐条检查）**：任一用例标题若含'且/同时/后'连接了 ≥2 个状态，或步骤里并列罗列 ≥3 个待验证属性，"
+                f"必须立即拆分成多条单点用例再输出；未完成拆分前不要交付。\n"
             ),
         }
         
-        return instructions.get(mode, instructions['smart'])
+        base = instructions.get(mode, instructions['smart'])
+        return base + (
+            "\n**视觉细节收敛（所有模式均须遵守）**：\n"
+            "图片素材/图标尺寸、像素级色值比对、动画参数等纯视觉细节不是功能测试重点，页面展示正常、无白屏/破图/资源缺失即可；"
+            "不要生成像素尺寸边界、取色比对类用例，视觉相关项合并为一条「页面与资源展示正常」用例"
+            "（需求明确把尺寸/色值作为功能验收标准的除外）。\n"
+            "性能/大数据量/多机型兼容性类用例同样须以需求明确指标或 C 端高频核心页面为依据，需求未提及时不要编造。\n"
+            "并发/幂等/超卖类业务健壮性用例（重复提交、库存争抢、同时下单等）不受上述限制，交易/库存模块应照常设计。\n"
+        )
+
+    @staticmethod
+    def _build_abnormal_scene_section(task: 'TestCaseGenerationTask') -> str:
+        """从该版本最近的覆盖率报告读取异常场景统计，按生成模式构建注入段落。
+
+        仅当存在成功报告且确有高频异常场景时才返回非空，否则返回空串（简单需求/首次生成不受影响）。
+        受限模式（smart/quick/standard）→ 易漏点提示，不改变用例总数目标；
+        comprehensive → 强制逐项覆盖。
+        """
+        if not task.version_id:
+            return ''
+        try:
+            from apps.zentao.models import CoverageReport
+        except Exception:
+            return ''
+        try:
+            report = (
+                CoverageReport.objects.filter(
+                    version_id=task.version_id, status='success'
+                )
+                .order_by('-created_at')
+                .first()
+            )
+        except Exception:
+            return ''
+        if not report:
+            return ''
+        scenes = ((report.detail or {}).get('abnormal_scenes')) or []
+        if not isinstance(scenes, list):
+            scenes = []
+        scenes = scenes[:5]
+        if not scenes:
+            return ''
+
+        lines = []
+        for sc in scenes:
+            if not isinstance(sc, dict):
+                continue
+            name = str(sc.get('type') or '').strip()
+            if not name:
+                continue
+            cnt = sc.get('count') or 0
+            examples = sc.get('examples') or []
+            ex_text = '；'.join(str(e) for e in examples[:2] if e)
+            line = f'   - {name}（历史未覆盖 {cnt} 次'
+            if ex_text:
+                line += f'，如：{ex_text}'
+            line += '）'
+            lines.append(line)
+        if not lines:
+            return ''
+
+        mode = task.generation_mode or 'smart'
+        if mode == 'comprehensive':
+            header = (
+                '\n\n【异常场景强制覆盖 - 来自历史缺陷统计】\n'
+                '该版本历史缺陷中，以下异常场景类型高频未覆盖，'
+                '请对需求涉及的每个相关功能点，逐项强制设计对应场景用例：\n'
+            )
+        else:
+            header = (
+                '\n\n【异常场景易漏点提示 - 来自历史缺陷统计】\n'
+                '该版本历史缺陷中，以下异常场景类型高频未覆盖。'
+                '请仅在需求涉及相关功能时，对最相关的场景各补充 1 条用例，'
+                '不要因此增加用例总数目标：\n'
+            )
+        return header + '\n'.join(lines) + '\n'
 
     @staticmethod
     def _build_confirmed_answers_context(task: 'TestCaseGenerationTask') -> str:
@@ -1478,12 +1803,16 @@ class AIModelService:
         # 根据生成模式构建不同的指令
         mode_instructions = AIModelService._build_generation_instructions(task)
 
+        # 异常场景类型统计注入（来自该版本覆盖率报告，按生成模式条件化措辞）
+        abnormal_scene_section = AIModelService._build_abnormal_scene_section(task)
+
         # 构建用户提示
         user_message = (
             f"请深入分析以下需求文档，并设计测试用例。\n\n"
             f"{knowledge_section}"
             f"{confirmed_block}"
             f"{mode_instructions}\n"
+            f"{abnormal_scene_section}"
             f"5. **⚠️ 输出顺序要求（必须严格执行）**：\n"
             f"   - **必须按用例编号从小到大的顺序输出**（如：001, 002, 003...或LOGIN_001, LOGIN_002, LOGIN_003...）\n"
             f"   - **绝对不能跳号、重复或乱序输出**\n"
@@ -1553,6 +1882,22 @@ class AIModelService:
             return f"评审过程中出现错误: {str(e)}\n\n建议：测试用例结构完整，可以使用。"
 
     @staticmethod
+    def append_review_history(task, feedback: str) -> None:
+        """把一轮评审反馈追加到 task.generation_log（JSON 数组），供后续生成综合参考。"""
+        import json as _json
+        history = []
+        try:
+            history = _json.loads(task.generation_log or '[]') if task.generation_log else []
+            if not isinstance(history, list):
+                history = []
+        except Exception:
+            history = []
+        history.append({
+            'time': str(timezone.now()),
+            'feedback': feedback,
+        })
+        task.generation_log = _json.dumps(history, ensure_ascii=False)
+
     async def generate_test_cases_stream(
         task: TestCaseGenerationTask,
         callback=None
@@ -1580,12 +1925,16 @@ class AIModelService:
         # 根据生成模式构建不同的指令
         mode_instructions = AIModelService._build_generation_instructions(task)
 
+        # 异常场景类型统计注入（来自该版本覆盖率报告，按生成模式条件化措辞）
+        abnormal_scene_section = AIModelService._build_abnormal_scene_section(task)
+
         # 构建用户提示
         user_message = (
             f"请深入分析以下需求文档，并设计测试用例。\n\n"
             f"{knowledge_section}"
             f"{confirmed_block}"
             f"{mode_instructions}\n"
+            f"{abnormal_scene_section}"
             f"5. **⚠️ 输出顺序要求（必须严格执行）**：\n"
             f"   - **必须按用例编号从小到大的顺序输出**（如：001, 002, 003...或LOGIN_001, LOGIN_002, LOGIN_003...）\n"
             f"   - **绝对不能跳号、重复或乱序输出**\n"
@@ -1601,10 +1950,14 @@ class AIModelService:
 
         # 流式调用API，确保正确关闭生成器
         # 使用配置的max_tokens，不硬编码限制
+        # comprehensive 模式涉及 Pairwise/归并等确定性策略，强制 temperature=0 减少输出飘移，
+        # 保证同需求两次生成结构一致、可对比（其他模式沿用 config.temperature 默认 0.7）
+        gen_temperature = 0.0 if (task.generation_mode or 'smart') == 'comprehensive' else None
         generator = AIModelService.call_openai_compatible_api_stream(
             task.writer_model_config,
             messages,
-            callback=callback
+            callback=callback,
+            temperature=gen_temperature,
             # 不再硬编码max_tokens，使用配置文件中的值（如32000）
         )
 
@@ -1629,6 +1982,16 @@ class AIModelService:
         # 统计生成的用例数量
         case_count = full_content.count('TC-') + full_content.count('TEST-') + full_content.count('测试用例')
         logger.info(f"生成用例统计: 约检测到{case_count}个用例编号标记")
+
+        # comprehensive 模式：生成后确定性去冗余（方案2 工程化兜底，收敛组合爆炸）
+        if (task.generation_mode or 'smart') == 'comprehensive':
+            try:
+                from apps.requirement_analysis.case_dedup import dedupe_comprehensive
+                deduped, raw_n, keep_n, rm_n = dedupe_comprehensive(full_content)
+                full_content = deduped
+                logger.info(f"comprehensive 去冗余: 原始 {raw_n} 条 -> 保留 {keep_n} 条（删除 {rm_n} 条同义反复/重复）")
+            except Exception as dedup_err:
+                logger.error(f"comprehensive 去冗余后处理失败，保留原始输出: {dedup_err}")
 
         return full_content
 
@@ -1777,10 +2140,14 @@ class AIModelService:
 
         # 流式调用API，确保正确关闭生成器
         # 使用配置的max_tokens，不硬编码限制
+        # comprehensive 模式涉及 Pairwise/归并等确定性策略，强制 temperature=0 减少输出飘移，
+        # 保证同需求两次生成结构一致、可对比（其他模式沿用 config.temperature 默认 0.7）
+        gen_temperature = 0.0 if (task.generation_mode or 'smart') == 'comprehensive' else None
         generator = AIModelService.call_openai_compatible_api_stream(
             task.writer_model_config,
             messages,
-            callback=callback
+            callback=callback,
+            temperature=gen_temperature,
             # 不再硬编码max_tokens，使用配置文件中的值（如32000）
         )
 
@@ -2248,161 +2615,8 @@ class AIModelService:
         return result
 
 
-class ModaoPrototype(models.Model):
-    """墨刀技能 - 需求来源（墨刀原型 / 需求文本），承载 5 阶段工作流状态与产物。"""
-    SOURCE_CHOICES = [
-        ('modao', '墨刀原型'),
-        ('webshare', 'webshare 页面树'),
-        ('text', '需求文本/文档'),
-    ]
-    STATUS_CHOICES = [
-        ('pending', '待处理'),
-        ('extracting', '读取中'),
-        ('extracted', '已读取'),
-        ('structuring', '结构化中'),
-        ('clarifying', '澄清中'),
-        ('designing', '用例设计中'),
-        ('done', '完成'),
-        ('failed', '失败'),
-    ]
-
-    uuid = models.CharField(max_length=32, unique=True, db_index=True, verbose_name='UUID')
-    title = models.CharField(max_length=200, verbose_name='标题', default='墨刀需求梳理')
-    url = models.TextField(verbose_name='原型链接', blank=True)
-    source_type = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='modao', verbose_name='来源类型')
-    auth_cookie = models.TextField(blank=True, verbose_name='登录Cookie(JSON)')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态')
-    current_stage = models.IntegerField(default=0, verbose_name='当前阶段(0-4)')
-    # 各阶段产物（文本/JSON 字符串）
-    extracted_json = models.TextField(blank=True, verbose_name='阶段0-逐页提取')
-    requirement_summary = models.TextField(blank=True, verbose_name='阶段1-需求摘要')
-    clarification_log = models.TextField(blank=True, verbose_name='阶段2-澄清记录')
-    module_split = models.TextField(blank=True, verbose_name='阶段3.1-模块拆分')
-    risks_json = models.TextField(blank=True, verbose_name='阶段3-风险')
-    pci_json = models.TextField(blank=True, verbose_name='阶段3-PCI')
-    final_testpoints_json = models.TextField(blank=True, verbose_name='阶段3-合并测试点')
-    dedup_audit_json = models.TextField(default='[]', blank=True, verbose_name='阶段3-去重审计记录')
-    testcases_json = models.TextField(blank=True, verbose_name='阶段3-用例')
-    smoke_json = models.TextField(blank=True, verbose_name='阶段3-冒烟')
-    quality_report_json = models.TextField(blank=True, verbose_name='阶段3-质量报告')
-    excel_path = models.CharField(max_length=500, blank=True, verbose_name='Excel路径')
-    stage_confirmations = models.TextField(default='{}', verbose_name='阶段确认JSON')
-    stage4_decision = models.CharField(max_length=20, blank=True, verbose_name='阶段4决策')
-    error_message = models.TextField(blank=True, verbose_name='错误信息')
-    work_log = models.TextField(blank=True, verbose_name='工作日志(各阶段进度)')
-    qa_log = models.TextField(default='[]', verbose_name='人工答疑记录(JSON数组)')
-    feature_module = models.ForeignKey('feature_modules.FeatureModule', on_delete=models.SET_NULL,
-                                       null=True, blank=True, related_name='modao_prototypes',
-                                       verbose_name='同步的顶层功能模块')
-    version = models.ForeignKey('versions.Version', on_delete=models.SET_NULL, null=True, blank=True,
-                                related_name='modao_prototypes', verbose_name='关联版本')
-    project = models.ForeignKey('projects.Project', on_delete=models.SET_NULL, null=True, blank=True, verbose_name='关联项目')
-    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='modao_prototypes', verbose_name='创建者')
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
-
-    class Meta:
-        db_table = 'modao_prototype'
-        verbose_name = '墨刀原型'
-        verbose_name_plural = '墨刀原型'
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f'Modao#{self.uuid}'
-
-    def get_confirmations(self):
-        try:
-            return json.loads(self.stage_confirmations or '{}')
-        except Exception:
-            return {}
-
-    def set_confirmation(self, stage: int, confirmed: bool = True):
-        conf = self.get_confirmations()
-        conf[f'stage{stage}_confirmed'] = confirmed
-        self.stage_confirmations = json.dumps(conf, ensure_ascii=False)
-
-    def clarification_items(self):
-        """Return structured clarification items; legacy free text has no items."""
-        raw = (self.clarification_log or '').strip()
-        if not raw:
-            return []
-        try:
-            value = json.loads(raw)
-        except Exception:
-            return []
-        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
-
-    def unresolved_clarifications(self):
-        """Items requiring a human conclusion before case generation."""
-        unresolved = []
-        for index, item in enumerate(self.clarification_items()):
-            resolution = str(item.get('resolution') or item.get('answer') or '').strip()
-            if not resolution:
-                unresolved.append({
-                    'index': index,
-                    'type': item.get('type') or '待确认',
-                    'location': item.get('location') or '',
-                    'issue': item.get('issue') or item.get('suggested_question') or '',
-                })
-        return unresolved
-
-    def case_generation_fingerprint(self):
-        """Bind human approval to the exact clarification and test-point inputs."""
-        content = '\n---CLARIFICATIONS---\n'.join([
-            self.clarification_log or '', self.final_testpoints_json or ''
-        ])
-        return hashlib.sha256(content.encode('utf-8')).hexdigest()
-
-    def case_generation_gate(self):
-        conf = self.get_confirmations()
-        unresolved = self.unresolved_clarifications()
-        current_fingerprint = self.case_generation_fingerprint()
-        approved = bool(conf.get('case_generation_approved'))
-        fingerprint_matches = (
-            approved and conf.get('case_generation_fingerprint') == current_fingerprint
-        )
-        stage2_confirmed = bool(conf.get('stage2_confirmed'))
-        reasons = []
-        if unresolved:
-            reasons.append(f'仍有 {len(unresolved)} 条位置/需求问题未填写人工结论')
-        if not stage2_confirmed:
-            reasons.append('阶段2尚未人工确认')
-        if not approved:
-            reasons.append('尚未批准生成最终测试用例')
-        elif not fingerprint_matches:
-            reasons.append('澄清结论或测试点已修改，原生成批准已失效')
-        return {
-            'allowed': not unresolved and stage2_confirmed and fingerprint_matches,
-            'unresolved_count': len(unresolved),
-            'unresolved_items': unresolved,
-            'stage2_confirmed': stage2_confirmed,
-            'approved': approved,
-            'fingerprint_matches': fingerprint_matches,
-            'reasons': reasons,
-        }
-
-class ModaoPage(models.Model):
-    """墨刀技能 - 原型单页提取结果。"""
-    prototype = models.ForeignKey(ModaoPrototype, on_delete=models.CASCADE, related_name='pages')
-    page_no = models.IntegerField(verbose_name='页码')
-    page_name = models.CharField(max_length=200, blank=True, verbose_name='页面名')
-    text = models.TextField(blank=True, verbose_name='可见文本')
-    annotations = models.TextField(default='[]', verbose_name='注释/标注(JSON)')
-    screenshot = models.CharField(max_length=500, blank=True, verbose_name='截图路径')
-
-    class Meta:
-        db_table = 'modao_page'
-        verbose_name = '墨刀页面'
-        verbose_name_plural = '墨刀页面'
-        ordering = ['page_no']
-
-    def __str__(self):
-        return f'P{self.page_no}-{self.page_name}'
-
-
-
     @staticmethod
-    async def audit_knowledge_base(
+    def audit_knowledge_base(
         task: TestCaseGenerationTask,
         test_cases: str,
         review_feedback: str = ""
@@ -2490,7 +2704,7 @@ class ModaoPage(models.Model):
                 {"role": "user", "content": user_message}
             ]
 
-            response = await AIModelService.call_openai_compatible_api(reviewer_config, messages)
+            response = asyncio.run(AIModelService.call_openai_compatible_api(reviewer_config, messages))
             result = response['choices'][0]['message']['content']
             logger.info(f"[KB审计] 任务 {task.task_id} 审计完成，结果长度={len(result) if result else 0}")
             return result
@@ -2666,3 +2880,156 @@ class ModaoPage(models.Model):
             f'跳过已存在{skipped}条, 输入{len(confirmed_answers)}条问答'
         )
         return result
+class ModaoPrototype(models.Model):
+    """墨刀技能 - 需求来源（墨刀原型 / 需求文本），承载 5 阶段工作流状态与产物。"""
+    SOURCE_CHOICES = [
+        ('modao', '墨刀原型'),
+        ('webshare', 'webshare 页面树'),
+        ('text', '需求文本/文档'),
+    ]
+    STATUS_CHOICES = [
+        ('pending', '待处理'),
+        ('extracting', '读取中'),
+        ('extracted', '已读取'),
+        ('structuring', '结构化中'),
+        ('clarifying', '澄清中'),
+        ('designing', '用例设计中'),
+        ('done', '完成'),
+        ('failed', '失败'),
+    ]
+
+    uuid = models.CharField(max_length=32, unique=True, db_index=True, verbose_name='UUID')
+    title = models.CharField(max_length=200, verbose_name='标题', default='墨刀需求梳理')
+    url = models.TextField(verbose_name='原型链接', blank=True)
+    source_type = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='modao', verbose_name='来源类型')
+    auth_cookie = models.TextField(blank=True, verbose_name='登录Cookie(JSON)')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态')
+    current_stage = models.IntegerField(default=0, verbose_name='当前阶段(0-4)')
+    # 各阶段产物（文本/JSON 字符串）
+    extracted_json = models.TextField(blank=True, verbose_name='阶段0-逐页提取')
+    requirement_summary = models.TextField(blank=True, verbose_name='阶段1-需求摘要')
+    clarification_log = models.TextField(blank=True, verbose_name='阶段2-澄清记录')
+    module_split = models.TextField(blank=True, verbose_name='阶段3.1-模块拆分')
+    risks_json = models.TextField(blank=True, verbose_name='阶段3-风险')
+    pci_json = models.TextField(blank=True, verbose_name='阶段3-PCI')
+    final_testpoints_json = models.TextField(blank=True, verbose_name='阶段3-合并测试点')
+    dedup_audit_json = models.TextField(default='[]', blank=True, verbose_name='阶段3-去重审计记录')
+    testcases_json = models.TextField(blank=True, verbose_name='阶段3-用例')
+    smoke_json = models.TextField(blank=True, verbose_name='阶段3-冒烟')
+    quality_report_json = models.TextField(blank=True, verbose_name='阶段3-质量报告')
+    excel_path = models.CharField(max_length=500, blank=True, verbose_name='Excel路径')
+    stage_confirmations = models.TextField(default='{}', verbose_name='阶段确认JSON')
+    stage4_decision = models.CharField(max_length=20, blank=True, verbose_name='阶段4决策')
+    error_message = models.TextField(blank=True, verbose_name='错误信息')
+    work_log = models.TextField(blank=True, verbose_name='工作日志(各阶段进度)')
+    qa_log = models.TextField(default='[]', verbose_name='人工答疑记录(JSON数组)')
+    feature_module = models.ForeignKey('feature_modules.FeatureModule', on_delete=models.SET_NULL,
+                                       null=True, blank=True, related_name='modao_prototypes',
+                                       verbose_name='同步的顶层功能模块')
+    version = models.ForeignKey('versions.Version', on_delete=models.SET_NULL, null=True, blank=True,
+                                related_name='modao_prototypes', verbose_name='关联版本')
+    project = models.ForeignKey('projects.Project', on_delete=models.SET_NULL, null=True, blank=True, verbose_name='关联项目')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='modao_prototypes', verbose_name='创建者')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'modao_prototype'
+        verbose_name = '墨刀原型'
+        verbose_name_plural = '墨刀原型'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'Modao#{self.uuid}'
+
+    def get_confirmations(self):
+        try:
+            return json.loads(self.stage_confirmations or '{}')
+        except Exception:
+            return {}
+
+    def set_confirmation(self, stage: int, confirmed: bool = True):
+        conf = self.get_confirmations()
+        conf[f'stage{stage}_confirmed'] = confirmed
+        self.stage_confirmations = json.dumps(conf, ensure_ascii=False)
+
+    def clarification_items(self):
+        """Return structured clarification items; legacy free text has no items."""
+        raw = (self.clarification_log or '').strip()
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except Exception:
+            return []
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    def unresolved_clarifications(self):
+        """Items requiring a human conclusion before case generation."""
+        unresolved = []
+        for index, item in enumerate(self.clarification_items()):
+            resolution = str(item.get('resolution') or item.get('answer') or '').strip()
+            if not resolution:
+                unresolved.append({
+                    'index': index,
+                    'type': item.get('type') or '待确认',
+                    'location': item.get('location') or '',
+                    'issue': item.get('issue') or item.get('suggested_question') or '',
+                })
+        return unresolved
+
+    def case_generation_fingerprint(self):
+        """Bind human approval to the exact clarification and test-point inputs."""
+        content = '\n---CLARIFICATIONS---\n'.join([
+            self.clarification_log or '', self.final_testpoints_json or ''
+        ])
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+    def case_generation_gate(self):
+        conf = self.get_confirmations()
+        unresolved = self.unresolved_clarifications()
+        current_fingerprint = self.case_generation_fingerprint()
+        approved = bool(conf.get('case_generation_approved'))
+        fingerprint_matches = (
+            approved and conf.get('case_generation_fingerprint') == current_fingerprint
+        )
+        stage2_confirmed = bool(conf.get('stage2_confirmed'))
+        reasons = []
+        if unresolved:
+            reasons.append(f'仍有 {len(unresolved)} 条位置/需求问题未填写人工结论')
+        if not stage2_confirmed:
+            reasons.append('阶段2尚未人工确认')
+        if not approved:
+            reasons.append('尚未批准生成最终测试用例')
+        elif not fingerprint_matches:
+            reasons.append('澄清结论或测试点已修改，原生成批准已失效')
+        return {
+            'allowed': not unresolved and stage2_confirmed and fingerprint_matches,
+            'unresolved_count': len(unresolved),
+            'unresolved_items': unresolved,
+            'stage2_confirmed': stage2_confirmed,
+            'approved': approved,
+            'fingerprint_matches': fingerprint_matches,
+            'reasons': reasons,
+        }
+
+class ModaoPage(models.Model):
+    """墨刀技能 - 原型单页提取结果。"""
+    prototype = models.ForeignKey(ModaoPrototype, on_delete=models.CASCADE, related_name='pages')
+    page_no = models.IntegerField(verbose_name='页码')
+    page_name = models.CharField(max_length=200, blank=True, verbose_name='页面名')
+    text = models.TextField(blank=True, verbose_name='可见文本')
+    annotations = models.TextField(default='[]', verbose_name='注释/标注(JSON)')
+    screenshot = models.CharField(max_length=500, blank=True, verbose_name='截图路径')
+
+    class Meta:
+        db_table = 'modao_page'
+        verbose_name = '墨刀页面'
+        verbose_name_plural = '墨刀页面'
+        ordering = ['page_no']
+
+    def __str__(self):
+        return f'P{self.page_no}-{self.page_name}'
+
+
+
