@@ -2442,6 +2442,7 @@ def push_report_to_knowledge(report: CoverageReport, user=None) -> dict:
                 'sort_order': sort_order,
                 'version': version,
                 'source': 'zentao_coverage',
+                'needs_review': True,  # 自动沉淀默认待复核，人工确认后才进向量召回
                 'created_by': user,
             },
         )
@@ -2549,6 +2550,87 @@ def push_report_to_knowledge(report: CoverageReport, user=None) -> dict:
             f'仅本版本 {scope_counts.get("version", 0)}，全局 {scope_counts.get("global", 0)}，'
             f'老功能优化 {scope_counts.get("legacy", 0)}）；'
             f'所有未覆盖有效 Bug 均视为可沉淀的缺失场景。'
+        ),
+    }
+
+
+# 判定"覆盖缺失重点"是否属于跨版本通用的易漏点（而非本版本专属 Bug 场景）。
+#
+# 判定标准（经用户纠正）：不是看"是否提及边界/异常/权限等测试类型词"，而是看
+# "这条坑换了版本/换了页面还会不会再犯"。只要做同类功能就必然复现的规律（如
+# 文案完整性/跨端差异、弹窗点空白自动关闭、模式数据隔离、跨月数据归属、删除后
+# 关联数据一致、切换不串布局）都应升级为跨版本通用；仅当"该版本实现了某个特定
+# 接口/字段才可能踩"的纯实现细节才是版本专属、不升。
+# 因此词表指向"会跨版本复现的固有行为规律"信号，而非具体功能名/版本号。
+_UNIVERSAL_HINTS = (
+    '文案', '跨端', 'iOS', 'Android', '完整', '缺失', '串', '隔离', '归属',
+    '联动', '回显', '折叠', '关闭', '空白', '收起', '级联', '一致', '布局',
+    '切换', '空状态', '占位', '兜底', '默认值', '竞态', '重复', '顺序', '弹窗',
+    '自动', '刷新', '同步', '错乱', '残留', '未展示', '不覆盖', '不串',
+)
+
+
+def _is_universal_knowledge_point(title: str, content: str) -> bool:
+    """粗略判定一条覆盖缺失重点是否跨版本通用（命中通用测试维度关键词）。"""
+    text = f'{title or ""}\n{content or ""}'
+    return any(hint in text for hint in _UNIVERSAL_HINTS)
+
+
+def promote_report_knowledge_to_global(
+    report: 'CoverageReport', user=None, only_universal: bool = True
+) -> dict:
+    """把本次覆盖率报告沉淀的、绑了本版本的知识升级为「跨版本通用」。
+
+    背景：push_report_to_knowledge 写入时，scope=version 的条目会绑定 report.version，
+    而生成用例的 RAG 召回（_rag_retrieve_kb）只会让"同版本"或"version 为空"的条目被召回。
+    因此 V2.0.0 踩过的坑（覆盖缺失重点）默认不会被 V3.0.0 复用，思考点容易反复遗漏。
+
+    本函数把该报告沉淀、且绑定本版本的条目：
+      1. version=None（解除版本绑定，跨版本通用）；
+      2. needs_review=False（确认进向量，否则 sync_kb_entry_to_vector 不写入）；
+      3. 重新 upsert 向量，使新版本生成用例时能被语义召回。
+
+    only_universal=True（默认）时只升级"命中通用测试维度关键词"的易漏点，
+    避免把本版本专属 Bug 场景细节污染全局；传 False 则把本次沉淀全部升级。
+    """
+    from apps.projects.models import ProjectKnowledge
+    from apps.requirement_analysis.models import AIModelService
+
+    if report.status != 'success':
+        raise RuntimeError('仅成功的覆盖率报告可升级知识')
+    if not report.config.project_id:
+        raise RuntimeError('该配置未关联 TestHub 项目，无法升级知识')
+
+    qs = ProjectKnowledge.objects.filter(
+        project=report.config.project,
+        source='zentao_coverage',
+        version=report.version,
+    )
+    promoted = skipped = 0
+    promoted_titles: List[str] = []
+    for entry in qs:
+        if only_universal and not _is_universal_knowledge_point(entry.title, entry.content):
+            skipped += 1
+            continue
+        entry.version = None
+        entry.needs_review = False
+        entry.save(update_fields=['version', 'needs_review', 'updated_at'])
+        try:
+            AIModelService.sync_kb_entry_to_vector(entry, 'upsert')
+        except Exception as exc:
+            logger.warning('升级知识向量化失败 %s: %s', entry.title, exc)
+        promoted += 1
+        promoted_titles.append(entry.title)
+
+    return {
+        'promoted': promoted,
+        'skipped_version_only': skipped,
+        'promoted_titles': promoted_titles,
+        'only_universal': only_universal,
+        'message': (
+            f'已升级 {promoted} 条覆盖缺失重点为跨版本通用'
+            + (f'（{skipped} 条本版本专属场景未升级）' if skipped else '')
+            + '；新版本生成用例时将自动语义召回这些易漏点。'
         ),
     }
 

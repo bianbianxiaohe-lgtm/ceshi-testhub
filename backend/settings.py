@@ -57,6 +57,7 @@ LOCAL_APPS = [
     'apps.analytics',
     'apps.app_automation.apps.AppAutomationConfig',
     'apps.api_agent',
+    'apps.zentao',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -324,6 +325,11 @@ LOGGING = {
             'handlers': ['file', 'console'],
             'level': 'INFO',
             'propagate': True,
+        },
+        'apps.zentao': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
         },
     },
 }
