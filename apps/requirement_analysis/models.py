@@ -879,8 +879,20 @@ class AIModelService:
 
     @staticmethod
     def sync_kb_entry_to_vector(entry, action='upsert'):
-        """知识条目增删改后同步 Chroma 向量（写入点钩子调用）。"""
+        """知识条目增删改后同步 Chroma 向量（写入点钩子调用）。
+
+        待复核（needs_review=True）的条目不进入向量召回：自动沉淀的未确认条目
+        在被人工确认前不应污染生成提示词。
+        """
         from .vector_store import get_project_kb_collection, upsert_kb_item, delete_kb_item
+        # 待复核条目：确保其在向量库中不存在（直接删除后返回）
+        if getattr(entry, 'needs_review', False):
+            try:
+                collection = get_project_kb_collection(entry.project_id)
+                delete_kb_item(collection, f'pk_{entry.id}')
+            except Exception:
+                pass
+            return
         try:
             embedder = AIModelConfig.get_active_embedder()
             if not embedder:
@@ -3021,6 +3033,30 @@ class ModaoPage(models.Model):
     text = models.TextField(blank=True, verbose_name='可见文本')
     annotations = models.TextField(default='[]', verbose_name='注释/标注(JSON)')
     screenshot = models.CharField(max_length=500, blank=True, verbose_name='截图路径')
+    selected = models.BooleanField(default=True, verbose_name='纳入后续流程')
+    recognition_note = models.CharField(max_length=200, blank=True, verbose_name='识别准确率标注')
+
+    # ---------- 画布级独立流水线状态（A2-b：进度/回退/重跑，产物仍任务级聚合）----------
+    PAGE_STAGE_CHOICES = [
+        (0, '待读取'),
+        (1, '已结构化'),
+        (2, '已澄清'),
+        (3, '已生成测试点/用例'),
+        (4, '已冒烟决策'),
+    ]
+    PAGE_STATUS_CHOICES = [
+        ('pending', '待处理'),
+        ('extracting', '读取中'),
+        ('done', '完成'),
+        ('failed', '失败'),
+        ('needs_rerun', '需重跑'),
+    ]
+    current_stage = models.IntegerField(default=0, verbose_name='画布当前阶段(0-4)')
+    stage_status = models.CharField(max_length=20, choices=PAGE_STATUS_CHOICES, default='pending', verbose_name='画布子状态')
+    work_log = models.TextField(blank=True, verbose_name='画布级工作日志')
+    error_message = models.TextField(blank=True, verbose_name='画布错误信息')
+    # 回退标记：JSON 数组，记录该画布需要重跑的阶段序号（如 [1,2] 表示需重跑结构化与澄清）
+    rerun_stages = models.TextField(default='[]', blank=True, verbose_name='需重跑阶段标记(JSON)')
 
     class Meta:
         db_table = 'modao_page'
@@ -3030,6 +3066,26 @@ class ModaoPage(models.Model):
 
     def __str__(self):
         return f'P{self.page_no}-{self.page_name}'
+
+    def get_rerun_stages(self):
+        try:
+            v = json.loads(self.rerun_stages or '[]')
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    def set_rerun_stages(self, stages):
+        self.rerun_stages = json.dumps(sorted(set(int(s) for s in stages)), ensure_ascii=False)
+
+    def mark_stage(self, stage, status='done', log=None, error=None):
+        """统一推进画布级进度。"""
+        self.current_stage = max(self.current_stage, stage)
+        self.stage_status = status
+        if log:
+            ts = timezone.now().strftime('%Y-%m-%d %H:%M:%S')
+            self.work_log = (self.work_log or '') + f'[{ts}] {log}\n'
+        if error is not None:
+            self.error_message = error
 
 
 

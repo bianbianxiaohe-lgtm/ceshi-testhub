@@ -108,17 +108,20 @@ ambiguous_points:
     issue: <问题描述>
     current_guess: <基于现有信息/知识库/行业惯例的推测结论；若推测唯一且无产品自定义空间，则此问题可收敛为确定结论，标为已确定并给出结论>
     suggested_question: <建议向产品确认的具体问题；若 current_guess 已确定为唯一结论，则 suggested_question 填空>
+    status: <converged | pending；current_guess 唯一且无产品自定义空间 → converged（suggested_question 必须填空）；否则 pending（必须给出可执行的问题）>
     priority: 高/中/低
 missing_points:
   - scenario: <完成当前明确流程所缺少的信息>
     basis: <为什么该信息是当前流程必需的>
     impact: <影响哪些模块>
     current_guess: <基于现有信息的最合理推测；若可确定则给出结论，否则留待确认>
+    status: <converged | pending；可确定 → converged；确实需要产品拍板 → pending>
 boundary_points:
   - issue: <与现有功能的边界问题>
     evidence: <相关原文或 "未找到直接原文">
     impact: <影响范围>
     current_guess: <基于现有信息的最合理推测；若可确定则给出结论，否则留待确认>
+    status: <converged | pending；可确定 → converged；确实需要产品拍板 → pending>
 ```
 
 ## 🔍 P0/P1/P2 判定规则
@@ -135,6 +138,7 @@ boundary_points:
 - ❌ 将多个页面的句子重新拼接后放进一对引号冒充原文
 - ❌ source_evidence 使用模型总结、同义改写或原文中不存在的文字
 - ❌ 为满足格式或数量要求强行生成问题
+- ❌ 省略 ambiguous_points / missing_points / boundary_points 三个字段（确实没有时也必须输出空列表 []）
 - ❌ 业务流写"详见原文"
 - ❌ 原文没有优先级时伪造原文依据；此时必须标记 priority_source: 模型建议
 

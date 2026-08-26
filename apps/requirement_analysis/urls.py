@@ -24,11 +24,13 @@ from .views import (
 )
 from .modao_views import (
     modao_list, modao_create, modao_extract, modao_reset, modao_terminate, modao_struct, modao_clarify, modao_design,
+    modao_update_pages,
     modao_generate_cases, modao_approve_case_generation,
     modao_confirm, modao_smoke, modao_detail, modao_excel,     modao_edit, modao_ask, modao_adopt,
     modao_adopt_single,
     modao_log_viewer, modao_log_raw,
     modao_export_xmind, modao_import_xmind,
+    modao_page_reset,
 )
 
 # 创建DRF路由器
@@ -69,6 +71,8 @@ urlpatterns = [
     path('api/modao/<int:pk>/reset/', modao_reset, name='modao-reset'),
     path('api/modao/<int:pk>/terminate/', modao_terminate, name='modao-terminate'),
     path('api/modao/<int:pk>/struct/', modao_struct, name='modao-struct'),
+    path('api/modao/<int:pk>/update-pages/', modao_update_pages, name='modao-update-pages'),
+    path('api/modao/<int:pk>/page-reset/', modao_page_reset, name='modao-page-reset'),
     path('api/modao/<int:pk>/clarify/', modao_clarify, name='modao-clarify'),
     path('api/modao/<int:pk>/design/', modao_design, name='modao-design'),
     path('api/modao/<int:pk>/generate-cases/', modao_generate_cases, name='modao-generate-cases'),

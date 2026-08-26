@@ -1299,6 +1299,32 @@ class GenerationConfigViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+def _recover_stale_task(task, stale_minutes=30):
+    """自动回收卡死的生成任务：容器重启/进程被杀后，后台线程已死。
+    若进行中状态超过 stale_minutes 无更新，按已有产物恢复，避免前端永久转圈。"""
+    from django.utils import timezone as _tz
+    if task.status not in ('generating', 'reviewing', 'revising'):
+        return
+    if not task.updated_at:
+        return
+    elapsed = (_tz.now() - task.updated_at).total_seconds()
+    if elapsed < stale_minutes * 60:
+        return
+    if task.final_test_cases or task.review_feedback:
+        task.status = 'completed'
+        task.progress = 100
+        task.save(update_fields=['status', 'progress'])
+        logger.warning('[stale-recover] task %s stale %.0fs -> completed（保留已有产物）', task.task_id, elapsed)
+    else:
+        task.status = 'failed'
+        task.error_message = (
+            f'任务执行超时（已超过 {stale_minutes} 分钟无更新，'
+            f'可能因线程中断/容器重启导致）。请重新触发生成。'
+        )
+        task.save(update_fields=['status', 'error_message'])
+        logger.warning('[stale-recover] task %s stale %.0fs -> failed', task.task_id, elapsed)
+
+
 class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     """测试用例生成任务视图集"""
     queryset = TestCaseGenerationTask.objects.all()
@@ -1306,6 +1332,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
     pagination_class = TestCaseGenerationTaskPagination
     http_method_names = ['get', 'post', 'patch', 'delete']  # 允许GET、POST、PATCH和DELETE方法
     lookup_field = 'task_id'  # 使用task_id作为查找字段
+
+    def retrieve(self, request, *args, **kwargs):
+        task = self.get_object()
+        _recover_stale_task(task)
+        return super().retrieve(request, *args, **kwargs)
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1668,7 +1699,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                         task.review_feedback = ''.join(review_buffer)
                                                         task.review_count = 1
                                                         task.review_updated_at = timezone.now()
-                                                        task.save(update_fields=['review_feedback', 'review_count', 'review_updated_at'])
+                                                        AIModelService.append_review_history(task, task.review_feedback)
+                                                        task.save(update_fields=['review_feedback', 'review_count', 'review_updated_at', 'generation_log'])
                                                     logger.info(f"任务 {task.task_id} 流式评审完成")
 
                                                     # 自动提取不确定项并填充 human_feedback
@@ -1832,7 +1864,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                     task.review_feedback = review_feedback
                                                     task.review_count = 1
                                                     task.review_updated_at = timezone.now()
-                                                    task.save(update_fields=['review_feedback', 'review_count', 'review_updated_at'])
+                                                    AIModelService.append_review_history(task, review_feedback)
+                                                    task.save(update_fields=['review_feedback', 'review_count', 'review_updated_at', 'generation_log'])
                                                     logger.info(f"任务 {task.task_id} 评审完成")
 
                                                     # 自动提取不确定项并填充 human_feedback
@@ -2028,6 +2061,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
         try:
             # DRF会根据lookup_field自动从URL提取task_id并调用get_object()
             task = self.get_object()
+            _recover_stale_task(task)
 
             return Response({
                 'task_id': task.task_id,
@@ -2351,6 +2385,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                         tc = TestCase.objects.create(
                             project=project,
                             author=task.created_by,
+                            source='ai',
                             title=test_case.get('scenario', '测试用例'),
                             description=test_case.get('scenario', ''),
                             preconditions=test_case.get('precondition', ''),
@@ -2500,6 +2535,7 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     tc = TestCase.objects.create(
                         project=project,  # 使用统一的项目选择逻辑
                         author=task.created_by,
+                        source='ai',
                         title=test_case.get('scenario', '测试用例'),
                         description=test_case.get('scenario', ''),  # 使用scenario作为描述
                         preconditions=test_case.get('precondition', ''),
@@ -2602,9 +2638,14 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 adopted_count = 0
                 batch_time = timezone.now()  # 同一批采纳共享创建时间，保证整块排序
                 for sort_idx, case_data in enumerate(test_cases_data, 1):
+                    # 缺操作步骤的用例显式标记，避免伪装成有效步骤
+                    if not (case_data.get('steps') or '').strip() and (case_data.get('title') or case_data.get('description')):
+                        case_data['steps'] = '【步骤缺失，请补充操作步骤】'
+                        case_data['steps_missing'] = True
                     tc = TestCase.objects.create(
                         project=project,  # 使用统一的项目选择逻辑
                         author=task.created_by,
+                        source='ai',
                         title=case_data.get('title', '测试用例'),
                         description=case_data.get('description', ''),
                         preconditions=case_data.get('preconditions', ''),
@@ -3004,6 +3045,157 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @action(detail=True, methods=['post'], url_path='regenerate-case')
+    def regenerate_case(self, request, task_id=None):
+        """单条重试：对缺少操作步骤的用例重新生成步骤，并回写该行 markdown。"""
+        import re as _re
+        task = self.get_object()
+        case_id = str(request.data.get('caseId') or request.data.get('case_id') or '').strip()
+        if not case_id:
+            return Response({'error': '缺少 caseId'}, status=status.HTTP_400_BAD_REQUEST)
+        if not task.writer_model_config:
+            return Response({'error': '缺少编写模型配置'}, status=status.HTTP_400_BAD_REQUEST)
+
+        content = task.final_test_cases or ''
+        lines = content.split('\n')
+        target_idx = None
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith('|') and f'| {case_id} |' in ln:
+                target_idx = i
+                break
+        if target_idx is None:
+            return Response({'error': f'未找到用例 {case_id}'}, status=status.HTTP_404_NOT_FOUND)
+
+        # 定位表头与步骤列
+        headers = None
+        for ln in lines[:target_idx]:
+            s = ln.strip()
+            if s.startswith('|') and ('步骤' in s or '场景' in s):
+                headers = [c.strip().lower() for c in s.strip().strip('|').split('|')]
+                break
+        step_idx = None
+        if headers:
+            step_idx = next(
+                (j for j, h in enumerate(headers)
+                 if '步骤' in h and '预期' not in h and '结果' not in h),
+                None,
+            )
+        if step_idx is None:
+            return Response({'error': '无法定位步骤列'}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw = lines[target_idx]
+        cells = [c.strip() for c in raw.strip().strip('|').split('|')]
+        if step_idx >= len(cells):
+            return Response({'error': '无法定位步骤单元格'}, status=status.HTTP_400_BAD_REQUEST)
+        if cells[step_idx] and '【步骤缺失' not in cells[step_idx] and '参考测试目标' not in cells[step_idx]:
+            return Response({'error': '该用例已有操作步骤，无需重试'}, status=status.HTTP_400_BAD_REQUEST)
+
+        scenario = cells[1] if len(cells) > 1 else ''
+        precondition = cells[2] if len(cells) > 2 else ''
+        expected = cells[step_idx + 1] if step_idx + 1 < len(cells) else ''
+        if expected.lower() in ('用例id', '测试目标', '前置条件', '操作步骤', '测试步骤', '预期结果', '优先级'):
+            expected = ''
+
+        prompt = (
+            '以下是生成的一条测试用例，缺少「操作步骤」。请根据用例信息补充 2~5 条具体的、可执行的测试操作步骤。\n\n'
+            f'用例编号：{case_id}\n'
+            f'测试目标：{scenario or ""}\n'
+            f'前置条件：{precondition or ""}\n'
+            f'预期结果：{expected or ""}\n\n'
+            '只输出 JSON：{"steps": ["步骤1", "步骤2", ...]}，不要输出任何解释文字。'
+        )
+        from apps.requirement_analysis.models import AIModelService
+        import asyncio as _asyncio
+        result = _asyncio.run(AIModelService.call_openai_compatible_api(
+            task.writer_model_config, [{'role': 'user', 'content': prompt}],
+            max_tokens=1500, temperature=0,
+        ))
+        raw_out = (result['choices'][0]['message']['content'] or '')
+        m = _re.search(r'\{.*\}', raw_out, _re.DOTALL)
+        steps_list = []
+        if m:
+            try:
+                steps_list = (json.loads(m.group(0)) or {}).get('steps') or []
+            except Exception:
+                steps_list = []
+        if not isinstance(steps_list, list) or not any(str(s).strip() for s in steps_list):
+            return Response(
+                {'error': 'AI 未能生成有效步骤，请稍后重试或手动补充'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        steps_text = '<br>'.join(
+            f'{i + 1}. {str(s).strip()}' for i, s in enumerate(steps_list) if str(s).strip()
+        )
+        cells[step_idx] = steps_text
+        # 截掉嵌入表头的残留单元格（LLM 偶发把表头写进数据行）
+        header_words = ('用例id', '测试目标', '前置条件', '操作步骤', '测试步骤', '预期结果', '优先级', '测试类型', '关联需求')
+        cut = next(
+            (j for j in range(step_idx + 1, len(cells)) if cells[j].lower() in header_words),
+            None,
+        )
+        if cut is not None:
+            cells = cells[:cut]
+        ncols = len(headers) if headers else 8
+        while len(cells) < ncols:
+            cells.append('')
+        cells = cells[:ncols]
+        lines[target_idx] = '| ' + ' | '.join(cells) + ' |'
+        task.final_test_cases = '\n'.join(lines)
+        task.save(update_fields=['final_test_cases'])
+        logger.info(f"[regenerate-case] 任务 {task.task_id} 用例 {case_id} 步骤已重新生成")
+        return Response({
+            'message': '步骤已重新生成',
+            'task': self.get_serializer(task).data,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='repair-table')
+    def repair_table(self, request, task_id=None):
+        """整表修复：把 final_test_cases 交给 LLM 重排为规范表格，
+        修复「表头嵌入数据行 / 重复行 / 步骤列截断」等格式问题（一次调用）。"""
+        task = self.get_object()
+        if not task.writer_model_config:
+            return Response({'error': '缺少编写模型配置'}, status=status.HTTP_400_BAD_REQUEST)
+        content = task.final_test_cases or ''
+        if not content.strip():
+            return Response({'error': '没有可修复的内容'}, status=status.HTTP_400_BAD_REQUEST)
+
+        prompt = (
+            '下面是 AI 生成的测试用例 Markdown 表格，存在格式问题：'
+            '部分数据行中嵌入了表头（如「用例ID | 测试目标 | 前置条件 | …」）、重复行、'
+            '或步骤/预期结果列被截断。请把它重排为规范的 Markdown 表格：\n'
+            '1. 只保留有效用例行，删除嵌入的表头残留和重复内容；\n'
+            '2. 每行必须包含：用例ID、测试目标、前置条件、测试步骤、预期结果、优先级；\n'
+            '3. 步骤确实缺失的行保留，但测试步骤列填「【步骤缺失，请补充操作步骤】」；\n'
+            '4. 不要改写或增删用例内容，只修复格式。\n\n'
+            '只输出修复后的 Markdown 表格，不要任何解释文字。\n\n原始内容：\n' + content
+        )
+        from apps.requirement_analysis.models import AIModelService
+        import asyncio as _asyncio
+        try:
+            result = _asyncio.run(AIModelService.call_openai_compatible_api(
+                task.writer_model_config, [{'role': 'user', 'content': prompt}],
+                max_tokens=16000, temperature=0,
+            ))
+        except Exception as e:
+            logger.error(f"[repair-table] 任务 {task.task_id} 修复失败: {e}")
+            return Response({'error': f'AI 修复失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        repaired = (result['choices'][0]['message']['content'] or '').strip()
+        if not repaired:
+            return Response({'error': 'AI 未能生成修复结果'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # 剥除可能的 markdown 代码块包裹
+        if repaired.startswith('```'):
+            repaired = repaired.strip('`').strip()
+            if repaired.startswith('markdown'):
+                repaired = repaired[len('markdown'):].strip()
+        task.final_test_cases = repaired
+        task.save(update_fields=['final_test_cases'])
+        logger.info(f"[repair-table] 任务 {task.task_id} 表格格式已修复")
+        return Response({
+            'message': '表格格式已修复',
+            'task': self.get_serializer(task).data,
+        }, status=status.HTTP_200_OK)
+
     def _parse_test_cases_content(self, content):
         """解析测试用例内容 - 支持多种格式"""
         if not content:
@@ -3069,6 +3261,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 elif any(keyword in header for keyword in ['优先级', 'priority']):
                     test_case['priority'] = value
             
+            # 缺操作步骤的用例显式标记，避免伪装成有效步骤
+            if not (test_case.get('steps') or '').strip() and test_case.get('scenario'):
+                test_case['steps'] = '【步骤缺失，请补充操作步骤】'
+                test_case['steps_missing'] = True
             if test_case.get('scenario') or test_case.get('steps'):
                 test_cases.append(test_case)
                 logger.debug(f"解析出表格测试用例: {test_case}")
@@ -3345,6 +3541,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                         return response['choices'][0]['message']['content']
                     
                     review_feedback = asyncio.run(call_ai_async())
+                    if not review_feedback or not review_feedback.strip():
+                        raise ValueError('评审模型返回空内容：请检查 reviewer 配置（推理模型需读取 reasoning_content）')
                     logger.info(f"[RERUN] AI评审返回，长度={len(review_feedback) if review_feedback else 0}")
                     
                     # === 阶段3: 同步保存结果 ===
@@ -3374,14 +3572,13 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     task_in_thread.completed_at = timezone.now()
                     task_in_thread.review_count = (task_in_thread.review_count or 0) + 1
                     task_in_thread.review_updated_at = timezone.now()
-                    task_in_thread.save(update_fields=['review_feedback', 'human_feedback', 'status', 'progress', 'completed_at', 'review_count', 'review_updated_at'])
+                    AIModelService.append_review_history(task_in_thread, review_feedback)
+                    task_in_thread.save(update_fields=['review_feedback', 'human_feedback', 'status', 'progress', 'completed_at', 'review_count', 'review_updated_at', 'generation_log'])
                     logger.info(f"[RERUN] 任务 {task_id} 重新评审完成")
                     
                     # === 评审完成后自动触发知识库审计 ===
                     try:
-                        audit_result = asyncio.run(
-                            AIModelService.audit_knowledge_base(task_in_thread, test_cases, review_feedback)
-                        )
+                        audit_result = AIModelService.audit_knowledge_base(task_in_thread, test_cases, review_feedback)
                         if audit_result:
                             task_in_thread.kb_audit_result = audit_result
                             task_in_thread.save(update_fields=['kb_audit_result'])
@@ -3460,13 +3657,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     test_cases_val = task_in_thread.final_test_cases or task_in_thread.generated_test_cases
                     review_val = task_in_thread.review_feedback or ""
                     
-                    async def run_audit():
-                        from apps.requirement_analysis.models import AIModelService
-                        return await AIModelService.audit_knowledge_base(
-                            task_in_thread, test_cases_val, review_val
-                        )
-                    
-                    audit_result = asyncio.run(run_audit())
+                    from apps.requirement_analysis.models import AIModelService
+                    audit_result = AIModelService.audit_knowledge_base(
+                        task_in_thread, test_cases_val, review_val
+                    )
                     logger.info(f"[KB审计] 任务 {task_id} 审计结果长度={len(audit_result) if audit_result else 0}")
                     
                     if audit_result:

@@ -12,7 +12,20 @@
     <!-- 历史记录 -->
     <el-card class="history-card" shadow="never">
       <template #header>
-        <span><b>📋 历史流程</b>（点击「继续」可恢复上次进度）</span>
+        <div class="history-header">
+          <span><b>📋 历史流程</b>（点击「继续」可恢复上次进度）</span>
+          <div class="history-filters">
+            <el-select v-model="filterProject" size="small" clearable placeholder="选择项目" style="width:160px"
+              :loading="loadingProjects" @change="onFilterProjectChange">
+              <el-option v-for="p in projects" :key="p.id" :label="p.name" :value="p.id" />
+            </el-select>
+            <el-select v-model="filterVersion" size="small" clearable placeholder="选择版本" style="width:160px"
+              :disabled="!filterProject" @change="loadHistory">
+              <el-option v-for="v in filterVersions" :key="v.id" :label="v.name" :value="v.id" />
+            </el-select>
+            <el-button size="small" @click="loadHistory" :loading="loadingHistory">刷新</el-button>
+          </div>
+        </div>
       </template>
       <div v-if="history.length === 0 && !loadingHistory" class="empty-hint">
         暂无历史记录，先在下方「阶段0·原型接入」创建一次吧。
@@ -136,7 +149,110 @@
       <el-button v-if="proto && proto.status === 'extracting'" :loading="true">读取中…</el-button>
       <el-button v-if="proto && proto.status === 'extracting'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
       <el-button v-if="proto && proto.status === 'extracted' && proto.current_stage >= 0"
-        type="success" @click="goStep(1)">✅ 已读取，进入阶段1</el-button>
+        type="success" @click="enterCanvasReview">✅ 已读取，校验画布模块</el-button>
+      <el-button v-if="proto && canvasPages.length" size="small" type="warning" plain
+        @click="openCanvasManage">✏️ 管理画布</el-button>
+    </el-card>
+
+    <!-- 画布/模块人工校验（阶段0读取后、需求结构化前） -->
+    <el-card v-if="proto && proto.status === 'extracted' && !canvasConfirmed && canvasPages.length"
+      class="stage-card canvas-review-card">
+      <template #header>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <b>画布模块校验 · 选择参与需求结构化的画布</b>
+          <el-button v-if="step > 0" size="small" type="primary" plain @click="canvasConfirmed = true; goStep(1)">↩ 跳过校验</el-button>
+        </div>
+      </template>
+      <el-alert type="info" :closable="false" show-icon
+        title="逐一核对每个画布的识别结果，取消勾选不需要的画布，或标记识别准确率。仅勾选的画布会进入需求结构化。" />
+      <div class="canvas-review-body">
+        <!-- 左侧：画布模块列表 -->
+        <div class="canvas-list">
+          <div class="canvas-list-toolbar">
+            <el-checkbox :value="canvasAllSelected" @change="toggleSelectAll">全选</el-checkbox>
+            <span class="canvas-count">已选 {{ canvasSelectedCount }}/{{ canvasPages.length }}</span>
+          </div>
+          <div
+            v-for="(c, idx) in canvasPages"
+            :key="c.id"
+            class="canvas-card"
+            :class="{ active: canvasActiveId === c.id, unchecked: !c.selected, 'auto-filtered': isAutoFiltered(c) }"
+            @click="canvasActiveId = c.id">
+            <div class="canvas-card-head">
+              <el-checkbox :value="c.selected" @click.stop
+                @change="val => onCanvasToggle(c, val)" />
+              <span class="canvas-no">{{ String(idx + 1).padStart(2, '0') }}</span>
+              <el-input v-model="c.page_name" size="small" class="canvas-name-input"
+                @click.stop @input="markCanvasDirty(c)" placeholder="画布名" />
+              <el-tag v-if="c.duplicate_of_page" size="mini" type="info">重复</el-tag>
+              <el-tag v-if="isAutoFiltered(c)" size="mini" type="info" class="auto-filter-tag">自动过滤</el-tag>
+            </div>
+            <div v-if="isAutoFiltered(c)" class="canvas-auto-filter-reason">{{ c.recognition_note }}</div>
+            <div class="canvas-card-meta">
+              <el-tag v-if="!c.visionAttempted" size="mini" type="warning">未视觉识别</el-tag>
+              <el-tag v-else-if="c.visionSuccess" size="mini" type="success">视觉✓</el-tag>
+              <el-tag v-else size="mini" type="danger">视觉✗</el-tag>
+              <el-tag v-if="c.warnings && c.warnings.length" size="mini" type="warning">
+                警告{{ c.warnings.length }}</el-tag>
+              <el-tag size="mini" type="info">文本{{ (c.text || '').length }}字</el-tag>
+              <el-tag size="mini" :type="canvasStageType(c)" effect="dark">画布·{{ canvasStageLabel(c) }}</el-tag>
+            </div>
+            <!-- 画布级流水线进度条（A2-b）：显示该画布已走到哪一步 -->
+            <div class="canvas-card-progress" @click.stop>
+              <el-steps :active="c.current_stage" align-center finish-status="success" size="mini">
+                <el-step title="读取" />
+                <el-step title="结构化" />
+                <el-step title="澄清" />
+                <el-step title="用例" />
+                <el-step title="冒烟" />
+              </el-steps>
+            </div>
+            <div class="canvas-card-accuracy" @click.stop>
+              <el-select v-model="c.recognition_note" size="small" placeholder="识别准确率" @change="markCanvasDirty(c)">
+                <el-option label="准确" value="准确" />
+                <el-option label="基本准确" value="基本准确" />
+                <el-option label="偏差较大" value="偏差较大" />
+                <el-option label="需重读" value="需重读" />
+              </el-select>
+              <el-dropdown trigger="click" @command="cmd => onPageReset(c, cmd)" :disabled="isRunning">
+                <el-button size="mini" type="warning" plain>↩ 回退 ▼</el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="1">回退到「读取」(重读此画布)</el-dropdown-item>
+                    <el-dropdown-item command="2">回退到「结构化」</el-dropdown-item>
+                    <el-dropdown-item command="3">回退到「澄清」</el-dropdown-item>
+                    <el-dropdown-item command="4">回退到「用例」</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+              <el-button size="mini" type="danger" plain @click="onCanvasDelete(c)">删除</el-button>
+            </div>
+          </div>
+        </div>
+        <!-- 右侧：画布预览 -->
+        <div class="canvas-preview" v-if="canvasActive">
+          <div class="canvas-preview-head">
+            <b>{{ canvasActive.page_name || '未命名画布' }}</b>
+            <span class="canvas-preview-no">第{{ canvasActive.page_no }}页</span>
+          </div>
+          <img v-if="canvasActive.screenshot" :src="mediaUrl(canvasActive.screenshot)"
+            class="canvas-preview-img" alt="画布截图" />
+          <div v-else class="canvas-preview-noshot">无截图</div>
+          <div class="canvas-preview-text">
+            <div class="canvas-preview-subtitle">识别文本</div>
+            <pre class="md-box">{{ canvasActive.text || '（无文本）' }}</pre>
+            <div v-if="canvasActive.annotations && canvasActive.annotations.length" class="canvas-preview-subtitle">注释/标注</div>
+            <pre v-if="canvasActive.annotations && canvasActive.annotations.length" class="md-box">{{ canvasActive.annotations }}</pre>
+            <div v-if="canvasActive.warnings && canvasActive.warnings.length" class="canvas-preview-subtitle">提取警告</div>
+            <pre v-if="canvasActive.warnings && canvasActive.warnings.length" class="md-box warn">{{ canvasActive.warnings.join('\n') }}</pre>
+          </div>
+        </div>
+        <div class="canvas-preview empty" v-else>请选择左侧画布查看预览</div>
+      </div>
+      <div class="canvas-review-actions">
+        <el-button type="primary" :loading="canvasSaving" @click="saveCanvasReview">保存校验结果并进入需求结构化</el-button>
+        <el-button @click="resetCanvasReview">重置</el-button>
+      </div>
     </el-card>
 
     <!-- 阶段1：需求通读 -->
@@ -145,6 +261,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between">
           <b>阶段1 · 需求通读</b>
           <el-button v-if="step > 1" size="small" type="primary" plain @click="goStep(1)">↩ 回到此阶段</el-button>
+          <el-button v-if="canvasPages.length" size="small" type="warning" plain @click="openCanvasManage">✏️ 管理画布</el-button>
         </div>
       </template>
       <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onStruct">运行需求结构化</el-button>
@@ -417,6 +534,7 @@
                   @click.stop="adoptSingleCase(tc._rawIndex !== undefined ? tc._rawIndex : tc.index ?? ti, 'tc-'+gi+'-'+ti)">📥 采纳</el-button>
                 <span v-else class="adopted-badge">✅ 已采纳</span>
               </div>
+              <el-alert v-if="tc.steps_missing || tc.steps === '【步骤缺失，请补充操作步骤】'" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
               <div v-if="tc.precondition || tc.preconditions" class="main-page-card-extra"><b>前置：</b>{{ tc.precondition || tc.preconditions }}</div>
               <ol v-if="Array.isArray(tc.steps) && tc.steps.length" class="main-page-tc-steps"><li v-for="(s, si) in tc.steps" :key="si">{{ s }}</li></ol>
               <div v-else-if="tc.steps" class="main-page-card-extra"><b>步骤：</b>{{ tc.steps }}</div>
@@ -517,6 +635,7 @@
                 <el-tag size="mini" :type="tc.type === 'UI' ? '' : 'warning'">{{ tc.type || '功能' }}</el-tag>
                 <el-tag v-if="tc.is_smoke" size="mini" type="success">冒烟</el-tag>
               </div>
+              <el-alert v-if="tc.steps_missing || tc.steps === '【步骤缺失，请补充操作步骤】'" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
               <div class="tc-card-body">
                 <div v-if="tc.precondition || tc.preconditions"><b>前置条件：</b>{{ tc.precondition || tc.preconditions }}</div>
                 <ol v-if="Array.isArray(tc.steps) && tc.steps.length" class="tc-steps">
@@ -726,6 +845,48 @@
         <el-button type="primary" :disabled="!quickVersionName.trim()" @click="createQuickVersion">创建</el-button>
       </template>
     </el-dialog>
+
+    <!-- 画布管理（二级页面）：随时勾选/改名/删除，显示每条画布参与到的整体阶段 -->
+    <el-dialog v-model="canvasManageVisible" title="管理画布 · 选择参与后续工作流的画布" width="720px" append-to-body
+      @open="onCanvasManageOpen">
+      <el-alert type="info" :closable="false" show-icon
+        title="勾选的画布会参与需求结构化与后续用例生成；取消勾选则从工作流中排除（已产生的产物不受影响）。保存后若已运行过结构化，需回到阶段1重新运行以纳入变更。" />
+      <div class="canvas-list" style="max-height:460px;margin-top:12px">
+        <div class="canvas-list-toolbar">
+          <el-checkbox :value="canvasAllSelected" @change="toggleSelectAll">全选</el-checkbox>
+          <span class="canvas-count">已选 {{ canvasSelectedCount }}/{{ canvasPages.length }}</span>
+        </div>
+        <div
+          v-for="(c, idx) in canvasPages"
+          :key="c.id"
+          class="canvas-card"
+          :class="{ active: canvasActiveId === c.id, unchecked: !c.selected, 'auto-filtered': isAutoFiltered(c) }"
+          @click="canvasActiveId = c.id">
+          <div class="canvas-card-head">
+            <el-checkbox :value="c.selected" @click.stop
+              @change="val => onCanvasToggle(c, val)" />
+            <span class="canvas-no">{{ String(idx + 1).padStart(2, '0') }}</span>
+            <el-input v-model="c.page_name" size="small" class="canvas-name-input"
+              @click.stop @input="markCanvasDirty(c)" placeholder="画布名" />
+            <el-tag v-if="c.duplicate_of_page" size="mini" type="info">重复</el-tag>
+            <el-tag v-if="isAutoFiltered(c)" size="mini" type="info" class="auto-filter-tag">自动过滤</el-tag>
+            <el-tag size="mini" :type="canvasStageTag(c)">{{ canvasStageOf(c) }}</el-tag>
+          </div>
+          <div v-if="isAutoFiltered(c)" class="canvas-auto-filter-reason">{{ c.recognition_note }}</div>
+          <div class="canvas-card-meta">
+            <el-tag v-if="!c.visionAttempted" size="mini" type="warning">未视觉识别</el-tag>
+            <el-tag v-else-if="c.visionSuccess" size="mini" type="success">视觉✓</el-tag>
+            <el-tag v-else size="mini" type="danger">视觉✗</el-tag>
+            <el-tag v-if="c.warnings && c.warnings.length" size="mini" type="warning">警告{{ c.warnings.length }}</el-tag>
+            <el-tag size="mini" type="info">文本{{ (c.text || '').length }}字</el-tag>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="canvasManageVisible = false">取消</el-button>
+        <el-button type="primary" :loading="canvasManageSaving" @click="saveCanvasManage">💾 保存画布选择</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -742,6 +903,12 @@ export default {
       step: 0,
       protoId: null,
       proto: null,
+      canvasConfirmed: false,
+      canvasActiveId: null,
+      canvasSaving: false,
+      // 画布管理二级弹窗（随时打开，勾选/改名/删除，不影响主流程阶段机）
+      canvasManageVisible: false,
+      canvasManageSaving: false,
       busy: false,
       terminating: false,
       xmindExporting: false,
@@ -790,6 +957,9 @@ export default {
       versions: [],
       loadingProjects: false,
       syncMsg: '',
+      // 历史列表筛选
+      filterProject: null,
+      filterVersion: null,
       // 快速新建
       showQuickProject: false,
       showQuickVersion: false,
@@ -848,6 +1018,197 @@ export default {
     },
   },
   methods: {
+    // ---------- 画布模块人工校验 ----------
+    mediaUrl(path) {
+      if (!path) return ''
+      if (/^https?:\/\//.test(path)) return path
+      return '/media/' + String(path).replace(/^\/?media\//, '')
+    },
+    // 编辑态（selected/_dirty/_delete）必须落在 proto.pages 原始响应式对象上，
+    // 否则会被 canvasPages computed 的临时拷贝吞掉，导致保存时读不到用户改动。
+    _rawPage(id) {
+      const pages = (this.proto && this.proto.pages) || []
+      return pages.find(p => p.id === id) || null
+    },
+    enterCanvasReview() {
+      this.canvasConfirmed = false
+      if (this.canvasPages.length && !this.canvasActiveId) {
+        this.canvasActiveId = this.canvasPages[0].id
+      }
+      this.$message.info('请逐一核对画布识别结果，勾选参与需求结构化的画布')
+    },
+    toggleSelectAll(val) {
+      ;((this.proto && this.proto.pages) || []).forEach(p => {
+        p.selected = val
+        p._dirty = true
+      })
+    },
+    onCanvasToggle(c, val) {
+      const rp = this._rawPage(c.id)
+      if (rp) {
+        rp.selected = val
+        rp._dirty = true
+      }
+    },
+    markCanvasDirty(c) {
+      const rp = this._rawPage(c.id)
+      if (rp) {
+        rp._dirty = true
+        // 同步可能的改名（v-model 先改 c.page_name 再触发 @input）
+        if (c.page_name !== undefined && c.page_name !== rp.page_name) rp.page_name = c.page_name
+      }
+    },
+    // ---------- A2-b 画布级进度展示与回退 ----------
+    canvasStageLabel(c) {
+      const st = c.current_stage || 0
+      const labels = ['待读取', '已结构化', '已澄清', '已生成用例', '已冒烟决策']
+      let label = labels[st] || '待读取'
+      if (c.stage_status === 'needs_rerun') label = '需重跑·' + label
+      if (c.stage_status === 'failed') label = '失败·' + label
+      return label
+    },
+    canvasStageType(c) {
+      if (c.stage_status === 'failed') return 'danger'
+      if (c.stage_status === 'needs_rerun') return 'warning'
+      if (c.current_stage >= 4) return 'success'
+      if (c.current_stage >= 1) return 'primary'
+      return 'info'
+    },
+    async onPageReset(c, stage) {
+      try {
+        await this.$confirm(
+          `确认将画布「${c.page_name}」回退到阶段${Number(stage) - 1}并标记需重跑？` +
+          `该画布后续的全局产物（结构化/用例等）将清空，需重新运行对应阶段。`,
+          '画布回退', { type: 'warning' }
+        )
+      } catch (e) {
+        return
+      }
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/page-reset/`,
+          method: 'post',
+          data: { page_id: c.id, stage: Number(stage) },
+        })
+        this.proto = res.data.proto
+        this.$message.success(`画布「${c.page_name}」已回退，可重新运行后续阶段`)
+        this.loadProto()
+      } catch (e) {
+        this.$message.error('回退失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+    // ---------- 画布管理二级弹窗 ----------
+    openCanvasManage() {
+      this.canvasActiveId = this.canvasActiveId || (this.canvasPages[0] && this.canvasPages[0].id)
+      this.canvasManageVisible = true
+    },
+    onCanvasManageOpen() {
+      // 打开时确保真实画布对象有 _dirty 标记（未改动过则置 false，便于保存时统一判断）
+      ;((this.proto && this.proto.pages) || []).forEach(p => { if (p._dirty === undefined) p._dirty = false })
+    },
+    async saveCanvasManage() {
+      const rawPages = (this.proto && this.proto.pages) || []
+      if (!rawPages.some(c => c.selected && !c._delete)) {
+        this.$message.warning('至少需勾选一个画布')
+        return
+      }
+      this.canvasManageSaving = true
+      try {
+        const pages = rawPages
+          .filter(c => c._dirty)
+          .map(c => ({
+            id: c.id,
+            selected: c.selected,
+            page_name: c.page_name,
+            recognition_note: c.recognition_note || '',
+            delete: !!c._delete,
+          }))
+        await request({ url: `${this.base()}/${this.protoId}/update-pages/`, method: 'post', data: { pages } })
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        this.proto = res.data
+        this.canvasManageVisible = false
+        // 若已运行过结构化（有摘要），提示需重跑以纳入画布变更
+        if (this.proto && this.proto.requirement_summary) {
+          this.$message.success('画布选择已保存；如需纳入结构化，请回到阶段1重新运行需求结构化')
+        } else {
+          this.$message.success('画布选择已保存')
+        }
+      } catch (e) {
+        this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.canvasManageSaving = false
+      }
+    },
+    // 画布参与到的整体阶段（X 方案：单 proto 内无画布独立 stage，显示其随整体进度到达的阶段）
+    canvasStageOf(c) {
+      const p = this.proto
+      if (!p) return '未读取'
+      if (!c.selected) return '未纳入'
+      const stage = p.current_stage || 0
+      const st = p.status
+      const map = ['原型接入', '需求通读', '需求澄清', '用例设计', '冒烟执行']
+      let label = map[stage] || '进行中'
+      if (['extracting', 'structuring', 'clarifying', 'designing'].includes(st)) label = '进行中'
+      if (st === 'done') label = '已完成'
+      if (st === 'failed') label = '失败'
+      return label
+    },
+    canvasStageTag(c) {
+      const label = this.canvasStageOf(c)
+      if (label === '未纳入') return 'info'
+      if (label === '已完成') return 'success'
+      if (label === '失败') return 'danger'
+      if (label === '进行中') return 'warning'
+      return ''
+    },
+    onCanvasDelete(c) {
+      this.$confirm(`确认删除画布「${c.page_name || '未命名'}」？该画布将不参与后续流程。`, '提示', {
+        type: 'warning'
+      }).then(() => {
+        const rp = this._rawPage(c.id)
+        if (rp) {
+          rp._delete = true
+          rp._dirty = true
+          rp.selected = false
+        }
+        this.$message.success('将在保存时删除该画布')
+      }).catch(() => {})
+    },
+    async saveCanvasReview() {
+      if (this.canvasSaving) return
+      const rawPages = (this.proto && this.proto.pages) || []
+      if (!rawPages.some(c => c.selected && !c._delete)) {
+        this.$message.warning('至少需勾选一个画布')
+        return
+      }
+      this.canvasSaving = true
+      try {
+        const pages = rawPages
+          .filter(c => c._dirty)
+          .map(c => ({
+            id: c.id,
+            selected: c.selected,
+            page_name: c.page_name,
+            recognition_note: c.recognition_note || '',
+            delete: !!c._delete,
+          }))
+        await request({ url: `${this.base()}/${this.protoId}/update-pages/`, method: 'post', data: { pages } })
+        // 重新拉取最新 proto（pages 已更新）
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        this.proto = res.data
+        this.canvasConfirmed = true
+        this.goStep(1)
+        this.$message.success('画布校验已保存，进入需求结构化')
+      } catch (e) {
+        this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.canvasSaving = false
+      }
+    },
+    resetCanvasReview() {
+      ;((this.proto && this.proto.pages) || []).forEach(p => { p._dirty = false; p._delete = false })
+      this.$message.info('已重置本地修改')
+    },
     // ---------- PCI 批量操作 ----------
     // 按影响级别批量确认 PCI 子问题
     // 答案优先级：后端 suggested_answer > resolution_condition（需过滤非答案）> 智能默认答案
@@ -1287,26 +1648,26 @@ export default {
         if (savedSubs.length) {
           this.pciSubQuestions[i] = savedSubs.map(s => ({
             question: s.question,
-            answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
+            answer: s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
             confirmed: !!s.confirmed,
             _loading: false,
-            _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+            _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
           }))
           return
         }
         // 2) 回退：无 sub_questions 时按 description 中文标点拆分
         const desc = (pci.description || '').trim()
         if (!desc) {
-          this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.resolution_condition || ''), confirmed: false, _loading: false, _aiDraft: !!(pci.answer || pci.resolution_condition || '').trim() }]
+          this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.suggested_answer || pci.resolution_condition || ''), confirmed: false, _loading: false, _aiDraft: !!(pci.answer || pci.suggested_answer || pci.resolution_condition || '').trim() }]
           return
         }
         const parts = desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean)
         const items = parts.map(p => ({
           question: p,
-          answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+          answer: pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
           confirmed: false,
           _loading: false,
-          _aiDraft: !!(pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+          _aiDraft: !!(pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
         }))
         this.pciSubQuestions[i] = items.length ? items : [{ question: desc, answer: '', confirmed: false, _loading: false, _aiDraft: false }]
       })
@@ -1326,10 +1687,10 @@ export default {
           if (savedSubs.length) {
             this.pciSubQuestions[i] = savedSubs.map(s => ({
               question: s.question,
-              answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
+              answer: s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
               confirmed: !!s.confirmed,
               _loading: false,
-              _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+              _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
             }))
             return
           }
@@ -1338,10 +1699,10 @@ export default {
           const parts = desc ? desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean) : ['(无描述内容)']
           const items = (parts.length ? parts : [desc || '(无描述内容)']).map(q => ({
             question: q,
-            answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+            answer: pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
             confirmed: false,
             _loading: false,
-            _aiDraft: !!(pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+            _aiDraft: !!(pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
           }))
           this.pciSubQuestions[i] = items
         } else {
@@ -1789,10 +2150,24 @@ export default {
         return (JSON.parse(this.proto?.qa_log || '[]')).filter(i => i.stage === stage)
       } catch (e) { return [] }
     },
+    async loadProjects() {
+      this.loadingProjects = true
+      try {
+        const res = await request({ url: '/projects/all/', method: 'get' })
+        this.projects = (Array.isArray(res.data) ? res.data : (res.data.results || []))
+      } catch (e) {
+        this.projects = []
+      } finally {
+        this.loadingProjects = false
+      }
+    },
     async loadHistory() {
       this.loadingHistory = true
       try {
-        const res = await request({ url: `${this.base()}/list/`, method: 'get' })
+        const params = {}
+        if (this.filterProject) params.project = this.filterProject
+        if (this.filterVersion) params.version = this.filterVersion
+        const res = await request({ url: `${this.base()}/list/`, method: 'get', params })
         const data = res.data
         if (Array.isArray(data)) {
           // 兼容旧接口（直接返回数组）
@@ -1807,6 +2182,21 @@ export default {
       } finally {
         this.loadingHistory = false
       }
+    },
+    async onFilterProjectChange(pid) {
+      this.filterVersion = null
+      this.versions = []
+      if (!pid) {
+        this.loadHistory()
+        return
+      }
+      try {
+        const res = await request({ url: `/versions/projects/${pid}/versions/`, method: 'get' })
+        this.versions = res.data.results || res.data || []
+      } catch (e) {
+        this.versions = []
+      }
+      this.loadHistory()
     },
     async onContinue(row) {
       this.protoId = row.id
@@ -1888,6 +2278,8 @@ export default {
           : (this.form.url || '').split('\n').map(s => s.trim()).filter(Boolean)
         const payload = { ...this.form, urls }
         await request({ url: `${this.base()}/${this.protoId}/extract/`, method: 'post', data: payload })
+        this.canvasConfirmed = false
+        this.canvasActiveId = null
         this.startPoll()
       } catch (e) {
         this.busy = false
@@ -2260,10 +2652,63 @@ export default {
     },
   },
   mounted() {
-    this.loadHistory()
-    this.loadProjects()
+    this.loadProjects().then(async () => {
+      const qid = this.$route.query && (this.$route.query.id || this.$route.query.protoId)
+      if (qid) {
+        try {
+          const res = await request({ url: `${this.base()}/${qid}/`, method: 'get' })
+          if (res.data && res.data.id) {
+            await this.onContinue(res.data)
+            this.$message.success(`已从历史记录恢复流程「${res.data.title || ''}」`)
+            return
+          }
+        } catch (e) {
+          this.$message.error('加载指定历史任务失败：' + (e.response?.data?.detail || e.message))
+        }
+      }
+      this.loadHistory()
+    })
   },
   computed: {
+    // 合并 DB 画布（selected/recognition_note）与 extracted_json 中的识别质量指标
+    canvasPages() {
+      const raw = (this.proto && this.proto.pages) || []
+      let metaMap = {}
+      try {
+        const ex = this.proto && this.proto.extracted_json
+        const data = typeof ex === 'string' ? JSON.parse(ex) : ex
+        const pages = (data && data.pages) || []
+        pages.forEach(p => { metaMap[p.page_no] = p })
+      } catch (e) { metaMap = {} }
+      return raw.map(p => {
+        const m = metaMap[p.page_no] || {}
+        return {
+          ...p,
+          visionAttempted: !!m.vision_attempted,
+          visionSuccess: !!m.vision_success,
+          warnings: m.extraction_warnings || [],
+          duplicate_of_page: m.duplicate_of_page || null,
+        }
+      })
+    },
+    canvasActive() {
+      return this.canvasPages.find(c => c.id === this.canvasActiveId) || null
+    },
+    canvasAllSelected() {
+      return this.canvasPages.length > 0 && this.canvasPages.every(c => c.selected)
+    },
+    canvasSelectedCount() {
+      return this.canvasPages.filter(c => c.selected).length
+    },
+    isAutoFiltered() {
+      // 后端读取时自动判定为无效画布（recognition_note 以「自动过滤」开头）
+      return (c) => !!(c && c.recognition_note && String(c.recognition_note).startsWith('自动过滤'))
+    },
+    filterVersions() {
+      // 历史列表「版本」下拉只展示所选项目下的版本
+      if (!this.filterProject) return []
+      return this.versions.filter(v => v.project === this.filterProject || v.project_id === this.filterProject || String(v.project) === String(this.filterProject))
+    },
     // 以服务端 proto.status 为权威依据：任务运行中（含未终止）则禁止再次触发，
     // 防止连点/刷新后组件重挂导致 busy 被清零而并发启动多个 run。
     isRunning() {
@@ -2439,7 +2884,7 @@ export default {
         const parts = desc ? desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean) : ['(无描述内容)']
         const items = (parts.length ? parts : [desc || '(无描述内容)']).map(q => ({
           question: q,
-          answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+          answer: pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
           confirmed: false,
           _loading: false,
         }))
@@ -2506,7 +2951,7 @@ export default {
         const impact = (pci.impact || 'low').toLowerCase()
         if (filter !== 'all' && filter !== impact) return
         const subs = pci.sub_questions
-        const fallbackAnswer = pci.answer || pci.resolution_condition || pci.resolution || ''
+        const fallbackAnswer = pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || ''
         if (Array.isArray(subs) && subs.length) {
           subs.forEach((s, j) => {
             out.push({
@@ -2627,6 +3072,10 @@ export default {
         return JSON.parse(raw)
       } catch (e) { return null }
     },
+    // 历史筛选：按当前选中项目过滤出的版本列表（onFilterProjectChange 已填充 this.versions）
+    filterVersions() {
+      return this.versions || []
+    },
   },
 }
 </script>
@@ -2637,6 +3086,8 @@ export default {
 .page-header h2 { margin: 0 4px 0 0; }
 .header-actions { margin-left: auto; display: flex; gap: 8px; }
 .history-card { margin: 16px 0; }
+.history-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.history-filters { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .empty-hint { color: #999; font-size: 13px; padding: 8px 0; }
 .subtitle { color: #888; margin: 0 0 16px; font-size: 13px; }
 .steps { margin-bottom: 22px; }
@@ -2946,5 +3397,70 @@ export default {
 .pci-sub-foot {
   display: flex; align-items: center; gap: 12px; margin-top: 8px;
   padding-top: 8px; border-top: 1px dashed #e5e7eb;
+}
+/* 画布模块校验 */
+.canvas-review-body {
+  display: flex; gap: 16px; margin-top: 14px; align-items: flex-start;
+}
+.canvas-list {
+  flex: 0 0 380px; max-height: 560px; overflow-y: auto; border: 1px solid #e5e7eb;
+  border-radius: 8px; padding: 10px; background: #fafafa;
+}
+.canvas-list-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid #eee;
+}
+.canvas-count { font-size: 12px; color: #909399; }
+.canvas-card {
+  border: 1px solid #e4e7ed; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px;
+  background: #fff; cursor: pointer; transition: all .15s;
+}
+.canvas-card:hover { border-color: #c0c4cc; }
+.canvas-card.active { border-color: #409eff; box-shadow: 0 0 0 2px rgba(64,158,255,.15); }
+.canvas-card.unchecked { opacity: .6; background: #f4f4f5; }
+.canvas-card.auto-filtered { border-style: dashed; background: #f7f8fa; opacity: .85; }
+.auto-filter-tag { background: #f0f2f5; color: #909399; border-color: #e4e7ed; }
+.canvas-auto-filter-reason {
+  margin: 4px 0 0 28px; font-size: 11px; color: #a8abb2; line-height: 1.4;
+}
+.canvas-card-head { display: flex; align-items: center; gap: 6px; }
+.canvas-no {
+  font-size: 12px; font-weight: 700; color: #409eff; min-width: 22px;
+  font-family: monospace;
+}
+.canvas-name-input { flex: 1; }
+.canvas-card-meta { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 4px 28px; }
+.canvas-card-accuracy { display: flex; gap: 6px; margin-left: 28px; align-items: center; }
+.canvas-card-progress { margin: 6px 0 4px 28px; }
+.canvas-card-progress :deep(.el-step__title) { font-size: 11px; }
+.canvas-card-progress :deep(.el-step__icon) { width: 18px; height: 18px; }
+.canvas-card-progress :deep(.el-step__icon-inner) { font-size: 11px; }
+.canvas-preview {
+  flex: 1; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px;
+  background: #fff; max-height: 560px; overflow-y: auto;
+}
+.canvas-preview.empty {
+  display: flex; align-items: center; justify-content: center;
+  color: #909399; font-size: 13px; min-height: 200px;
+}
+.canvas-preview-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px;
+}
+.canvas-preview-no { font-size: 12px; color: #909399; }
+.canvas-preview-img {
+  max-width: 100%; border: 1px solid #eee; border-radius: 6px; margin-bottom: 12px;
+  background: #f5f5f5;
+}
+.canvas-preview-noshot {
+  color: #909399; font-size: 13px; padding: 20px; text-align: center;
+  border: 1px dashed #dcdfe6; border-radius: 6px; margin-bottom: 12px;
+}
+.canvas-preview-subtitle {
+  font-weight: 600; font-size: 13px; color: #303133; margin: 10px 0 4px;
+}
+.canvas-preview-text .md-box { font-size: 12px; max-height: 220px; overflow-y: auto; }
+.canvas-preview-text .md-box.warn { color: #e6a23c; }
+.canvas-review-actions {
+  display: flex; gap: 12px; margin-top: 14px;
 }
 </style>

@@ -329,6 +329,14 @@
             style="background:#409eff;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;">
             🚀 转UI自动化 ({{ selectedCases.length }})
           </button>
+          <button
+            class="batch-convert-btn"
+            :disabled="repairingTable"
+            @click="repairTable"
+            title="修复表格中嵌表头/重复行/步骤截断等格式问题（会调用一次AI）"
+            style="background:#e6a23c;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;">
+            {{ repairingTable ? '🔧 修复中...' : '🔧 修复表格格式' }}
+          </button>
         </div>
       </div>
 
@@ -348,7 +356,7 @@
         <div class="table-body">
           <div 
             v-for="(testCase, index) in paginatedTestCases" 
-            :key="testCase.id || index"
+            :key="testCase.caseId || index"
             class="table-row">
             <div class="body-cell checkbox-cell">
               <input 
@@ -359,24 +367,36 @@
             </div>
             <div class="body-cell">{{ testCase.caseId || `TC${String(index + 1).padStart(3, '0')}` }}</div>
             <div class="body-cell">{{ testCase.scenario }}</div>
-            <div class="body-cell text-limit-2">{{ formatTextForList(testCase.precondition) }}</div>
+            <div
+              class="body-cell text-limit-2 clickable-cell"
+              :class="{ 'text-expanded': isCellExpanded(testCase, 'precondition') }"
+              @click="toggleCellExpand(testCase, 'precondition')"
+              :title="isCellExpanded(testCase, 'precondition') ? '点击收起' : '点击展开完整内容'">
+              <div class="cell-content">{{ formatTextForList(testCase.precondition) }}</div>
+              <span v-if="shouldShowToggle(testCase, 'precondition')" class="expand-toggle">
+                {{ isCellExpanded(testCase, 'precondition') ? '收起 ▲' : '展开 ▼' }}
+              </span>
+            </div>
             <div
               class="body-cell text-limit-2 clickable-cell"
               :class="{ 'text-expanded': isCellExpanded(testCase, 'steps') }"
               @click="toggleCellExpand(testCase, 'steps')"
               :title="isCellExpanded(testCase, 'steps') ? '点击收起' : '点击展开完整内容'">
+              <el-tag v-if="isStepsMissing(testCase.steps)" size="mini" type="danger">步骤缺失</el-tag>
               <div class="cell-content">{{ formatTextForList(testCase.steps) }}</div>
-              <span class="expand-toggle">
+              <span v-if="shouldShowToggle(testCase, 'steps')" class="expand-toggle">
                 {{ isCellExpanded(testCase, 'steps') ? '收起 ▲' : '展开 ▼' }}
               </span>
             </div>
+            <el-button v-if="isStepsMissing(testCase.steps)" size="mini" type="warning" plain
+              :loading="regenLoading === testCase.caseId" @click.stop="regenerateCase(testCase)">🔁 重试生成步骤</el-button>
             <div
               class="body-cell text-limit-2 clickable-cell"
               :class="{ 'text-expanded': isCellExpanded(testCase, 'expected') }"
               @click="toggleCellExpand(testCase, 'expected')"
               :title="isCellExpanded(testCase, 'expected') ? '点击收起' : '点击展开完整内容'">
               <div class="cell-content">{{ formatTextForList(testCase.expected) }}</div>
-              <span class="expand-toggle">
+              <span v-if="shouldShowToggle(testCase, 'expected')" class="expand-toggle">
                 {{ isCellExpanded(testCase, 'expected') ? '收起 ▲' : '展开 ▼' }}
               </span>
             </div>
@@ -414,7 +434,7 @@
         <div class="pagination-controls">
           <div class="page-size-selector">
             <label>每页显示：</label>
-            <select v-model="pageSize" @change="currentPage = 1">
+            <select v-model.number="pageSize" @change="currentPage = 1">
               <option value="10">10 条</option>
               <option value="20">20 条</option>
               <option value="50">50 条</option>
@@ -453,7 +473,10 @@
           </div>
           <div class="detail-item">
             <label>操作步骤:</label>
+            <el-alert v-if="isStepsMissing(selectedCase.steps)" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
             <p class="test-steps" v-html="formatMarkdown(selectedCase.steps)"></p>
+            <el-button v-if="isStepsMissing(selectedCase.steps)" size="mini" type="warning" plain
+              :loading="regenLoading === selectedCase.caseId" @click="regenerateCase(selectedCase)">🔁 重试生成步骤</el-button>
           </div>
           <div class="detail-item">
             <label>预期结果:</label>
@@ -727,6 +750,8 @@ export default {
       taskId: '',
       task: {},
       testCases: [],
+      regenLoading: null,
+      repairingTable: false,
       selectedCases: [],
       isLoading: true,
       showCaseDetail: false,
@@ -799,8 +824,10 @@ export default {
     },
 
     paginatedTestCases() {
-      const start = (this.currentPage - 1) * this.pageSize
-      const end = start + this.pageSize
+      // 防御：select 的 v-model 可能带回字符串，加法会变字符串拼接导致切片越界
+      const size = Number(this.pageSize) || 10
+      const start = (this.currentPage - 1) * size
+      const end = start + size
       return this.testCases.slice(start, end)
     },
 
@@ -1432,17 +1459,29 @@ export default {
       let isTableFormat = false
       const tableData = []
 
+      let tableStarted = false
       for (let line of lines) {
         const trimmedLine = line.trim()
-        if (trimmedLine.includes('|') && !trimmedLine.includes('--------')) {
+        const isSep = trimmedLine.includes('|') && trimmedLine.includes('--------')
+        if (trimmedLine.includes('|') && !isSep) {
           let cells = trimmedLine.split('|').map(cell => cell.trim())
           // 移除首尾空字符串（split('|') 在首尾会产生空字符串）
           while (cells.length > 0 && cells[0] === '') cells.shift()
           while (cells.length > 0 && cells[cells.length - 1] === '') cells.pop()
           if (cells.length > 1) {
-            tableData.push(cells)
+            // 跳过重复表头行（流式中间态/二次表格拼接时会再嵌一份表头）
+            const isHeaderRow = tableData.length > 0 &&
+              String(cells[0]).toLowerCase() === String(tableData[0][0]).toLowerCase() &&
+              String(cells[1] || '').toLowerCase() === String(tableData[0][1] || '').toLowerCase()
+            if (!isHeaderRow) {
+              tableData.push(cells)
+            }
             isTableFormat = true
+            tableStarted = true
           }
+        } else if (tableStarted && !isSep) {
+          // 只解析第一个连续表格块，避免内容含第二段表格时混入重复行
+          break
         }
       }
       
@@ -1450,8 +1489,19 @@ export default {
         // 表格格式解析
         const headers = tableData[0]
         for (let i = 1; i < tableData.length; i++) {
-          const row = tableData[i]
+          let row = tableData[i]
           const testCase = {}
+
+          // 容错：LLM 偶发把表头/下一行嵌进数据行 → 在表头词处截断
+          const headerWords = ['用例id', '测试目标', '前置条件', '操作步骤', '测试步骤', '预期结果', '优先级', '测试类型', '关联需求']
+          let cutIdx = row.length
+          for (let j = 3; j < row.length; j++) {
+            if (headerWords.includes(String(row[j]).trim().toLowerCase())) {
+              cutIdx = j
+              break
+            }
+          }
+          if (cutIdx < row.length) row = row.slice(0, cutIdx)
 
           // 清理<br>标签的辅助函数
           const cleanBrTags = (text) => {
@@ -1534,7 +1584,16 @@ export default {
         }
       }
       
-      return testCases
+      // 防御：同一任务内按 caseId 去重，避免历史重复行导致分页重复展示
+      const seenIds = new Set()
+      const deduped = []
+      testCases.forEach(tc => {
+        const k = tc.caseId || tc.scenario || ''
+        if (k && seenIds.has(k)) return
+        if (k) seenIds.add(k)
+        deduped.push(tc)
+      })
+      return deduped
     },
 
     getStatusText(status) {
@@ -1565,6 +1624,57 @@ export default {
     toggleCellExpand(testCase, field) {
       const key = `${testCase.id || testCase.caseId || ''}-${field}`
       this.expandedCells[key] = !this.expandedCells[key]
+    },
+
+    /** 判断步骤是否缺失：空、占位文案、显式缺失标记都视为缺失 */
+    isStepsMissing(steps) {
+      const s = (steps == null ? '' : String(steps)).trim()
+      return !s || s === '参考测试目标执行相应操作' || String(steps).includes('【步骤缺失')
+    },
+
+    /** 单条重试：对缺少步骤的用例调用后端重新生成步骤 */
+    async regenerateCase(testCase) {
+      if (!testCase || !testCase.caseId) return
+      this.regenLoading = testCase.caseId
+      try {
+        const response = await api.post(
+          `/requirement-analysis/api/testcase-generation/${this.taskId}/regenerate-case/`,
+          { caseId: testCase.caseId }
+        )
+        if (response.data.task) {
+          this.task = response.data.task
+          this.testCases = this.parseTestCases(this.task.final_test_cases)
+          this.$message.success(response.data.message || '步骤已重新生成')
+        }
+      } catch (error) {
+        this.$message.error(
+          (error.response && error.response.data && error.response.data.error) || '重试生成步骤失败'
+        )
+      } finally {
+        this.regenLoading = null
+      }
+    },
+
+    /** 整表修复：把 final_test_cases 交给 AI 重排为规范表格 */
+    async repairTable() {
+      if (this.repairingTable) return
+      this.repairingTable = true
+      try {
+        const response = await api.post(
+          `/requirement-analysis/api/testcase-generation/${this.taskId}/repair-table/`
+        )
+        if (response.data.task) {
+          this.task = response.data.task
+          this.testCases = this.parseTestCases(this.task.final_test_cases)
+          this.$message.success(response.data.message || '表格格式已修复')
+        }
+      } catch (error) {
+        this.$message.error(
+          (error.response && error.response.data && error.response.data.error) || '修复表格失败'
+        )
+      } finally {
+        this.repairingTable = false
+      }
     },
 
     /** 是否需要显示「展开/收起」按钮（只要内容非空就显示） */

@@ -865,13 +865,29 @@ class ModaoWorkflow:
         for idx, p in enumerate(all_pages, 1):
             p['page_no'] = idx
         self.prototype.pages.all().delete()
+        auto_filtered_names = []
         for p in all_pages:
+            should_filter, reason = self._auto_filter_page(p)
+            note = f'自动过滤：{reason}' if should_filter else ''
+            if should_filter:
+                auto_filtered_names.append(p.get('page_name', ''))
             self.prototype.pages.create(
                 page_no=p['page_no'],
                 page_name=p['page_name'],
                 text=p.get('text', ''),
                 annotations=json.dumps(p.get('annotations', []), ensure_ascii=False),
                 screenshot=p.get('screenshot', ''),
+                selected=(not should_filter),
+                recognition_note=note,
+                # A2-b：提取完成即标记画布「已读取」
+                current_stage=0,
+                stage_status='done',
+            )
+        if auto_filtered_names:
+            self._log(
+                f'已自动过滤 {len(auto_filtered_names)} 个无效画布（默认不纳入结构化）：'
+                + '、'.join(auto_filtered_names)
+                + '；如需保留可在「校验画布模块」中手动勾选恢复'
             )
         valid_pages = [p for p in all_pages if not p.get('duplicate_of_page')]
         duplicate_count = len(all_pages) - len(valid_pages)
@@ -977,6 +993,12 @@ class ModaoWorkflow:
         else:
             self.prototype.error_message = ''
         self.prototype.current_stage = 0
+        # A2-b：同步画布级状态（提取成功=已读取 done；失败=failed）
+        page_status = 'failed' if extraction_blocked else 'done'
+        self.prototype.pages.all().update(
+            stage_status=page_status,
+            error_message=(self.prototype.error_message if extraction_blocked else ''),
+        )
         self.prototype.save()
         if extraction_blocked:
             self._log(self.prototype.error_message)
@@ -990,19 +1012,103 @@ class ModaoWorkflow:
             'blocked': extraction_blocked,
         }
 
+    # ---------- 阶段0 画布自动过滤 ----------
+    # 墨刀原型常自带模板/引导/封面/副本页（如「总览/演示/标注/登录/免费使用」等），
+    # 这些页对需求结构化无意义，读取后自动取消勾选，避免污染后续流程；
+    # 用户仍可在画布校验卡片上手改回勾选。
+    _USELESS_PAGE_HINTS = (
+        '总览', '演示', '标注', '登录', '免费使用', '引导', '封面', '示例', '帮助',
+        'about', 'intro', 'start', 'cover', 'template', 'demo', 'guide', 'tour',
+        '欢迎', '首页引导', '使用说明', '新手', '教程', '预览',
+    )
+
+    @classmethod
+    def _auto_filter_page(cls, p: dict):
+        """判断某画布是否应自动过滤（不纳入后续流程）。
+
+        返回 (should_filter: bool, reason: str)。保守策略，仅命中明确无效特征才过滤，
+        避免误杀真实业务页面。
+        """
+        # 1) 副本页（与某页重复）
+        dup = p.get('duplicate_of_page')
+        if dup:
+            return True, f'画布副本(与「{dup}」重复)'
+
+        name = (p.get('page_name') or '').strip().lower()
+        # 2) 页面名命中无用模板关键词（整名或包含关键词）
+        for hint in cls._USELESS_PAGE_HINTS:
+            hl = hint.lower()
+            if name == hl or hl in name:
+                return True, f'模板/引导页(命中「{hint}」)'
+
+        # 3) 内容过少：DOM 文本极短且视觉也未提供有效内容，疑似空页/封面
+        dom_len = int(p.get('dom_text_len') or 0)
+        vision_ok = bool(p.get('vision_success'))
+        vision_text = (p.get('vision_text') or '').strip()
+        if dom_len < 15 and (not vision_ok or len(vision_text) < 15):
+            return True, '内容过少(疑似空页/封面)'
+
+        return False, ''
+
     # ---------- 阶段1：需求结构化 ----------
+    def _selected_page_names(self) -> set:
+        """已勾选（纳入后续流程）的画布名集合；未做勾选操作时默认全部纳入。"""
+        try:
+            pages = self.prototype.pages.all()
+            if not pages:
+                return set()
+            selected = {p.page_name for p in pages if getattr(p, 'selected', True)}
+            # 若没有任何一条 selected 记录（历史数据），视为全选
+            if not selected:
+                return {p.page_name for p in pages}
+            return selected
+        except Exception:
+            return set()
+
+    def _advance_selected_pages(self, stage, status='done', error=None):
+        """A2-b：把任务下所有「已勾选」画布的画布级进度推进到指定阶段。
+
+        结构化/澄清/测试点合并是任务级全局聚合操作，完成后所有参与画布统一推进；
+        回退时由回退接口单独调用本方法降级。
+        """
+        try:
+            selected_names = self._selected_page_names()
+            pages = self.prototype.pages.all()
+            if selected_names:
+                pages = pages.filter(page_name__in=selected_names)
+            for p in pages:
+                # 只在前进时取 max；回退（stage 更小）时由调用方直接赋值
+                if stage >= p.current_stage:
+                    p.current_stage = stage
+                if status:
+                    p.stage_status = status
+                if error is not None:
+                    p.error_message = error
+                p.save(update_fields=['current_stage', 'stage_status', 'error_message'])
+        except Exception as e:
+            logger.warning('[_advance_selected_pages] 同步画布进度失败: %s', e)
+
     def _source_text(self) -> str:
         if self.prototype.extracted_json:
+            selected_names = self._selected_page_names()
             data = json.loads(self.prototype.extracted_json)
             parts = []
             fused = data.get('fused_requirements') or []
             if fused:
+                if selected_names:
+                    fused = [
+                        x for x in fused
+                        if isinstance(x, dict)
+                        and (selected_names & set(str(s) for s in (x.get('source_pages') or [])))
+                    ]
                 parts.append(
                     '## DOM + 视觉双路交叉融合需求（结构化主输入）\n'
                     + json.dumps(fused, ensure_ascii=False)
                 )
             for p in data.get('pages', []):
                 if p.get('duplicate_of_page'):
+                    continue
+                if selected_names and p.get('page_name') not in selected_names:
                     continue
                 parts.append(
                     f"### {p['page_name']}\n{p.get('text','')}\n"
@@ -1458,6 +1564,7 @@ class ModaoWorkflow:
         self.prototype.status = 'extracted'
         self.prototype.current_stage = 1
         self.prototype.save()
+        self._advance_selected_pages(1)
         self._log('需求结构化完成，已生成摘要')
         return out
 
@@ -1554,6 +1661,7 @@ class ModaoWorkflow:
         self.prototype.status = 'extracted'
         self.prototype.current_stage = 2
         self.prototype.save()
+        self._advance_selected_pages(2)
         self._log('需求澄清完成')
         return out
 
@@ -2106,6 +2214,7 @@ class ModaoWorkflow:
         self.prototype.status = 'testpoints_ready'
         self.prototype.current_stage = 3
         self.prototype.save()
+        self._advance_selected_pages(3)
         self._log(f'第一段完成！共 {len(modules)} 模块 / {len(all_final_tps)} 测试点。请确认/编辑测试点后再生成测试用例。')
         release_merge_collection(self.session_id)
         return {
@@ -2389,6 +2498,7 @@ class ModaoWorkflow:
             self.prototype.error_message = f'质量门禁未通过（阻断项）：{reasons}。已保留测试用例和质量报告，但未导出正式 Excel。'
             self.prototype.excel_path = ''
             self.prototype.save()
+            self._advance_selected_pages(self.prototype.current_stage, status='failed', error=self.prototype.error_message)
             self._log(self.prototype.error_message)
             return {'final_testpoints': len(all_final_tps), 'testcases': len(all_cases),
                     'smoke': q['smoke_count'], 'excel': '', 'quality': 'failed', 'blocking_issues': q['blocking'], 'phase': 2}
@@ -2407,6 +2517,7 @@ class ModaoWorkflow:
         self.prototype.status = 'done'
         self.prototype.current_stage = 3
         self.prototype.save()
+        self._advance_selected_pages(4)
         self._log(f'用例生成全部完成！共 {len(all_final_tps)} 测试点 / {len(all_cases)} 用例 / Excel: {excel_path or "无"}')
 
         # 自适应沉淀（方案C闭环）：本次流程发现的风险处置/PCI处置/质量缺口/澄清结论，

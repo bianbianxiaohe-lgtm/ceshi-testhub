@@ -387,10 +387,14 @@ class ClarificationQuestionSerializer(serializers.ModelSerializer):
 
 
 class ModaoPageSerializer(serializers.ModelSerializer):
-    """墨刀单页提取结果序列化器"""
+    """墨刀单页提取结果序列化器（含 A2-b 画布级流水线状态）"""
     class Meta:
         model = ModaoPage
-        fields = ['id', 'page_no', 'page_name', 'text', 'annotations', 'screenshot']
+        fields = [
+            'id', 'page_no', 'page_name', 'text', 'annotations', 'screenshot',
+            'selected', 'recognition_note',
+            'current_stage', 'stage_status', 'work_log', 'error_message', 'rerun_stages',
+        ]
 
 
 class ModaoPrototypeSerializer(serializers.ModelSerializer):

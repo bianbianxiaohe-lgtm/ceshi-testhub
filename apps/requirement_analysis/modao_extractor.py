@@ -256,13 +256,32 @@ class ModaoExtractor:
                     if item is not None:
                         try:
                             page_name = (await item.inner_text()).strip() or page_name
+                            # 墨刀页面树存在层级：子状态(横版/竖版)嵌套在父画布(前置付费页)下。
+                            # 为在模块拆分时区分「前置的横版」与「通用的横版」，把最近一级
+                            # 父画布名拼到 page_name 前，形成「父/子」层级名。
+                            parent_name = await item.evaluate(
+                                """el => {
+                                    let p = el.parentElement;
+                                    while (p) {
+                                        if (p.classList && p.classList.contains('rn-list-item') && p.classList.contains('page')) {
+                                            try { return (p.innerText || '').trim().split('\\n')[0]; } catch (e) { return ''; }
+                                        }
+                                        p = p.parentElement;
+                                    }
+                                    return '';
+                                }"""
+                            )
+                            parent_name = (parent_name or '').strip()
+                            if parent_name and parent_name != page_name:
+                                page_name = f'{parent_name}/{page_name}'
                         except Exception:
                             pass
                         switched = await self._activate_page_item(page, item)
                         if not switched:
-                            msg = f'第{idx}页"{page_name}"点击后画布未发生变化'
-                            warnings.append(msg)
-                            extraction_warnings.append(msg)
+                            # 点击后画布未变化：多为纯分组/容器节点（只展开不切换画布），
+                            # 不是真实独立画布，直接跳过，避免收集重复/无效页。
+                            logger.info(f'页面项"{page_name}"点击后画布未变化，跳过')
+                            continue
                     else:
                         # 单页模式：确保回到原型根视图
                         pass
@@ -710,7 +729,12 @@ class ModaoExtractor:
         return []
 
     async def _enumerate_pages(self, page, source_type: str = None) -> List[Any]:
-        """枚举页面树元素，返回可点击的页面项列表（为空表示未识别）。"""
+        """枚举页面树元素，返回可点击的页面项列表（为空表示未识别）。
+
+        注意：墨刀页面树里顶层画布展开后的「竖版/横版/弹窗」也是各自独立、点击会切换画布的
+        真实画布，必须保留，不能按 DOM 层级过滤（否则会遗漏）。真正要剔除的是「点击后画布
+        不变化」的纯分组/容器节点，那在抓取循环中用视口指纹判定并跳过（见 _run_extract 循环）。
+        """
         selectors = list(PAGE_TREE_SELECTORS)
         if source_type == 'webshare':
             # webshare 优先用专门的页面树选择器，再回退通用选择器

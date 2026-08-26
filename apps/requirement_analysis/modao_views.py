@@ -32,8 +32,8 @@ from django.shortcuts import get_object_or_404
 from django.http import FileResponse, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from apps.requirement_analysis.models import ModaoPrototype
-from apps.requirement_analysis.serializers import ModaoPrototypeSerializer
+from apps.requirement_analysis.models import ModaoPrototype, ModaoPage
+from apps.requirement_analysis.serializers import ModaoPrototypeSerializer, ModaoPageSerializer
 from apps.requirement_analysis.modao_workflow import ModaoWorkflow, _parse_yaml, _extract_block
 from apps.requirement_analysis import modao_xmind
 from apps.feature_modules.models import FeatureModule, TestPoint
@@ -97,7 +97,7 @@ def _canonical_module_name(raw, proto=None, project=None):
 import datetime as _dt
 _CONTAINER_START_TIME = _dt.datetime.now()
 
-def _recover_stale_designing(proto, timeout_minutes=120):
+def _recover_stale_designing(proto, timeout_minutes=30):
     """自动回收卡死的 designing 状态。
 
     当 proto.status 为 designing 但 updated_at 距今超过 timeout_minutes 分钟时，
@@ -114,14 +114,7 @@ def _recover_stale_designing(proto, timeout_minutes=120):
     elapsed = (timezone.now() - proto.updated_at).total_seconds()
     if elapsed < timeout_minutes * 60:
         return False
-    # 容器重启后 updated_at 可能很早 → 不判为超时
-    try:
-        if proto.updated_at.replace(tzinfo=None) < _CONTAINER_START_TIME:
-            logger.info('[stale-recover] proto %d skipped: updated_at before container start', proto.id)
-            return False
-    except Exception:
-        pass
-    # 已超时且无活跃线程 → 回收
+    # 已超时且无活跃线程 → 回收（重启前中断的线程同样按超时回收，避免永久转圈）
     wl_tail = (proto.work_log or '')[-150:]
     proto.status = 'failed'
     proto.error_message = (
@@ -313,6 +306,7 @@ def _sync_stage3(proto, user):
                 description=description,
                 status='draft',
                 author=user,
+                source='ai',
             )
             tc.save()
             if proto.version_id:
@@ -343,6 +337,10 @@ def _run_in_thread(proto, target):
 def modao_list(request):
     """历史记录列表（按创建时间倒序）。
 
+    查询参数：
+    - project: 按项目ID过滤
+    - version: 按版本ID过滤
+
     权限规则：
     - 超级管理员：可查看所有人的任务；
     - 普通用户：可查看自己创建的 + 自己是项目成员（owner/admin/developer/tester）的项目下的任务。
@@ -350,6 +348,14 @@ def modao_list(request):
     from apps.core.mixins import _is_superuser
     is_admin = _is_superuser(request.user)
     qs = _accessible_proto_qs(request.user).order_by('-created_at')
+
+    project_id = request.query_params.get('project')
+    version_id = request.query_params.get('version')
+    if project_id:
+        qs = qs.filter(project_id=project_id)
+    if version_id:
+        qs = qs.filter(version_id=version_id)
+
     # 批量回收列表中可能卡死的 designing 状态
     for p in qs.filter(status__in=('extracting', 'structuring', 'clarifying', 'designing')):
         _recover_stale_designing(p)
@@ -519,6 +525,47 @@ def modao_struct(request, pk):
 
 
 @api_view(['POST'])
+def modao_update_pages(request, pk):
+    """批量更新画布（模块）的人工会校验结果：勾选/取消、改名、标注识别准确率、删除。
+
+    请求体：{'pages': [{'id': <int>, 'selected': <bool>, 'page_name': <str>,
+                        'recognition_note': <str>, 'delete': <bool>}, ...]}
+    仅传入需要变更的字段即可；未传字段保持不变。
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    pages = request.data.get('pages') or []
+    if not isinstance(pages, list):
+        return Response({'detail': 'pages 必须为数组'}, status=http_status.HTTP_400_BAD_REQUEST)
+    updated, deleted = 0, 0
+    for item in pages:
+        pid = item.get('id')
+        if not pid:
+            continue
+        try:
+            page = proto.pages.get(id=pid)
+        except ModaoPage.DoesNotExist:
+            continue
+        if item.get('delete'):
+            page.delete()
+            deleted += 1
+            continue
+        changed = []
+        if 'selected' in item and isinstance(item['selected'], bool):
+            page.selected = item['selected']
+            changed.append('selected')
+        if 'page_name' in item and item['page_name']:
+            page.page_name = item['page_name']
+            changed.append('page_name')
+        if 'recognition_note' in item:
+            page.recognition_note = item['recognition_note']
+            changed.append('recognition_note')
+        if changed:
+            page.save(update_fields=changed)
+            updated += 1
+    return Response({'detail': f'已更新 {updated} 个画布，删除 {deleted} 个', 'updated': updated, 'deleted': deleted})
+
+
+@api_view(['POST'])
 def modao_clarify(request, pk):
     proto = get_object_or_404(ModaoPrototype, pk=pk)
     a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
@@ -537,6 +584,12 @@ def modao_clarify(request, pk):
 def modao_design(request, pk):
     """阶段3 第一段：模块拆分→测试点→风险→PCI→三路合并（到最终测试点为止，等待人工确认）。"""
     proto = get_object_or_404(ModaoPrototype, pk=pk)
+    # 运行中禁止重复触发，避免并发线程重复生成（LLM 双倍消耗 + 产物互相覆盖）
+    if proto.status in ('extracting', 'structuring', 'clarifying', 'designing'):
+        return Response(
+            {'detail': f'任务正在运行中（{proto.status}），请勿重复触发'},
+            status=400,
+        )
     a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
                         request.data.get('writer_config_id'),
                         request.data.get('embedder_config_id'))
@@ -677,6 +730,73 @@ def modao_edit(request, pk):
 
 
 @api_view(['POST'])
+def modao_page_reset(request, pk):
+    """A2-b 画布级回退：把某画布回退到指定阶段之前，并标记需重跑。
+
+    回退语义：画布级进度独立回退（current_stage 降级 + stage_status=needs_rerun），
+    同时把任务级全局聚合产物中该阶段之后的内容清空（结构化/澄清/测试点/用例都是跨画布聚合，
+    旧画布内容已失效需重算），任务级 current_stage 同步回退。
+
+    请求体：{'page_id': <int>, 'stage': <int 1-4 回退到该阶段之前>}
+    stage=1 → 重新读取该画布（清空 text，强制重提取）
+    stage=2 → 重做结构化（保留提取，清空结构化及之后）
+    stage=3 → 重做澄清（清空澄清及之后）
+    stage=4 → 重做测试点/用例（清空测试点/用例及之后）
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    if not _user_can_access_proto(request.user, proto):
+        return Response({'detail': '无权操作该任务'}, status=http_status.HTTP_403_FORBIDDEN)
+    page_id = request.data.get('page_id')
+    stage = int(request.data.get('stage', 1))
+    if stage not in (1, 2, 3, 4):
+        return Response({'detail': 'stage 必须为 1-4'}, status=http_status.HTTP_400_BAD_REQUEST)
+    try:
+        page = proto.pages.get(id=page_id)
+    except ModaoPage.DoesNotExist:
+        return Response({'detail': '画布不存在'}, status=http_status.HTTP_404_NOT_FOUND)
+    if proto.status in ('extracting', 'structuring', 'clarifying', 'designing'):
+        return Response({'detail': '任务正在运行，请等待结束后再回退'}, status=http_status.HTTP_409_CONFLICT)
+
+    # 1) 画布级进度回退
+    page.current_stage = stage - 1
+    page.stage_status = 'needs_rerun'
+    page.set_rerun_stages([stage, stage + 1, stage + 2, stage + 3])
+    page.rerun_stages = page.rerun_stages  # 已 set
+    if stage <= 1:
+        page.text = ''
+        page.annotations = '[]'
+    page.save(update_fields=['current_stage', 'stage_status', 'rerun_stages', 'text', 'annotations'])
+
+    # 2) 任务级全局产物按回退阶段清空（stage 之前的产物保留）
+    if stage <= 1:
+        fields = ['requirement_summary', 'clarification_log', 'module_split', 'risks_json',
+                  'pci_json', 'final_testpoints_json', 'dedup_audit_json', 'testcases_json',
+                  'smoke_json', 'quality_report_json', 'excel_path', 'stage_confirmations']
+    elif stage <= 2:
+        fields = ['clarification_log', 'module_split', 'risks_json', 'pci_json',
+                  'final_testpoints_json', 'dedup_audit_json', 'testcases_json',
+                  'smoke_json', 'quality_report_json', 'excel_path', 'stage_confirmations']
+    elif stage <= 3:
+        fields = ['module_split', 'risks_json', 'pci_json', 'final_testpoints_json',
+                  'dedup_audit_json', 'testcases_json', 'smoke_json',
+                  'quality_report_json', 'excel_path', 'stage_confirmations']
+    else:
+        fields = ['testcases_json', 'smoke_json', 'quality_report_json', 'excel_path', 'stage_confirmations']
+    for f in fields:
+        setattr(proto, f, '' if f != 'dedup_audit_json' and f != 'stage_confirmations' else ('[]' if f == 'dedup_audit_json' else '{}'))
+    proto.current_stage = stage - 1
+    proto.status = 'extracted' if stage > 1 else 'pending'
+    proto.stage4_decision = ''
+    proto.error_message = ''
+    proto.save(update_fields=['current_stage', 'status', 'stage4_decision', 'error_message'] + fields)
+    return Response({
+        'detail': f'画布「{page.page_name}」已回退到阶段{stage-1}，标记需重跑',
+        'page': ModaoPageSerializer(page).data,
+        'proto': ModaoPrototypeSerializer(proto).data,
+    })
+
+
+@api_view(['POST'])
 def modao_ask(request, pk):
     """针对某阶段产物答疑：基于当前内容调用 LLM 回答，并追加到 qa_log。"""
     proto = get_object_or_404(ModaoPrototype, pk=pk)
@@ -769,6 +889,7 @@ def _adopt_to_library(proto, user, include_smoke=False):
             priority=_PRIO_MAP.get(priority, 'medium'),
             test_type=_TYPE_MAP.get((test_type or '').lower(), 'functional'),
             description=description, status='draft', author=user,
+            source='ai',
             sort_order=sort_order,
         )
         tc.save()
@@ -931,6 +1052,7 @@ def _adopt_single_case(proto, user, case_index):
         priority=_PRIO_MAP.get(priority, 'medium'),
         test_type=_TYPE_MAP.get((test_type or '').lower(), 'functional'),
         description=description, status='draft', author=user,
+        source='ai',
         sort_order=case_index + 1,
     )
     tc.save()
@@ -1048,7 +1170,7 @@ def modao_log_raw(request):
     proto_status = ''
     if finished:
         try:
-            from apps.requirement_analysis.models import ModaoPrototype
+            from apps.requirement_analysis.models import ModaoPrototype, ModaoPage
             p = ModaoPrototype.objects.filter(pk=36).first()
             if p:
                 proto_status = p.status
