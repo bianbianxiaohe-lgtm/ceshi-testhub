@@ -26,7 +26,7 @@ from .models import (
     TestCase, TestCaseStep, TestCaseExecution, OperationRecord,
     UiScheduledTask, UiNotificationLog, UiTaskNotificationSetting,
     AICase, AIExecutionRecord,
-    AppDevice, AppConfig
+    AppDevice, AppConfig, BusinessAction
 )
 from .serializers import (
     UiProjectSerializer, UiProjectCreateSerializer, UiProjectUpdateSerializer,
@@ -45,7 +45,7 @@ from .serializers import (
     OperationRecordSerializer,
     UiScheduledTaskSerializer, UiNotificationLogSerializer, UiTaskNotificationSettingSerializer,
     AICaseSerializer, AIExecutionRecordSerializer,
-    AppDeviceSerializer, AppConfigSerializer
+    AppDeviceSerializer, AppConfigSerializer, BusinessActionSerializer
 )
 from .operation_logger import log_operation
 
@@ -3818,6 +3818,76 @@ class AICaseViewSet(viewsets.ModelViewSet):
 
         return Response(result)
 
+    @action(detail=False, methods=['post'], url_path='midscene-save-step')
+    def midscene_save_step(self, request):
+        """
+        Midscene 步骤沉淀（B 方案）：把 Playground 验证过的自然语言步骤，
+        直接 append 进指定 AICase 的 steps（结构化固化），后续走 _run_midscene 重放免重复试错。
+
+        入参：
+          ai_case_id  目标用例（必填）
+          action/prompt/selector_hint/value/name/wait_ms/extract/assert 步骤字段
+        """
+        data = request.data
+        ai_case_id = data.get('ai_case_id')
+        prompt = (data.get('prompt') or '').strip()
+        action = data.get('action') or 'aiAct'
+
+        if not ai_case_id:
+            return Response(
+                {'error': 'ai_case_id 必填（要沉淀到哪个 AI 用例的 steps）'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not prompt:
+            return Response(
+                {'error': 'prompt（自然语言操作指令）不能为空'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if action not in ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'assert', 'wait',
+                          'launch', 'back', 'home', 'screenshot'):
+            return Response(
+                {'error': 'action 不支持: %s' % action},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            ai_case = AICase.objects.get(id=ai_case_id)
+        except AICase.DoesNotExist:
+            return Response(
+                {'error': 'AI 用例不存在 id=%s' % ai_case_id},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # 沉淀到 midscene 用例：若用例仍是 text 模式，自动切换为 midscene（steps 才有意义）
+        if ai_case.execution_mode != 'midscene':
+            ai_case.execution_mode = 'midscene'
+
+        step = {
+            'name': (data.get('name') or '').strip() or '步骤%d' % (len(ai_case.steps) + 1),
+            'action': action,
+            'prompt': prompt,
+            'selector_hint': (data.get('selector_hint') or '').strip(),
+            'value': (data.get('value') or '').strip(),
+            'wait_ms': int(data.get('wait_ms') or 0),
+        }
+        extract = data.get('extract')
+        if extract:
+            step['extract'] = extract
+        assert_cfg = data.get('assert')
+        if assert_cfg:
+            step['assert'] = assert_cfg
+
+        ai_case.steps = (ai_case.steps or []) + [step]
+        ai_case.save(update_fields=['steps', 'execution_mode', 'updated_at'])
+
+        logger.info('[Midscene] 步骤已沉淀到 AICase#%s，当前 steps 数=%d', ai_case.id, len(ai_case.steps))
+        return Response({
+            'message': '步骤已追加到用例「%s」' % ai_case.name,
+            'ai_case_id': ai_case.id,
+            'steps_count': len(ai_case.steps),
+            'steps': ai_case.steps,
+        })
+
     @action(detail=True, methods=['post'])
     def run(self, request, pk=None):
         """执行 AI 用例"""
@@ -4594,24 +4664,46 @@ class AppConfigViewSet(viewsets.ModelViewSet):
     serializer_class = AppConfigSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['platform', 'project', 'ai_project']
+    # project/ai_project 不放进 filterset_fields：
+    # django-filter 会为外键生成 ModelChoiceFilter，无法接收 "ui_<id>"/"proj_<id>" 这种合成 id，
+    # 会抛「选择一个有效的选项」400。统一由 get_queryset 解析。
+    filterset_fields = ['platform']
     search_fields = ['name', 'package_name']
     ordering = ['platform', 'name']
 
     def get_queryset(self):
         """支持按 project 参数筛选（同时匹配 project 和 ai_project）"""
         qs = super().get_queryset()
-        project_param = self.request.query_params.get('project')
+        project_param = (self.request.query_params.get('project') or '').strip()
         if project_param:
             # project 参数可能是 "ui_xxx" 或 "proj_xxx" 格式
             if project_param.startswith('ui_'):
-                qs = qs.filter(project_id=project_param[3:])
+                tail = project_param[3:]
+                if tail.isdigit():
+                    qs = qs.filter(project_id=tail)
             elif project_param.startswith('proj_'):
-                qs = qs.filter(ai_project_id=project_param[6:])
-            else:
+                tail = project_param[6:]
+                if tail.isdigit():
+                    qs = qs.filter(ai_project_id=tail)
+            elif project_param.isdigit():
                 # 兼容纯数字（旧的 UiProject id）
                 qs = qs.filter(project_id=project_param)
+            # 非合法格式（空/含非数字字符）直接忽略，避免 500
         return qs
+
+
+class BusinessActionViewSet(viewsets.ModelViewSet):
+    """业务动作库（Prompt 与代码分离）"""
+    queryset = BusinessAction.objects.all()
+    serializer_class = BusinessActionSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['action']
+    search_fields = ['name', 'description', 'prompt']
+    ordering = ['name']
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
 
 
 @api_view(['GET'])
@@ -4694,12 +4786,15 @@ def ensure_ui_project(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def learn_elements(request):
-    """连接 Appium dump 当前页面控件，返回元素列表供前端选择"""
+    """dump 当前页面控件，返回元素列表供前端选择。
+    根据请求参数 engine 选择 AppiumTestEngine 或 AirtestRecordingEngine，
+    默认 Airtest（无需起 Appium Server）。"""
     from .smart_locator import dump_page_elements
 
     device_id = request.data.get('device_id')
     app_config_id = request.data.get('app_config_id')
     app_name = request.data.get('app_name', '万年历')
+    engine_type = (request.data.get('engine') or 'airtest').lower()
 
     if not device_id or not app_config_id:
         return Response({'success': False, 'message': '缺少 device_id 或 app_config_id'}, status=400)
@@ -4708,16 +4803,27 @@ def learn_elements(request):
         device = _resolve_recording_device(device_id)
         app_config = get_object_or_404(AppConfig, id=app_config_id)
 
-        from .appium_engine import AppiumTestEngine
-        engine = AppiumTestEngine(
-            appium_server_url=device.appium_server_url,
-            platform=device.platform,
-            device_udid=device.udid,
-            app_package=app_config.package_name,
-            app_activity=app_config.app_activity,
-            no_reset=True,
-            new_command_timeout=60,
-        )
+        if engine_type == 'airtest':
+            from .airtest_engine import AirtestRecordingEngine
+            _adb_host = getattr(device, 'adb_host', None) or None
+            engine = AirtestRecordingEngine(
+                serial=device.udid,
+                platform=device.platform,
+                app_package=app_config.package_name,
+                wda_url=device.appium_server_url,
+                adb_host=_adb_host,
+            )
+        else:
+            from .appium_engine import AppiumTestEngine
+            engine = AppiumTestEngine(
+                appium_server_url=device.appium_server_url,
+                platform=device.platform,
+                device_udid=device.udid,
+                app_package=app_config.package_name,
+                app_activity=app_config.app_activity,
+                no_reset=True,
+                new_command_timeout=60,
+            )
         engine.connect()
         try:
             engine.driver.activate_app(app_config.package_name)
@@ -5380,6 +5486,44 @@ def generate_recording_case(request):
     })
 
 
+def _extract_airtpl_files(script_file):
+    """若上传的是 .air 压缩包(zip)，解压提取模板图（tpl*.png）并写入 media/airtest_templates/<uuid>/。
+
+    返回 (py_script_text, {模板文件名: 相对路径})。非 zip 返回 (原文件文本, {})。
+    """
+    import io as _io
+    import os as _os
+    import zipfile
+    import uuid as _uuid
+    from django.conf import settings as _settings
+
+    raw = script_file.read()
+    # 尝试按 zip 解析（.air 压缩包 / .zip）
+    tpl_map = {}
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(raw))
+        # 找 .py 脚本
+        py_name = next((n for n in zf.namelist() if n.endswith('.py')), None)
+        py_text = zf.read(py_name).decode('utf-8', 'ignore') if py_name else ''
+        # 找模板图 tpl*.png
+        imgs = [n for n in zf.namelist() if n.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        if imgs:
+            sub = f"airtest_templates/{_uuid.uuid4().hex}"
+            base_dir = _os.path.join(str(_settings.MEDIA_ROOT), sub)
+            _os.makedirs(base_dir, exist_ok=True)
+            for n in imgs:
+                fname = n.split('/')[-1]
+                fpath = _os.path.join(base_dir, fname)
+                with open(fpath, 'wb') as f:
+                    f.write(zf.read(n))
+                tpl_map[fname] = f"{sub}/{fname}"
+        zf.close()
+        return py_text, tpl_map
+    except (zipfile.BadZipFile, Exception):
+        # 非 zip：当作纯文本
+        return raw.decode('utf-8', 'ignore'), {}
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def import_airtest_script(request):
@@ -5387,18 +5531,24 @@ def import_airtest_script(request):
 
     入参：
       - script: Airtest 脚本文本（与 script_file 二选一）
-      - script_file: 上传的 .air 脚本文件
+      - script_file: 上传的 .air/.zip 压缩包 或 .py 文件
       - project_id: 目标 UI 项目 ID（必填）
       - case_name: 用例名称（可选，默认自动命名）
       - app_package: 被测应用包名（可选，用于「启动应用」步骤描述）
     返回生成的 case_id 与解析出的步骤列表。
     """
     script = request.data.get('script') or ''
-    if not script and request.FILES.get('script_file'):
+    tpl_map = {}
+    sf = request.FILES.get('script_file')
+    if not script and sf:
         try:
-            script = request.FILES['script_file'].read().decode('utf-8', 'ignore')
+            # 尝试解压 .air 压缩包提取模板图；非 zip 则读纯文本
+            script, tpl_map = _extract_airtpl_files(sf)
         except Exception:
-            script = ''
+            try:
+                script = sf.read().decode('utf-8', 'ignore')
+            except Exception:
+                script = ''
     if not script.strip():
         return Response({'success': False, 'message': '请提供 script 文本或上传 script_file（.air/.py）'}, status=400)
 
@@ -5420,6 +5570,17 @@ def import_airtest_script(request):
 
     if not steps:
         return Response({'success': False, 'message': '未能从脚本中解析出任何操作步骤'}, status=400)
+
+    # 图像步骤：把模板图文件名映射为已保存的相对路径（airtest_templates/<uuid>/xxx.png），
+    # 供执行时用 Airtest 图像识别定位。找不到对应图时保留原文件名（执行时跳过）。
+    if tpl_map:
+        for st in steps:
+            ed = st.get('element') or {}
+            if (ed.get('locator_strategy') or '').lower() == 'image':
+                fname = (ed.get('value') or '').split('/')[-1]
+                if fname in tpl_map:
+                    ed['value'] = tpl_map[fname]
+                    ed['locator_value'] = tpl_map[fname]
 
     try:
         test_case, created_elements, step_count = _build_test_case_from_steps(

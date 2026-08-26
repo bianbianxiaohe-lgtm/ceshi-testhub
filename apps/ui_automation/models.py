@@ -1237,3 +1237,59 @@ class AppPipelineRun(models.Model):
     def __str__(self):
         return f"Pipeline #{self.id} - {self.app_config.name} - {self.get_status_display()}"
 
+
+# ==================== 业务动作库（Prompt 与代码分离） ====================
+
+class BusinessAction(models.Model):
+    """业务动作（一个动作 = 一个明确的自然语言业务操作）。
+
+    Prompt 与代码分离：每个动作对应一条「经过 Playground 真机验证」的语义 prompt，
+    由 Playground 一键生成，也可在业务动作库管理页手工编辑。
+    正式用例 AICase.steps 中可用 {ref: 动作名} 引用，避免把 prompt 内联写死在用例里。
+    """
+    ACTION_CHOICES = [
+        ('aiAct', 'aiAct（自然语言执行）'),
+        ('aiTap', 'aiTap（点击）'),
+        ('aiInput', 'aiInput（输入）'),
+        ('aiQuery', 'aiQuery（提取）'),
+        ('assert', 'assert（断言）'),
+    ]
+
+    name = models.CharField(max_length=100, unique=True, verbose_name='动作名', help_text='唯一标识，如 login / select-product')
+    description = models.CharField(max_length=200, blank=True, verbose_name='描述')
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES, default='aiAct', verbose_name='动作类型')
+    prompt = models.TextField(verbose_name='语义指令', help_text='自然语言操作指令，禁止写坐标，跨机型可复用')
+    selector_hint = models.CharField(max_length=300, blank=True, verbose_name='定位提示', help_text='可选，aiTap/aiInput 优先用此定位')
+    value = models.CharField(max_length=300, blank=True, verbose_name='输入值', help_text='aiInput 使用，支持 ${{key}} 上下文变量')
+    wait_ms = models.IntegerField(default=0, verbose_name='等待毫秒')
+    extract = models.JSONField(default=list, blank=True, verbose_name='提取配置', help_text='[{key,prompt,type,required}]，aiQuery 提取业务数据写入上下文')
+    assert_config = models.JSONField(default=dict, blank=True, verbose_name='断言配置', help_text='{prompt, expect}')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='创建人')
+
+    class Meta:
+        db_table = 'ui_business_actions'
+        verbose_name = '业务动作'
+        verbose_name_plural = '业务动作'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+    def to_step(self) -> dict:
+        """展开为 midscene 引擎可直接执行的 step dict。"""
+        step = {
+            'name': self.name,
+            'action': self.action,
+            'prompt': self.prompt,
+            'selector_hint': self.selector_hint or '',
+            'value': self.value or '',
+            'wait_ms': self.wait_ms or 0,
+        }
+        if self.extract:
+            step['extract'] = self.extract
+        if self.assert_config:
+            step['assert'] = self.assert_config
+        return step
+

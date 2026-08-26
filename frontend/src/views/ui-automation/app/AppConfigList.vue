@@ -296,7 +296,21 @@ const loadProjects = async () => {
       })
     }
     
-    projects.value = Array.from(mergedMap.values())
+    // 按名称去重：同名项目只保留一份（AI 项目优先）。
+    // 业务源头是 AI 生成用例模块：先创建 AI 项目，再由它衍生出 UI 自动化等功能。
+    // 因此同名项目只保留 AI 那份（proj_），不再额外展示/派生 UiProject 副本。
+    const byName = new Map()
+    for (const p of Array.from(mergedMap.values())) {
+      const exist = byName.get(p.name)
+      if (!exist) {
+        byName.set(p.name, p)
+        continue
+      }
+      if (exist.source !== 'proj' && p.source === 'proj') {
+        byName.set(p.name, p)
+      }
+    }
+    projects.value = Array.from(byName.values())
   } catch (error) {
     // 项目列表加载失败不影响主功能
   }

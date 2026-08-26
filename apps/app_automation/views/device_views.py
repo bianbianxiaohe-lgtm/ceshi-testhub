@@ -18,6 +18,56 @@ from ..managers.device_manager import DeviceManager
 logger = logging.getLogger(__name__)
 
 
+def sync_devices_to_ui_automation(devices):
+    """
+    把 app-automation 发现的设备同步到 ui_automation.AppDevice（midscene 真正读的表）。
+
+    - 按 udid 匹配（app-automation 的 device_id 即 ui-automation 的 udid）。
+    - 仅同步「真实设备」（排除模拟器/占位/远程 IP 形式），更新 name/adb_host/status。
+    - 不删除 ui-automation 中已存在的设备，仅 upsert 新增与更新。
+    """
+    try:
+        from apps.ui_automation.models import AppDevice as UiAppDevice
+    except Exception as e:
+        logger.warning(f"同步到 ui_automation 失败（导入错误）: {e}")
+        return 0
+
+    synced = 0
+    for dev in devices:
+        device_id = dev.device_id
+        # 跳过占位主机记录和模拟器/远程 IP 形式
+        if not device_id or device_id.startswith('adb-host:') or device_id.startswith('emulator-') or ':' in device_id:
+            continue
+
+        # status 映射：app-automation 的 available/online 视为在线
+        status = dev.status
+        if status in ('available', 'online'):
+            ui_status = 'online'
+        elif status in ('locked',):
+            ui_status = 'busy'
+        else:
+            ui_status = 'offline'
+
+        try:
+            obj, created = UiAppDevice.objects.update_or_create(
+                udid=device_id,
+                defaults={
+                    'name': dev.name or device_id,
+                    'platform': 'android',
+                    'platform_version': dev.android_version or '',
+                    'device_type': 'real',
+                    'adb_host': dev.adb_host or '',
+                    'status': ui_status,
+                }
+            )
+            synced += 1
+        except Exception as e:
+            logger.warning(f"同步设备 {device_id} 到 ui_automation 失败: {e}")
+
+    logger.info(f"已同步 {synced} 个设备到 ui_automation.AppDevice")
+    return synced
+
+
 def get_adb_path() -> str:
     """
     获取 ADB 路径：优先使用数据库配置，否则使用默认值 'adb'
@@ -66,11 +116,15 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             # 逐个主机扫描，合并结果
             all_devices = []
             seen_device_ids = set()
+            # 记录哪些主机可达（用于把不可达主机下的设备置 offline）
+            reachable_hosts = set()
             
             for host in known_hosts:
                 try:
                     manager = DeviceManager(adb_path=adb_path, adb_host=host)
-                    devices_info = manager.list_devices()
+                    # 短超时快速失败，避免死 IP 拖垮整个扫描
+                    devices_info = manager.list_devices(timeout=3)
+                    reachable_hosts.add(host)
                     
                     for device_info in devices_info:
                         device_id = device_info['device_id']
@@ -109,6 +163,17 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
                     logger.warning(f"扫描主机 {host} 失败: {str(e)}")
                     continue
             
+            # 不可达主机（扫描失败/超时）下的设备，标记为离线（不删除，保留历史记录）
+            if known_hosts:
+                unreachable_hosts = set(known_hosts) - reachable_hosts
+                if unreachable_hosts:
+                    updated = AppDevice.objects.filter(
+                        adb_host__in=unreachable_hosts
+                    ).exclude(
+                        device_id__startswith='adb-host:'
+                    ).update(status='offline')
+                    logger.info(f"标记 {updated} 个不可达主机下的设备为离线: {unreachable_hosts}")
+            
             # 清理已无对应真实设备的占位主机记录（该主机下已发现真实设备时移除占位）
             placeholder_hosts = list(
                 AppDevice.objects
@@ -118,6 +183,9 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
             for ph_id, ph_host in placeholder_hosts:
                 if ph_host and AppDevice.objects.filter(adb_host=ph_host).exclude(device_id=ph_id).exists():
                     AppDevice.objects.filter(device_id=ph_id).delete()
+            
+            # 同步到 ui_automation.AppDevice（midscene 执行设备真正读取的表）
+            sync_devices_to_ui_automation(all_devices)
             
             # 返回序列化后的数据库对象
             return Response({
@@ -338,6 +406,9 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
 
             # 已发现真实设备，移除占位主机记录
             AppDevice.objects.filter(device_id=placeholder_id).delete()
+
+            # 同步到 ui_automation.AppDevice（midscene 执行设备真正读取的表）
+            sync_devices_to_ui_automation(all_devices)
 
             return Response({
                 'success': True,

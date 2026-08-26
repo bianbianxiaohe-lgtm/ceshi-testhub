@@ -1270,3 +1270,49 @@ export function generateRecordingCase(data) {
     data
   })
 }
+
+// ==================== 业务动作库（Prompt 与代码分离） ====================
+
+// 获取业务动作列表
+export function getBusinessActions(params) {
+  return request({
+    url: '/ui-automation/business-actions/',
+    method: 'get',
+    params
+  })
+}
+
+// 创建业务动作
+export function createBusinessAction(data) {
+  return request({
+    url: '/ui-automation/business-actions/',
+    method: 'post',
+    data
+  })
+}
+
+// 更新业务动作
+export function updateBusinessAction(id, data) {
+  return request({
+    url: `/ui-automation/business-actions/${id}/`,
+    method: 'patch',
+    data
+  })
+}
+
+// 删除业务动作
+export function deleteBusinessAction(id) {
+  return request({
+    url: `/ui-automation/business-actions/${id}/`,
+    method: 'delete'
+  })
+}
+
+// 把 Midscene Playground 验证过的步骤沉淀进指定 AI 用例的 steps（midscene 模式固化）
+export function saveMidsceneStep(data) {
+  return request({
+    url: '/ui-automation/ai-cases/midscene-save-step/',
+    method: 'post',
+    data
+  })
+}

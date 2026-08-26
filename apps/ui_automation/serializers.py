@@ -8,7 +8,7 @@ from .models import (
     UiScheduledTask, UiNotificationLog, UiTaskNotificationSetting,
     AICase, AIExecutionRecord,
     AppDevice, AppConfig,
-    AppPipelineRun
+    AppPipelineRun, BusinessAction
 )
 from django.contrib.auth import get_user_model
 
@@ -1043,4 +1043,19 @@ class AppPipelineRunSerializer(serializers.ModelSerializer):
             'id', 'status', 'status_display', 'log', 'result_summary',
             'snapshot_path', 'report_url', 'created_at', 'started_at', 'finished_at', 'duration'
         ]
+
+
+class BusinessActionSerializer(serializers.ModelSerializer):
+    """业务动作序列化器（Prompt 与代码分离）"""
+    action_display = serializers.CharField(source='get_action_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True, allow_null=True)
+
+    class Meta:
+        model = BusinessAction
+        fields = [
+            'id', 'name', 'description', 'action', 'action_display', 'prompt',
+            'selector_hint', 'value', 'wait_ms', 'extract', 'assert_config',
+            'created_by', 'created_by_name', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
 

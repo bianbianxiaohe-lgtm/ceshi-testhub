@@ -24,6 +24,7 @@ from .views import (
     UiDashboardViewSet,
     AppDeviceViewSet,
     AppConfigViewSet,
+    BusinessActionViewSet,
     get_all_projects_unified,
     ensure_ui_project,
     learn_elements,
@@ -70,6 +71,7 @@ router.register(r'ai-models', AIIntelligentModeConfigViewSet, basename='ai-model
 router.register(r'app-devices', AppDeviceViewSet)
 router.register(r'app-configs', AppConfigViewSet)
 router.register(r'app-pipelines', AppPipelineRunViewSet)
+router.register(r'business-actions', BusinessActionViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),

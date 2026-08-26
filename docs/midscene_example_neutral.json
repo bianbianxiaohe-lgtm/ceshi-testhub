@@ -1,0 +1,61 @@
+{
+  "description": "Midscene APP 自动化中性示例用例（非电商，用于验证步骤模型与业务锚点机制）。本示例模拟一个通用的『内容型 App』主流程：进入、操作列表项、提交、回查结果。请按需替换为任意业务。",
+  "execution_mode": "midscene",
+  "app_config": {
+    "package_name": "com.example.app",
+    "app_activity": ".MainActivity"
+  },
+  "device": {
+    "udid": "设备的 udid",
+    "adb_host": "192.168.8.71:5037"
+  },
+  "steps": [
+    {
+      "name": "启动并判断是否已登录",
+      "action": "aiAct",
+      "prompt": "若当前未登录，则使用已配置的测试账号完成登录；若已登录则保持当前状态，不要退出重登。",
+      "extract": [
+        {
+          "key": "login_state",
+          "prompt": "当前页面是否已处于登录态？",
+          "type": "boolean",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "进入内容列表并操作首个条目",
+      "action": "aiAct",
+      "prompt": "进入主列表，对第一个常规条目执行『打开详情』操作。",
+      "extract": [
+        {
+          "key": "entity_title",
+          "prompt": "当前详情页的主标题是什么？",
+          "type": "string",
+          "required": true
+        },
+        {
+          "key": "entity_id",
+          "prompt": "当前条目的唯一标识（如 ID 或编号）是什么？",
+          "type": "string",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "提交业务操作",
+      "action": "aiTap",
+      "selector_hint": "提交按钮",
+      "prompt": "点击提交按钮，完成本次业务操作。",
+      "wait_ms": 1500
+    },
+    {
+      "name": "回查结果并断言",
+      "action": "assert",
+      "assert": {
+        "prompt": "页面是否提示操作成功，且显示的标题与 ${{entity_title}} 一致？",
+        "expect": "操作成功且标题一致"
+      }
+    }
+  ]
+}
