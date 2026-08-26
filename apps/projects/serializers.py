@@ -49,7 +49,7 @@ class ProjectKnowledgeSerializer(serializers.ModelSerializer):
         model = ProjectKnowledge
         fields = [
             'id', 'project', 'title', 'category', 'category_display',
-            'content', 'is_active', 'sort_order',
+            'content', 'is_active', 'sort_order', 'source', 'needs_review',
             'created_by', 'created_by_name', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']

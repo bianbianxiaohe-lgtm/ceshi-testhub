@@ -193,11 +193,14 @@
                 <div v-if="knowledgeLoading" style="padding:20px"><el-skeleton :rows="3" animated /></div>
                 <div v-else-if="knowledgeList.length === 0" style="padding:30px;text-align:center;color:#c0c4cc">暂无条目</div>
                 <div v-else class="kb-db-list">
-                  <div v-for="item in (knowledgeList || [])" :key="item && item.id" class="kb-db-card" :class="{ 'is-disabled': !item?.is_active }">
+                  <div v-for="item in (knowledgeList || [])" :key="item && item.id" class="kb-db-card" :class="{ 'is-disabled': !item?.is_active, 'is-pending': item?.needs_review }">
                     <div class="kb-db-card-hd">
                       <el-tag :type="getCategoryTagType(item.category)" size="small">{{ item.category_display }}</el-tag>
+                      <el-tag v-if="item?.source === 'zentao_coverage'" type="info" size="small" effect="plain">自动沉淀</el-tag>
+                      <el-tag v-if="item?.needs_review" type="warning" size="small">待复核</el-tag>
                       <span class="kb-db-title">{{ item.title }}</span>
                       <el-switch v-model="item.is_active" size="small" @change="toggleKnowledge(item)" />
+                      <el-button v-if="item?.needs_review" size="small" type="success" link @click="confirmKnowledge(item)">确认</el-button>
                       <el-button size="small" link @click="openKnowledgeDialog(item)">编辑</el-button>
                       <el-button size="small" type="danger" link @click="deleteKnowledge(item)">删除</el-button>
                     </div>
@@ -966,6 +969,40 @@ const toggleKnowledge = async (item) => {
   }
 }
 
+const confirmKnowledge = async (item) => {
+  // 确认前先做语义去重预检：若知识库已有高度相似（>=0.90）条目，提示人工判断
+  try {
+    const dupRes = await api.post(`/projects/${route.params.id}/knowledge/check-duplicate/`, {
+      entry_id: item.id,
+    })
+    const dups = (dupRes.data && dupRes.data.duplicates) || []
+    if (dupRes.data && dupRes.data.has_duplicate && dups.length) {
+      const top = dups[0]
+      const list = dups
+        .map((d) => `• ${(d.title || '未命名')}（相似度 ${(d.similarity * 100).toFixed(1)}%）`)
+        .join('\n')
+      try {
+        await ElMessageBox.confirm(
+          `该条目与知识库中以下内容高度相似，确认后仍会重复沉淀：\n\n${list}\n\n是否仍然确认纳入？`,
+          `疑似重复（${(top.similarity * 100).toFixed(1)}%）`,
+          { type: 'warning', confirmButtonText: '仍然确认', cancelButtonText: '取消' }
+        )
+      } catch {
+        return // 用户取消，不确认
+      }
+    }
+  } catch {
+    // 去重预检失败则放行，不阻断确认
+  }
+  try {
+    await api.patch(`/projects/${route.params.id}/knowledge/${item.id}/`, { needs_review: false })
+    item.needs_review = false
+    ElMessage.success('已确认，知识条目已纳入生成召回')
+  } catch {
+    ElMessage.error('确认失败')
+  }
+}
+
 const deleteKnowledge = async (item) => {
   try {
     await ElMessageBox.confirm(`确定删除「${item.title}」吗？`, '提示', { type: 'warning' })
@@ -1450,6 +1487,7 @@ const FsTreeNode = {
     border: 1px solid #e4e7ed; border-radius: 6px; padding: 10px 14px;
     background: #fff;
     &.is-disabled { opacity: 0.5; background: #f9f9f9; }
+    &.is-pending { border-color: #e6a23c; background: #fdf6ec; }
     .kb-db-card-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
     .kb-db-title { font-weight: 600; color: #303133; flex: 1; }
     .kb-db-content { font-size: 13px; color: #606266; white-space: pre-wrap; }

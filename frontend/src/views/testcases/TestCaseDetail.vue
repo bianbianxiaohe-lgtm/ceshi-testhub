@@ -70,6 +70,7 @@
           <div v-html="testcase.preconditions || '无'"></div>
         </el-descriptions-item>
         <el-descriptions-item label="操作步骤" :span="2">
+          <el-alert v-if="testcase.steps && testcase.steps.includes('【步骤缺失')" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
           <div class="steps-content" v-html="testcase.steps || '无'"></div>
         </el-descriptions-item>
         <el-descriptions-item label="预期结果" :span="2">

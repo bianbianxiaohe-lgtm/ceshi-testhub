@@ -194,6 +194,94 @@ class ProjectKnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
+# 语义去重阈值：相似度 >= 此值视为"疑似重复"
+KB_DUP_SIMILARITY_THRESHOLD = 0.90
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def check_kb_duplicate(request, project_id):
+    """
+    确认知识条目（特别是待复核的自动沉淀条目）前，做语义去重预检。
+
+    请求体（二选一）：
+      - { "entry_id": 123 }                      按已有条目取 title/content
+      - { "title": "...", "content": "..." }      按传入文本查重
+    返回：
+      {
+        "duplicates": [
+          { "id": 88, "title": "...", "category": "...",
+            "similarity": 0.94, "content_preview": "..." }, ...
+        ],
+        "has_duplicate": true/false   # 是否存在 >= 阈值的高相似已确认条目
+      }
+    """
+    try:
+        project = Project.objects.get(id=project_id)
+    except Project.DoesNotExist:
+        return Response({'error': '项目不存在'}, status=404)
+
+    entry_id = request.data.get('entry_id')
+    title = request.data.get('title', '')
+    content = request.data.get('content', '')
+    if entry_id:
+        try:
+            entry = ProjectKnowledge.objects.get(id=entry_id, project_id=project_id)
+            title = title or entry.title
+            content = content or entry.content
+        except ProjectKnowledge.DoesNotExist:
+            return Response({'error': '知识条目不存在'}, status=404)
+
+    if not (title or content):
+        return Response({'error': '请提供 entry_id 或 title/content'}, status=400)
+
+    try:
+        from apps.requirement_analysis.models import AIModelService
+        from apps.requirement_analysis.vector_store import (
+            get_project_kb_collection, query_kb
+        )
+        embedder = AIModelService.embed_texts_sync([f'{title}\n{content}'])
+        if not embedder:
+            # 无 embedder 配置时降级：不做去重预检，直接放行
+            return Response({'duplicates': [], 'has_duplicate': False,
+                             'note': '未配置向量化模型，跳过语义去重'})
+        collection = get_project_kb_collection(project_id)
+        hits = query_kb(collection, embedder[0], top_k=5)
+        duplicates = []
+        for h in hits:
+            # 排除自身
+            if entry_id and str(h.get('id')) == f'pk_{entry_id}':
+                continue
+            sim = h.get('similarity', 0.0)
+            if sim >= KB_DUP_SIMILARITY_THRESHOLD:
+                meta = h.get('meta') or {}
+                # 从 id 反解条目主键
+                kb_id = None
+                if str(h.get('id', '')).startswith('pk_'):
+                    try:
+                        kb_id = int(str(h.get('id'))[3:])
+                    except ValueError:
+                        kb_id = None
+                duplicates.append({
+                    'id': kb_id,
+                    'vector_id': h.get('id'),
+                    'title': meta.get('title') or (meta.get('text_preview') or '')[:60],
+                    'category': meta.get('category', ''),
+                    'similarity': round(sim, 4),
+                    'content_preview': (meta.get('text_preview') or '')[:200],
+                })
+        duplicates.sort(key=lambda x: x['similarity'], reverse=True)
+        return Response({
+            'duplicates': duplicates,
+            'has_duplicate': len(duplicates) > 0,
+            'threshold': KB_DUP_SIMILARITY_THRESHOLD,
+        })
+    except Exception as e:
+        logger.warning(f'[KB] 语义去重预检失败（降级放行）: {e}')
+        return Response({'duplicates': [], 'has_duplicate': False,
+                         'note': f'去重预检异常，已降级放行: {e}'})
+
+
 # ============================================================
 # 文件系统知识库（Markdown 文件驱动）
 # ============================================================

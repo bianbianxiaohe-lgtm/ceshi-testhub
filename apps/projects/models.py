@@ -101,6 +101,21 @@ class ProjectKnowledge(models.Model):
     content = models.TextField(verbose_name='内容')
     is_active = models.BooleanField(default=True, verbose_name='是否启用')
     sort_order = models.IntegerField(default=0, verbose_name='排序权重')
+    version = models.ForeignKey(
+        'versions.Version',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='knowledge_entries',
+        verbose_name='适用版本（空=全项目通用）',
+    )
+    source = models.CharField(max_length=30, default='manual', verbose_name='来源')
+    needs_review = models.BooleanField(
+        default=False,
+        verbose_name='待复核',
+        help_text='自动沉淀（来源=zentao_coverage）的条目默认待复核，'
+                  '人工确认前不进入向量召回；手动创建默认为 False'
+    )
     created_by = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,

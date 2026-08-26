@@ -72,6 +72,15 @@
             </el-form-item>
           </el-col>
           <el-col :span="8">
+            <el-form-item label="来源" prop="source">
+              <el-select v-model="form.source" placeholder="请选择来源">
+                <el-option label="人工编写" value="manual" />
+                <el-option label="AI生成" value="ai" />
+                <el-option label="未标记" value="unknown" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
             <el-form-item label="关联版本">
               <el-select 
                 v-model="form.version_ids" 
@@ -225,6 +234,7 @@ const form = reactive({
   priority: 'medium',
   test_type: 'functional',
   status: 'draft',
+  source: 'manual',
   preconditions: '',
   steps: '',
   expected_result: '',

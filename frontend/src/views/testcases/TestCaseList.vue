@@ -171,6 +171,7 @@
             <el-link @click="goToTestCase(row.id)" type="primary">
               {{ row.title }}
             </el-link>
+            <el-tag v-if="row.steps && row.steps.includes('【步骤缺失')" size="mini" type="danger" style="margin-left:6px">步骤缺失</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="project.name" label="关联项目" min-width="120">
@@ -238,6 +239,11 @@
         <el-table-column prop="status" label="状态" min-width="70">
           <template #default="{ row }">
             <el-tag :type="getStatusType(row.status)">{{ getStatusText(row.status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="source" label="来源" min-width="80">
+          <template #default="{ row }">
+            <el-tag :type="getSourceType(row.source)" size="small">{{ getSourceText(row.source) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="执行结果" min-width="80">
@@ -1079,6 +1085,24 @@ const getStatusText = (status) => {
     deprecated: '废弃'
   }
   return textMap[status] || status
+}
+
+const getSourceType = (source) => {
+  const typeMap = {
+    ai: 'success',
+    manual: 'primary',
+    unknown: 'info'
+  }
+  return typeMap[source] || 'info'
+}
+
+const getSourceText = (source) => {
+  const textMap = {
+    ai: 'AI生成',
+    manual: '人工',
+    unknown: '未标记'
+  }
+  return textMap[source] || '未标记'
 }
 
 const getTypeText = (type) => {
