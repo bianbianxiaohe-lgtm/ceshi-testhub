@@ -161,6 +161,28 @@ CREATE TABLE IF NOT EXISTS modao_page (
 ''')
 print('ensured table modao_page')
 
+# 确保 modao_page 有 selected / recognition_note 列（画布模块人工校验）
+for col, ddl in (
+    ('selected', 'ALTER TABLE modao_page ADD COLUMN selected TINYINT(1) NOT NULL DEFAULT 1'),
+    ('recognition_note', "ALTER TABLE modao_page ADD COLUMN recognition_note VARCHAR(200) NOT NULL DEFAULT ''"),
+    ('current_stage', 'ALTER TABLE modao_page ADD COLUMN current_stage INT NOT NULL DEFAULT 0'),
+    ('stage_status', "ALTER TABLE modao_page ADD COLUMN stage_status VARCHAR(20) NOT NULL DEFAULT 'pending'"),
+    ('work_log', 'ALTER TABLE modao_page ADD COLUMN work_log LONGTEXT NOT NULL'),
+    ('error_message', 'ALTER TABLE modao_page ADD COLUMN error_message LONGTEXT NOT NULL'),
+    ('rerun_stages', 'ALTER TABLE modao_page ADD COLUMN rerun_stages LONGTEXT NOT NULL'),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'modao_page' AND column_name = %s",
+        (col,),
+    )
+    if not cur.fetchone():
+        cur.execute(ddl)
+        print(f'ensured column {col} on modao_page')
+    else:
+        print(f'{col} already exists')
+
+
 # 确保墨刀原型表有 work_log 列（工作日志：各阶段进度记录）
 cur.execute(
     "SELECT 1 FROM information_schema.columns "
@@ -236,6 +258,18 @@ if not cur.fetchone():
     print('ensured column confirmed_answers on testcase_generation_task')
 else:
     print('confirmed_answers already exists')
+
+# 确保项目知识库表有 needs_review 列（知识沉淀待复核机制：自动沉淀条目默认待复核，
+# 人工确认前不进入向量召回）
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'project_knowledge' AND column_name = 'needs_review'",
+)
+if not cur.fetchone():
+    cur.execute('ALTER TABLE project_knowledge ADD COLUMN needs_review TINYINT(1) NOT NULL DEFAULT 0')
+    print('ensured column needs_review on project_knowledge')
+else:
+    print('needs_review already exists')
 
 # 确保 App 自动化流水线运行记录表存在（新功能：选应用 + 自定义阶段 + 运行记录重跑）。
 # 注意：app_configs / app_devices 库内主键实际为 INT（与模型 BigAutoField 存在漂移），

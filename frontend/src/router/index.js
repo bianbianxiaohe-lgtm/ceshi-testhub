@@ -91,6 +91,11 @@ const routes = [
         component: () => import('@/views/versions/VersionList.vue')
       },
       {
+        path: 'zentao-coverage',
+        name: 'ZentaoCoverage',
+        component: () => import('@/views/zentao/ZentaoCoverage.vue')
+      },
+      {
         path: 'reviews',
         name: 'Reviews',
         component: () => import('@/views/reviews/ReviewList.vue')
@@ -457,6 +462,11 @@ const routes = [
         path: 'midscene-playground',
         name: 'MidscenePlayground',
         component: () => import('@/views/ui-automation/ai/MidscenePlayground.vue')
+      },
+      {
+        path: 'business-actions',
+        name: 'BusinessActionList',
+        component: () => import('@/views/ui-automation/ai/BusinessActionList.vue')
       }
     ]
   },

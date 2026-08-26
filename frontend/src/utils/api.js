@@ -50,6 +50,11 @@ api.interceptors.request.use(
       config.headers.Authorization = `Bearer ${userStore.accessToken}`
     }
 
+    // FormData（文件上传）：删除硬编码的 application/json，让浏览器自动设置 multipart boundary
+    if (config.data instanceof FormData) {
+      delete config.headers['Content-Type']
+    }
+
     return config
   },
   (error) => {

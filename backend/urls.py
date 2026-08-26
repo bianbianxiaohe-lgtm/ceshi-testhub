@@ -37,6 +37,7 @@ urlpatterns = [
     path('api/analytics/', include('apps.analytics.urls')),
     path('api/app-automation/', include('apps.app_automation.urls')),
     path('api/agent/', include('apps.api_agent.urls')),
+    path('api/zentao/', include('apps.zentao.urls')),
     # 日志查看器（直接注册，匹配前端 /requirement-analysis/api/modao/... 路径）
     path('requirement-analysis/api/modao/log-viewer/', modao_log_viewer, name='modao-log-viewer-root'),
     path('requirement-analysis/api/modao/log-raw/', modao_log_raw, name='modao-log-raw-root'),
