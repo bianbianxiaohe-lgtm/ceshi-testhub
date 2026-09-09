@@ -170,6 +170,13 @@ for col, ddl in (
     ('work_log', 'ALTER TABLE modao_page ADD COLUMN work_log LONGTEXT NOT NULL'),
     ('error_message', 'ALTER TABLE modao_page ADD COLUMN error_message LONGTEXT NOT NULL'),
     ('rerun_stages', 'ALTER TABLE modao_page ADD COLUMN rerun_stages LONGTEXT NOT NULL'),
+    ('page_summary', 'ALTER TABLE modao_page ADD COLUMN page_summary LONGTEXT NOT NULL'),
+    ('page_clarification', 'ALTER TABLE modao_page ADD COLUMN page_clarification LONGTEXT NOT NULL'),
+    ('page_testpoints_json', 'ALTER TABLE modao_page ADD COLUMN page_testpoints_json LONGTEXT NOT NULL'),
+    ('page_testcases_json', 'ALTER TABLE modao_page ADD COLUMN page_testcases_json LONGTEXT NOT NULL'),
+    ('page_smoke_json', 'ALTER TABLE modao_page ADD COLUMN page_smoke_json LONGTEXT NOT NULL'),
+    ('page_approved', 'ALTER TABLE modao_page ADD COLUMN page_approved TINYINT(1) NOT NULL DEFAULT 0'),
+    ('screenshot_segments', "ALTER TABLE modao_page ADD COLUMN screenshot_segments LONGTEXT NOT NULL DEFAULT ('[]')"),
 ):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
@@ -213,6 +220,19 @@ for col in ('feature_module_id', 'version_id'):
     )
     if not cur.fetchone():
         cur.execute(f'ALTER TABLE modao_prototype ADD COLUMN {col} INT')
+        print(f'ensured column {col} on modao_prototype')
+    else:
+        print(f'{col} already exists')
+
+# 确保 modao_prototype 有汇总采纳字段（A2-c：已采纳画布用例合并视图）
+for col in ('merged_testcases_json', 'merged_smoke_json'):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'modao_prototype' AND column_name = %s",
+        (col,),
+    )
+    if not cur.fetchone():
+        cur.execute(f'ALTER TABLE modao_prototype ADD COLUMN {col} LONGTEXT NOT NULL')
         print(f'ensured column {col} on modao_prototype')
     else:
         print(f'{col} already exists')
@@ -270,6 +290,29 @@ if not cur.fetchone():
     print('ensured column needs_review on project_knowledge')
 else:
     print('needs_review already exists')
+
+# 确保 AI 用例表的 app_config_id / device_id 允许为空。
+# 背景：该表是老表，部分环境建成了 NOT NULL DEFAULT 0，但模型 AICase.app_config / device
+# 均为 null=True。Django 插入时会显式写 NULL，在严格模式下直接报
+# (1048, "Column 'app_config_id' cannot be null")，导致该环境**任何** AI 用例都建不了
+# （不只是 Midscene Web，所有执行模式都受影响）。
+# 由于部分环境的 manage.py migrate 因历史迁移状态不一致而不可用，这里用幂等 DDL 兜底修复。
+for _col in ('app_config_id', 'device_id'):
+    cur.execute(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = %s",
+        (_col,),
+    )
+    _row = cur.fetchone()
+    if _row is None:
+        # 列都不存在（极端老库）就跳过，交给建表逻辑处理
+        print('skip %s on ui_ai_cases (column not found)' % _col)
+    elif _row[0] == 'NO':
+        cur.execute('ALTER TABLE ui_ai_cases MODIFY %s INT NULL DEFAULT NULL' % _col)
+        print('ensured column %s on ui_ai_cases is nullable' % _col)
+    else:
+        print('%s on ui_ai_cases already nullable' % _col)
+
 
 # 确保 App 自动化流水线运行记录表存在（新功能：选应用 + 自定义阶段 + 运行记录重跑）。
 # 注意：app_configs / app_devices 库内主键实际为 INT（与模型 BigAutoField 存在漂移），
