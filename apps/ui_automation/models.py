@@ -609,26 +609,32 @@ class TestCase(models.Model):
 class TestCaseStep(models.Model):
     """测试用例步骤模型"""
     ACTION_TYPE_CHOICES = [
-        ('click', '点击'),
-        ('tap', '轻触'),
-        ('double_tap', '双击'),
-        ('long_press', '长按'),
-        ('fill', '输入文本'),
-        ('input', '输入'),
-        ('clear', '清空'),
-        ('getText', '获取文本'),
-        ('waitFor', '等待元素'),
-        ('hover', '悬停'),
-        ('scroll', '滚动'),
-        ('swipe', '滑动'),
-        ('screenshot', '截图'),
-        ('assert', '断言'),
-        ('wait', '等待'),
-        ('switchTab', '切换标签页'),
-        ('launch_app', '启动应用'),
-        ('close_app', '关闭应用'),
-        ('back', '返回'),
-        ('home', '主页'),
+       ('click', '点击'),
+       ('tap', '轻触'),
+       ('double_tap', '双击'),
+       ('long_press', '长按'),
+       ('fill', '输入文本'),
+       ('input', '输入'),
+       ('clear', '清空'),
+       ('getText', '获取文本'),
+       ('waitFor', '等待元素'),
+       ('hover', '悬停'),
+       ('scroll', '滚动'),
+       ('swipe', '滑动'),
+       ('screenshot', '截图'),
+       ('assert', '断言'),
+       ('wait', '等待'),
+       ('switchTab', '切换标签页'),
+       ('launch_app', '启动应用'),
+       ('close_app', '关闭应用'),
+       ('back', '返回'),
+       ('home', '主页'),
+       ('aiAct', 'AI操作(Midscene)'),
+       ('aiTap', 'AI点击(Midscene)'),
+       ('aiInput', 'AI输入(Midscene)'),
+       ('aiQuery', 'AI查询(Midscene)'),
+       ('aiAssert', 'AI断言(Midscene)'),
+       ('navigate', '导航(Midscene)'),
     ]
 
     ASSERT_TYPE_CHOICES = [
@@ -1107,6 +1113,7 @@ class AICase(models.Model):
     EXECUTION_MODE_CHOICES = [
         ('text', '文本模式(browser-use)'),
         ('midscene', 'Midscene APP 自动化'),
+        ('midscene_web', 'Midscene Web 自动化'),
     ]
 
     project = models.ForeignKey(UiProject, on_delete=models.CASCADE, null=True, blank=True, verbose_name='所属项目')
@@ -1158,7 +1165,7 @@ class AIExecutionRecord(models.Model):
     ai_case = models.ForeignKey(AICase, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='关联AI用例')
     case_name = models.CharField(max_length=200, verbose_name='用例名称快照')
     task_description = models.TextField(blank=True, default='', verbose_name='任务描述', help_text='用户输入的原始任务描述')
-    execution_mode = models.CharField(max_length=20, choices=[('text', '文本模式'), ('midscene', 'Midscene APP 自动化')], default='text', verbose_name='执行模式')
+    execution_mode = models.CharField(max_length=20, choices=[('text', '文本模式'), ('midscene', 'Midscene APP 自动化'), ('midscene_web', 'Midscene Web 自动化')], default='text', verbose_name='执行模式')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='执行状态')
     start_time = models.DateTimeField(auto_now_add=True, verbose_name='开始时间')
     end_time = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')

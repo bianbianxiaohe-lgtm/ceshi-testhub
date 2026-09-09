@@ -23,6 +23,14 @@ from .models import (
 )
 from .variable_resolver import resolve_variables
 
+#: 传统 assert_type 枚举 -> 给 AI 断言模型看的自然语言模板
+_ASSERT_TYPE_TEXT = {
+    'textContains': '{target} 的文本内容包含「{val}」',
+    'textEquals': '{target} 的文本内容等于「{val}」',
+    'isVisible': '{target} 在页面上可见',
+    'exists': '页面上存在 {target}',
+    'hasAttribute': '{target} 的属性值包含「{val}」',
+}
 
 
 class TestExecutor:
@@ -115,8 +123,12 @@ class TestExecutor:
             # 根据引擎选择执行方式
             if self.engine == 'playwright':
                 self.run_with_playwright()
+            elif self.engine == 'midscene_web':
+                self.run_with_midscene_web()
             elif self.engine == 'appium':
                 self.run_with_appium()
+            elif self.engine == 'airtest':
+                self.run_with_airtest()
             else:
                 self.run_with_selenium()
 
@@ -1180,6 +1192,386 @@ class TestExecutor:
 
         return step_result
 
+    def run_with_midscene_web(self):
+        """使用 Midscene Web 引擎执行测试（基于 Playwright + AI 语义定位）"""
+        start_time = time.time()
+        passed = 0
+        failed = 0
+        skipped = 0
+
+        # 检查 Midscene 是否可用
+        try:
+            from .midscene_web_engine import MidsceneWebEngine
+        except ImportError as e:
+            error_msg = (
+                "Midscene Web 模块未安装。\n\n"
+                "请确保：\n"
+                "1. 已安装: pip install midscene playwright\n"
+                "2. 已安装浏览器: playwright install\n"
+                f"详细错误: {str(e)}"
+            )
+            print(f"❌ {error_msg}")
+            if self.execution:
+                self.update_execution_result(status='FAILED', failed=len(self.test_cases), error_msg=error_msg)
+            return
+
+        # 获取 Midscene 模型配置（真源：AIModelConfig role=midscene_vision）
+        # 注意：历史上这里误用不存在的 AIIntelligentModeConfig 且被 except 静默吞掉，
+        # 导致 model_config 恒为空、执行必失败且无日志。此处失败要显式暴露。
+        try:
+            from .midscene_web_engine import load_midscene_model_config
+            model_config = load_midscene_model_config()
+        except Exception as e:
+            print(f"❌ 读取 Midscene 模型配置失败: {e}")
+            if self.execution:
+                self.update_execution_result(
+                    status='FAILED', failed=len(self.test_cases),
+                    error_msg='读取 Midscene 模型配置失败: %s' % e)
+            return
+        if not model_config.get('api_key'):
+            error_msg = (
+                "未配置 Midscene 视觉模型。请在「AI 模型配置」中新增 role=midscene_vision "
+                "且已启用的多模态模型（需含 api_key / base_url / model_name）。"
+            )
+            print(f"❌ {error_msg}")
+            if self.execution:
+                self.update_execution_result(
+                    status='FAILED', failed=len(self.test_cases), error_msg=error_msg)
+            return
+
+        # 预先获取所有测试用例的步骤数据
+        test_cases_data = []
+        for test_case in self.test_cases:
+            case_data = {
+                'id': test_case.id,
+                'name': test_case.name,
+                'project_id': self.test_suite.project.id,
+                'steps': []
+            }
+
+            # 获取步骤并转换为 Midscene 格式
+            steps = test_case.steps.select_related('element').order_by('step_number')
+            for step in steps:
+                step_data = {
+                    'id': step.id,
+                    'step_number': step.step_number,
+                    'action_type': step.action_type,
+                    'description': step.description,
+                    'input_value': step.input_value,
+                    'wait_time': step.wait_time,
+                    'assert_type': step.assert_type,
+                    'assert_value': step.assert_value,
+                    'element': None
+                }
+
+                if step.element:
+                    step_data['element'] = {
+                        'id': step.element.id,
+                        'name': step.element.name,
+                        'locator_value': step.element.locator_value,
+                        'locator_strategy': step.element.locator_strategy.name if step.element.locator_strategy else 'css'
+                    }
+
+                case_data['steps'].append(step_data)
+
+            test_cases_data.append(case_data)
+
+        # 创建用例执行记录
+        case_executions = {}
+        for test_case in self.test_cases:
+            case_executions[test_case.id] = TestCaseExecution.objects.create(
+                test_case=test_case,
+                test_suite=self.test_suite,
+                project=self.test_suite.project,
+                execution_source='suite',
+                status='running',
+                engine='midscene_web',
+                browser='chromium',
+                headless=self.headless,
+                created_by=self.executed_by,
+                started_at=timezone.now()
+            )
+
+        # 套件内所有用例复用同一个浏览器实例，避免 N 个用例 N 次冷启动
+        engine = MidsceneWebEngine(
+            base_url=self.test_suite.project.base_url if self.test_suite.project else '',
+            model_config=model_config,
+            headless=self.headless
+        )
+
+        try:
+            engine.start()
+        except Exception as e:
+            print(f"✗ Midscene Web 引擎启动失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            for case_execution in case_executions.values():
+                case_execution.status = 'failed'
+                case_execution.error_message = str(e)
+                case_execution.finished_at = timezone.now()
+                case_execution.save()
+            self.update_execution_result(
+                status='FAILED', passed=0, failed=len(test_cases_data),
+                skipped=0, duration=time.time() - start_time,
+                error_msg='Midscene Web 引擎启动失败: %s' % e)
+            return
+
+        # 执行测试用例
+        try:
+            for case_data in test_cases_data:
+                try:
+                    print(f"\n🧪 开始执行用例: {case_data['name']} (Midscene Web)")
+
+                    # 转换步骤为 Midscene 格式
+                    midscene_steps = self._convert_to_midscene_steps(case_data['steps'])
+
+                    # 如果项目有基础 URL 且第一步不是导航，自动添加导航步骤
+                    base_url = self.test_suite.project.base_url if self.test_suite.project else ''
+                    if base_url and (not midscene_steps or midscene_steps[0].get('action') != 'navigate'):
+                        midscene_steps.insert(0, {
+                            'action': 'navigate',
+                            'prompt': base_url,
+                            'name': '导航到项目基础URL',
+                        })
+
+                    # 执行步骤
+                    result = engine.execute_steps(midscene_steps)
+
+                    # 记录结果
+                    case_result = {
+                        'test_case_id': case_data['id'],
+                        'test_case_name': case_data['name'],
+                        'status': 'passed' if result['status'] == 'success' else 'failed',
+                        'steps': result['steps'],
+                        'error': result.get('error'),
+                        'start_time': datetime.now().isoformat(),
+                        'end_time': datetime.now().isoformat(),
+                        'screenshots': []
+                    }
+
+                    # 提取截图（统一成 {url, description, step_number, timestamp}，
+                    # 与 Playwright 引擎一致，否则前端 :src="screenshot.url" 取不到图）
+                    case_result['screenshots'] = self._collect_screenshots(result['steps'])
+
+                    self.results.append(case_result)
+
+                    # 更新用例执行记录
+                    case_execution = case_executions[case_data['id']]
+                    case_execution.status = case_result['status']
+                    case_execution.finished_at = timezone.now()
+                    case_execution.execution_time = (case_execution.finished_at - case_execution.started_at).total_seconds()
+                    case_execution.execution_logs = json.dumps(result['steps'], ensure_ascii=False)
+                    if case_result['error']:
+                        case_execution.error_message = case_result['error']
+                    if case_result.get('screenshots'):
+                        case_execution.screenshots = case_result['screenshots']
+                    case_execution.save()
+
+                    if case_result['status'] == 'passed':
+                        passed += 1
+                    else:
+                        failed += 1
+
+                except Exception as e:
+                    print(f"✗ 用例执行出现异常: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    failed += 1
+                    self.results.append({
+                        'test_case_id': case_data['id'],
+                        'test_case_name': case_data['name'],
+                        'status': 'failed',
+                        'steps': [],
+                        'error': str(e),
+                        'start_time': datetime.now().isoformat(),
+                        'end_time': datetime.now().isoformat(),
+                        'screenshots': []
+                    })
+        finally:
+            engine.close()
+
+        # 更新执行结果
+        duration = time.time() - start_time
+        status = 'PASSED' if failed == 0 and passed > 0 else 'FAILED'
+        self.update_execution_result(
+            status=status,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            duration=duration
+        )
+        print(f"\n✓ Midscene Web 测试执行完成: 通过 {passed}, 失败 {failed}, 耗时 {duration:.2f}秒")
+
+    @staticmethod
+    def _collect_screenshots(step_results):
+        """把步骤里的截图统一成前端可渲染的对象格式。"""
+        screenshots = []
+        for step_res in step_results or []:
+            step_no = (step_res.get('index') or 0) + 1
+            for key, desc in (('screenshot', '步骤'), ('fail_screenshot', '步骤失败')):
+                shot = step_res.get(key)
+                if not shot:
+                    continue
+                screenshots.append({
+                    'url': shot if str(shot).startswith('data:') else 'data:image/png;base64,%s' % shot,
+                    'description': '%s %d: %s' % (desc, step_no, step_res.get('name') or ''),
+                    'step_number': step_no,
+                    'timestamp': datetime.now().isoformat(),
+                })
+        return screenshots
+
+    @staticmethod
+    def _convert_to_midscene_steps(steps):
+        """将传统 TestCaseStep 格式转换为 Midscene Web 引擎格式。
+
+        入参兼容两种来源：
+        - 套件执行：本文件构造的 step_data（含 step_number）
+        - 单用例执行：views.py 构造的 steps_data（**历史不含 step_number**）
+        因此这里一律用 step.get('step_number') 并以下标兜底，避免 KeyError。
+        """
+        midscene_steps = []
+        for idx, step in enumerate(steps or []):
+            action = step['action_type']
+            element = step.get('element') or step.get('element_data')
+            element_name = element['name'] if element else ''
+            locator_value = element['locator_value'] if element else ''
+            step_no = step.get('step_number') or (idx + 1)
+            desc = step.get('description') or ''
+            default_name = 'Step %s' % step_no
+
+            # 映射传统 action 到 Midscene action
+            if action in ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'navigate'):
+                # 已经是 Midscene 原生 action
+                # description 字段存放自然语言 prompt，input_value 用于 aiInput 的填入值 / navigate 的 URL
+                desc = step.get('description') or ''
+                inp = step.get('input_value') or ''
+                ms_step = {
+                    'action': action,
+                    'prompt': desc or element_name or locator_value,
+                    'name': desc or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                }
+                if action == 'aiInput':
+                    ms_step['prompt'] = desc or element_name or locator_value or '输入框'
+                    ms_step['value'] = inp
+                    ms_step['selector_hint'] = element_name or desc
+                elif action == 'aiTap':
+                    ms_step['prompt'] = desc or element_name or locator_value
+                    ms_step['selector_hint'] = element_name or desc
+                elif action == 'navigate':
+                    ms_step['prompt'] = inp or desc
+                elif action == 'aiAssert':
+                    assert_prompt = desc or inp or '验证页面状态'
+                    ms_step['prompt'] = assert_prompt
+                    ms_step['assert'] = {
+                        'prompt': assert_prompt,
+                        'expect': step.get('assert_value', 'true')
+                    }
+                midscene_steps.append(ms_step)
+
+            elif action in ('click', 'tap', 'double_tap', 'long_press'):
+                # 传统点击操作 -> aiTap
+                ms_step = {
+                    'action': 'aiTap',
+                    'prompt': element_name or locator_value or step.get('description', ''),
+                    'selector_hint': element_name or '',
+                    'name': step.get('description') or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                }
+                midscene_steps.append(ms_step)
+
+            elif action in ('fill', 'input'):
+                # 传统输入操作 -> aiInput
+                ms_step = {
+                    'action': 'aiInput',
+                    'prompt': element_name or locator_value or step.get('description', ''),
+                    'selector_hint': element_name or '',
+                    'value': step.get('input_value', ''),
+                    'name': step.get('description') or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                }
+                midscene_steps.append(ms_step)
+
+            elif action == 'getText':
+                # 获取文本 -> aiQuery
+                ms_step = {
+                    'action': 'aiQuery',
+                    'prompt': f"获取 {element_name or locator_value or step.get('description', '')} 的文本内容",
+                    'name': step.get('description') or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                    'extract': [{
+                        'key': 'step_%s_text' % step_no,
+                        'prompt': '提取%s的文本内容' % (element_name or locator_value or '目标元素'),
+                        'type': 'string',
+                    }]
+                }
+                midscene_steps.append(ms_step)
+
+            elif action == 'assert':
+                # 断言 -> aiAssert
+                # assert_type 是 textContains/textEquals/... 枚举，直接拼进 prompt 会变成
+                # "验证 用户名 equals admin" 这类中英混杂，模型不好理解，先翻译成自然语言。
+                assert_val = step.get('assert_value', '') or ''
+                target = element_name or locator_value or desc or '页面'
+                tpl = _ASSERT_TYPE_TEXT.get(step.get('assert_type', ''), '{target} 满足：{val}')
+                assert_prompt = tpl.format(target=target, val=assert_val)
+                ms_step = {
+                    'action': 'aiAssert',
+                    'prompt': assert_prompt,
+                    'name': desc or default_name,
+                    'wait_ms': step.get('wait_time', 0),
+                    'assert': {'prompt': assert_prompt, 'expect': assert_val}
+                }
+                midscene_steps.append(ms_step)
+
+            elif action == 'waitFor':
+                # 等待元素 -> aiAssert (存在性检查)
+                ms_step = {
+                    'action': 'aiAssert',
+                    'prompt': f"页面上存在 {element_name or locator_value or step.get('description', '')}",
+                    'name': step.get('description') or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                }
+                midscene_steps.append(ms_step)
+
+            elif action == 'wait':
+                # 固定等待
+                ms_step = {
+                    'action': 'wait',
+                    'wait_ms': step.get('wait_time', 1000),
+                    'name': step.get('description') or f"Step {step_no}",
+                }
+                midscene_steps.append(ms_step)
+
+            elif action == 'screenshot':
+                ms_step = {
+                    'action': 'screenshot',
+                    'name': step.get('description') or f"Step {step_no}",
+                }
+                midscene_steps.append(ms_step)
+
+            elif action == 'scroll':
+                # 滚动 -> aiAct
+                ms_step = {
+                    'action': 'aiAct',
+                    'prompt': step.get('input_value') or step.get('description') or '向下滚动页面',
+                    'name': step.get('description') or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                }
+                midscene_steps.append(ms_step)
+
+            else:
+                # 其他操作 -> aiAct (兜底)
+                ms_step = {
+                    'action': 'aiAct',
+                    'prompt': step.get('description') or f"执行操作: {action}",
+                    'name': step.get('description') or f"Step {step_no}",
+                    'wait_ms': step.get('wait_time', 0),
+                }
+                midscene_steps.append(ms_step)
+
+        return midscene_steps
+
     def run_with_appium(self):
         """使用 Appium 执行 App 自动化测试"""
         start_time = time.time()
@@ -1234,6 +1626,16 @@ class TestExecutor:
                         'name': step.element.name,
                         'locator_value': step.element.locator_value,
                         'locator_strategy': step.element.locator_strategy.name if step.element.locator_strategy else 'xpath',
+                        'center_x': step.center_x,
+                        'center_y': step.center_y,
+                    }
+                elif step.center_x is not None and step.center_y is not None:
+                    # 纯坐标步骤（Airtest 导入的 touch((x,y))）：构造带坐标的 element
+                    # 供 Appium 走 driver.tap 坐标点击，避免元素为空报「需要提供元素定位信息」。
+                    step_data['element'] = {
+                        'name': f'坐标({step.center_x},{step.center_y})',
+                        'locator_strategy': 'coordinate',
+                        'locator_value': f'{step.center_x},{step.center_y}',
                         'center_x': step.center_x,
                         'center_y': step.center_y,
                     }
@@ -1399,6 +1801,241 @@ class TestExecutor:
             # 断开设备连接
             if appium_engine:
                 appium_engine.disconnect()
+
+        duration = time.time() - start_time
+        status = 'SUCCESS' if failed == 0 else 'FAILED'
+        self.update_execution_result(status, passed, failed, skipped, duration)
+
+    def run_with_airtest(self):
+        """使用 Airtest 引擎回放 App 自动化用例。
+
+        支持 Airtest 导入脚本的全部步骤类型：
+          - touch(Template(图片))：图像识别（依赖导入时已落库的 airtest_templates 模板图）
+          - poco("x").click() / id / xpath：通过 Poco 或坐标定位
+          - touch((x,y)) 纯坐标点击：fallback 到 input tap
+        与 views.py 的 run_airtest_test 同构，但作用于套件（TestExecutor 路径）。
+        """
+        start_time = time.time()
+        passed = 0
+        failed = 0
+        skipped = 0
+
+        if not self.device_id or not self.app_config_id:
+            self.update_execution_result('FAILED',
+                error_msg='使用 Airtest 引擎时必须选择设备和应用配置')
+            return
+
+        # 预先构建步骤数据
+        test_cases_data = []
+        for test_case in self.test_cases:
+            case_data = {
+                'id': test_case.id,
+                'name': test_case.name,
+                'project_id': self.test_suite.project.id,
+                'steps': []
+            }
+            steps = test_case.steps.select_related('element', 'element__locator_strategy').order_by('step_number')
+            for step in steps:
+                step_data = {
+                    'id': step.id,
+                    'step_number': step.step_number,
+                    'action_type': step.action_type,
+                    'description': step.description,
+                    'input_value': step.input_value,
+                    'wait_time': step.wait_time,
+                    'assert_type': step.assert_type,
+                    'assert_value': step.assert_value,
+                    'center_x': step.center_x,
+                    'center_y': step.center_y,
+                }
+                if step.element:
+                    step_data['element_data'] = {
+                        'locator_strategy': step.element.locator_strategy.name if step.element.locator_strategy else 'xpath',
+                        'locator_value': step.element.locator_value,
+                        'name': step.element.name,
+                    }
+                else:
+                    step_data['element_data'] = None
+                case_data['steps'].append(step_data)
+            test_cases_data.append(case_data)
+
+        # 预先创建用例执行记录
+        case_executions = {}
+        for case_data in test_cases_data:
+            case_execution = TestCaseExecution.objects.create(
+                test_case_id=case_data['id'],
+                project_id=case_data['project_id'],
+                test_suite=self.test_suite,
+                execution_source='suite',
+                status='pending',
+                engine='airtest',
+                browser=self.browser,
+                headless=self.headless,
+                created_by=self.executed_by
+            )
+            case_executions[case_data['id']] = case_execution
+
+        from .airtest_engine import AirtestRecordingEngine
+        from apps.app_automation.models import AppDevice as AutoAppDevice
+
+        at_engine = None
+        try:
+            _raw_device = AutoAppDevice.objects.get(device_id=self.device_id)
+            app_config = AppConfig.objects.get(id=self.app_config_id)
+
+            # 字段映射：app_automation.AppDevice → 执行引擎期望的接口
+            class _DeviceAdapter:
+                def __init__(self, d):
+                    self._d = d
+                @property
+                def udid(self):
+                    return self._d.device_id
+                @property
+                def platform(self):
+                    return 'android'
+                @property
+                def appium_server_url(self):
+                    return ''
+                @property
+                def capabilities(self):
+                    return {}
+                def __getattr__(self, name):
+                    return getattr(self._d, name)
+            device = _DeviceAdapter(_raw_device)
+
+            at_engine = AirtestRecordingEngine(
+                serial=device.udid,
+                platform=device.platform,
+                app_package=app_config.package_name,
+                wda_url=device.appium_server_url,
+                adb_host=getattr(device, 'adb_host', None),
+            )
+            at_engine.connect()
+            try:
+                at_engine.activate_app(app_config.package_name)
+            except Exception:
+                pass
+            time.sleep(1)
+        except Exception as e:
+            error_msg = f"Airtest 连接失败: {str(e)}"
+            for case_data in test_cases_data:
+                self.results.append({
+                    'test_case_id': case_data['id'],
+                    'test_case_name': case_data['name'],
+                    'status': 'failed',
+                    'steps': [],
+                    'error': error_msg,
+                    'start_time': datetime.now().isoformat(),
+                    'end_time': datetime.now().isoformat(),
+                    'screenshots': []
+                })
+                failed += 1
+                ce = case_executions[case_data['id']]
+                ce.status = 'failed'
+                ce.error_message = error_msg
+                ce.finished_at = timezone.now()
+                ce.save()
+            self.update_execution_result('FAILED', 0, len(test_cases_data), 0, 0, error_msg)
+            return
+
+        try:
+            for case_data in test_cases_data:
+                case_execution = case_executions[case_data['id']]
+                case_execution.started_at = timezone.now()
+                case_execution.status = 'running'
+                case_execution.save()
+
+                case_result = {
+                    'test_case_id': case_data['id'],
+                    'test_case_name': case_data['name'],
+                    'status': 'passed',
+                    'steps': [],
+                    'error': None,
+                    'start_time': datetime.now().isoformat(),
+                    'screenshots': []
+                }
+                try:
+                    for step_info in case_data['steps']:
+                        el = step_info.get('element_data')
+                        # 纯坐标步骤（touch((x,y))）：element 为空但 step 顶层有坐标
+                        if el is None or (not el.get('center_x') and not el.get('center_y')):
+                            cx = step_info.get('center_x')
+                            cy = step_info.get('center_y')
+                            if cx is not None and cy is not None:
+                                el = {'center_x': cx, 'center_y': cy,
+                                      'locator_strategy': 'coordinate',
+                                      'value': f'{cx},{cy}',
+                                      'name': f'坐标({cx},{cy})'}
+                            elif el is None:
+                                el = {}
+                        step_data = {
+                            'step_number': step_info['step_number'],
+                            'action_type': step_info['action_type'],
+                            'description': step_info['description'],
+                            'input_value': step_info.get('input_value', ''),
+                            'wait_time': step_info.get('wait_time', 0),
+                            'assert_type': step_info.get('assert_type', ''),
+                            'assert_value': step_info.get('assert_value', ''),
+                            'element': el
+                        }
+                        result = at_engine.execute_step(step_data)
+                        case_result['steps'].append({
+                            'step_number': step_info['step_number'],
+                            'action_type': step_info['action_type'],
+                            'description': step_info['description'],
+                            'success': result.get('success', False),
+                            'error': result.get('error', ''),
+                            'screenshot': result.get('screenshot', None)
+                        })
+                        if not result.get('success'):
+                            case_result['status'] = 'failed'
+                            case_result['error'] = result.get('error',
+                                f"步骤 {step_info['step_number']} 执行失败")
+                            if result.get('screenshot'):
+                                case_result['screenshots'].append({
+                                    'url': result['screenshot'],
+                                    'description': f"步骤 {step_info['step_number']} 失败截图",
+                                    'step_number': step_info['step_number'],
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                            break
+                        time.sleep(0.3)
+                except Exception as e:
+                    case_result['status'] = 'failed'
+                    case_result['error'] = f"用例执行异常: {str(e)}"
+                    try:
+                        b64 = at_engine.get_screenshot_base64()
+                        case_result['screenshots'].append({
+                            'url': f'data:image/png;base64,{b64}',
+                            'description': f"异常截图: {str(e)}",
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    except Exception:
+                        pass
+
+                case_result['end_time'] = datetime.now().isoformat()
+                self.results.append(case_result)
+
+                case_execution.status = case_result['status']
+                case_execution.finished_at = timezone.now()
+                if case_execution.started_at:
+                    case_execution.execution_time = (
+                        case_execution.finished_at - case_execution.started_at
+                    ).total_seconds()
+                case_execution.execution_logs = json.dumps(case_result['steps'], ensure_ascii=False)
+                if case_result['error']:
+                    case_execution.error_message = case_result['error']
+                if case_result.get('screenshots'):
+                    case_execution.screenshots = case_result['screenshots']
+                case_execution.save()
+
+                if case_result['status'] == 'passed':
+                    passed += 1
+                else:
+                    failed += 1
+        finally:
+            if at_engine:
+                at_engine.disconnect()
 
         duration = time.time() - start_time
         status = 'SUCCESS' if failed == 0 else 'FAILED'

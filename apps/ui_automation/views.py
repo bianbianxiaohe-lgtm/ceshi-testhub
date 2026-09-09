@@ -488,7 +488,7 @@ class PageObjectViewSet(viewsets.ModelViewSet):
     queryset = PageObject.objects.all()
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['project']
+    filterset_fields = ['project', 'execution_mode']
     search_fields = ['name', 'class_name', 'description']
 
     def get_serializer_class(self):
@@ -1574,6 +1574,8 @@ class TestCaseViewSet(viewsets.ModelViewSet):
             for step in test_steps:
                 step_data = {
                     'step': step,
+                    # 各引擎（含 Midscene Web 步骤转换）都可能用到，缺了会 KeyError
+                    'step_number': step.step_number,
                     'action_type': step.action_type,
                     'description': step.description,
                     'input_value': step.input_value,
@@ -2008,6 +2010,169 @@ class TestCaseViewSet(viewsets.ModelViewSet):
                     'device': device.name,
                     'app_config': app_config.name
                 })
+            elif engine_type == 'midscene_web':
+                # Midscene Web 引擎：使用 AI 语义定位执行测试
+                import threading
+                from .midscene_web_engine import MidsceneWebEngine
+                # 本分支自己统计耗时（通用流程的 start_time 在后面才设置，会算成 ~0）
+                midscene_start_time = time.time()
+
+                # 获取 Midscene 模型配置（真源：AIModelConfig role=midscene_vision）
+                try:
+                    from .midscene_web_engine import load_midscene_model_config
+                    model_config = load_midscene_model_config()
+                except Exception as e:
+                    model_config = {}
+                    execution_logs.append(f"✗ 读取 Midscene 模型配置失败: {e}")
+                if not model_config.get('api_key'):
+                    execution_logs.append(
+                        "✗ 未配置 Midscene 视觉模型：请在「AI 模型配置」中新增 role=midscene_vision "
+                        "且已启用的多模态模型（需含 api_key / base_url / model_name）。")
+
+                execution_logs.append(f"测试用例 '{test_case.name}' 开始执行 (Midscene Web)")
+                execution_logs.append(f"执行时间: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                execution_logs.append(f"执行引擎: MIDSCENE_WEB")
+                execution_logs.append(f"执行用户: {request.user.username}")
+                execution_logs.append(f"项目基础URL: {test_case.project.base_url}")
+                execution_logs.append("")
+
+                def run_midscene_web_test():
+                    """使用 Midscene Web 引擎执行测试"""
+                    try:
+                        # 创建 Midscene Web 引擎实例
+                        engine = MidsceneWebEngine(
+                            base_url=test_case.project.base_url or '',
+                            model_config=model_config,
+                            headless=request.data.get('headless', True)
+                        )
+
+                        # 转换步骤为 Midscene 格式
+                        from .test_executor import TestExecutor
+                        midscene_steps = TestExecutor._convert_to_midscene_steps(steps_data)
+
+                        # 如果项目有基础 URL 且第一步不是导航，自动添加导航步骤
+                        base_url = test_case.project.base_url or ''
+                        if base_url and (not midscene_steps or midscene_steps[0].get('action') != 'navigate'):
+                            midscene_steps.insert(0, {
+                                'action': 'navigate',
+                                'prompt': base_url,
+                                'name': '导航到项目基础URL',
+                            })
+
+                        execution_logs.append(f"共 {len(midscene_steps)} 个步骤待执行")
+                        execution_logs.append("")
+
+                        # 执行步骤
+                        result = engine.execute_steps(midscene_steps)
+
+                        # 记录结果
+                        execution_logs.extend(engine.logs)
+                        execution_logs.append("")
+                        execution_logs.append(f"执行结束: {result.get('status', 'unknown')}")
+
+                        if result['status'] == 'success':
+                            execution_result['status'] = 'passed'
+                            execution_logs.append("✓ 测试通过")
+                        else:
+                            execution_result['status'] = 'failed'
+                            execution_result['error_message'] = result.get('error', '执行失败')
+                            execution_logs.append(f"✗ 测试失败: {result.get('error', '未知错误')}")
+
+                        # 收集步骤结果和截图
+                        for step_res in result['steps']:
+                            step_info = {
+                                'step_number': step_res.get('index', 0) + 1,
+                                'action_type': step_res.get('action', ''),
+                                'description': step_res.get('name', ''),
+                                'success': step_res.get('status') == 'success',
+                                'log': f"{step_res.get('action', '')}: {step_res.get('name', '')}",
+                            }
+                            step_results.append(step_info)
+
+                            # 截图统一成 {url, description, step_number, timestamp}，
+                            # 与 Playwright 引擎一致，前端按 :src="screenshot.url" 渲染
+                            for key, prefix in (('screenshot', '步骤'), ('fail_screenshot', '步骤失败')):
+                                shot = step_res.get(key)
+                                if not shot:
+                                    continue
+                                screenshots.append({
+                                    'url': shot if str(shot).startswith('data:') else f'data:image/png;base64,{shot}',
+                                    'description': f'{prefix} {step_info["step_number"]}: {step_info["description"]}',
+                                    'step_number': step_info['step_number'],
+                                    'timestamp': timezone.now().isoformat(),
+                                })
+
+                            if not step_info['success']:
+                                detailed_errors.append({
+                                    'step_number': step_info['step_number'],
+                                    'action_type': step_info['action_type'],
+                                    'element': '',
+                                    'message': step_res.get('error', '步骤执行失败'),
+                                    'details': step_res.get('error', ''),
+                                    'description': step_info['description']
+                                })
+
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        execution_result['status'] = 'failed'
+                        execution_result['error_message'] = str(e)
+                        execution_logs.append(f"✗ 执行异常: {str(e)}")
+                        detailed_errors.append({
+                            'step_number': None,
+                            'action_type': '执行异常',
+                            'element': '',
+                            'message': str(e),
+                            'details': str(e),
+                            'description': 'Midscene Web 执行异常'
+                        })
+
+                # 启动后台线程执行
+                # 注意：首次运行需要下载 Node runtime + npm install @midscene/web（实测约 4 分钟），
+                # 5 分钟的上限会在冷启动时被击穿，这里放宽到 15 分钟。
+                thread = threading.Thread(target=run_midscene_web_test)
+                thread.daemon = True
+                thread.start()
+                thread.join(timeout=900)
+
+                # 收尾并直接返回：不能再往下走 Playwright/Selenium 的通用流程，
+                # 否则日志头会重复打印、总耗时被重算成 ~0。
+                total_time = round(time.time() - midscene_start_time, 2)
+                execution_logs.append("")
+                execution_logs.append(f"- 总执行时间: {total_time}秒")
+                if screenshots:
+                    execution_logs.append(f"- 截图数量: {len(screenshots)} 张")
+
+                execution.status = execution_result['status']
+                execution.error_message = execution_result['error_message'] or ''
+                execution.execution_logs = json.dumps(step_results, ensure_ascii=False)
+                execution.step_results = step_results
+                execution.execution_time = total_time
+                execution.finished_at = timezone.now()
+                execution.screenshots = screenshots
+                execution.save()
+
+                log_operation('run', 'test_case', test_case.id, test_case.name, request.user)
+
+                errors = [{
+                    'message': e['message'],
+                    'details': e['details'],
+                    'step_number': e['step_number'],
+                    'action_type': e['action_type'],
+                    'element': e['element'],
+                    'description': e['description'],
+                } for e in detailed_errors]
+                if not errors and execution.error_message:
+                    errors.append({'message': execution.error_message, 'details': ''})
+
+                return Response({
+                    'success': execution.status == 'passed',
+                    'logs': execution.execution_logs,
+                    'screenshots': screenshots,
+                    'execution_time': execution.execution_time,
+                    'errors': errors
+                })
+
             else:
                 import asyncio
                 import threading
@@ -3897,6 +4062,10 @@ class AICaseViewSet(viewsets.ModelViewSet):
         if ai_case.execution_mode == 'midscene':
             return self._run_midscene(request, ai_case)
 
+        # Midscene Web 自动化模式：走结构化 steps + Playwright 浏览器引擎
+        if ai_case.execution_mode == 'midscene_web':
+            return self._run_midscene_web(request, ai_case)
+
         # 创建执行记录
         execution_record = AIExecutionRecord.objects.create(
             project=ai_case.project,
@@ -4011,6 +4180,164 @@ class AICaseViewSet(viewsets.ModelViewSet):
         
         return Response({
             'message': 'AI 用例开始执行',
+            'execution_id': execution_record.id
+        })
+
+    @action(detail=False, methods=['post'], url_path='midscene-web-playground')
+    def midscene_web_playground(self, request):
+        """
+        Midscene Web Playground: 自然语言单条调试（连 Playwright 浏览器执行并返回截图 base64）。
+        """
+        data = request.data
+        url = (data.get('url') or '').strip()
+        prompt = (data.get('prompt') or '').strip()
+        action = data.get('action') or 'aiAct'
+        value = data.get('value') or ''
+        selector_hint = data.get('selector_hint') or ''
+
+        if not url:
+            return Response({'error': 'url (目标网址) 不能为空'}, status=status.HTTP_400_BAD_REQUEST)
+        if not prompt:
+            return Response({'error': 'prompt (自然语言操作指令) 不能为空'}, status=status.HTTP_400_BAD_REQUEST)
+        if action not in ('aiAct', 'aiTap', 'aiInput', 'aiQuery'):
+            return Response({'error': 'action 仅支持 aiAct/aiTap/aiInput/aiQuery'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 获取模型配置（真源：AIModelConfig role=midscene_vision）
+        from .midscene_web_engine import MidsceneWebEngine, load_midscene_model_config
+        model_config = load_midscene_model_config()
+        if not model_config.get('api_key'):
+            return Response(
+                {'error': '未配置 Midscene 视觉模型：请在「AI 模型配置」中新增 role=midscene_vision '
+                          '且已启用的多模态模型（需含 api_key / base_url / model_name）。'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            engine = MidsceneWebEngine(model_config=model_config, headless=True)
+            result = engine.playground_run(url=url, prompt=prompt, action=action, value=value, selector_hint=selector_hint)
+        except Exception as e:
+            logger.warning('[MidsceneWeb Playground] 执行失败: %s', e)
+            return Response({'status': 'failed', 'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(result)
+
+    @action(detail=False, methods=['post'], url_path='midscene-web-save-step')
+    def midscene_web_save_step(self, request):
+        """
+        Midscene Web 步骤沉淀: 把 Playground 验证过的自然语言步骤 append 进 AICase 的 steps。
+        """
+        data = request.data
+        ai_case_id = data.get('ai_case_id')
+        prompt = (data.get('prompt') or '').strip()
+        action = data.get('action') or 'aiAct'
+
+        if not ai_case_id:
+            return Response({'error': 'ai_case_id 必填'}, status=status.HTTP_400_BAD_REQUEST)
+        if not prompt:
+            return Response({'error': 'prompt 不能为空'}, status=status.HTTP_400_BAD_REQUEST)
+        if action not in ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'assert', 'wait', 'navigate', 'screenshot'):
+            return Response({'error': 'action 不支持 %s' % action}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            ai_case = AICase.objects.get(id=ai_case_id)
+        except AICase.DoesNotExist:
+            return Response({'error': 'AI 用例不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if ai_case.execution_mode not in ('midscene_web', 'text'):
+            return Response({'error': '目标用例已绑定 APP 模式，不能沉淀 Web 步骤'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if ai_case.execution_mode != 'midscene_web':
+            ai_case.execution_mode = 'midscene_web'
+
+        step = {
+            'name': (data.get('name') or '').strip() or '步骤%d' % (len(ai_case.steps) + 1),
+            'action': action,
+            'prompt': prompt,
+            'selector_hint': data.get('selector_hint', ''),
+            'value': data.get('value', ''),
+            'wait_ms': data.get('wait_ms', 0),
+            'extract': data.get('extract', []),
+            'assert': data.get('assert', {}),
+        }
+        ai_case.steps = (ai_case.steps or []) + [step]
+        ai_case.save(update_fields=['steps', 'execution_mode', 'updated_at'])
+        logger.info('[MidsceneWeb] 步骤已沉淀到 AICase#%s, 当前 steps 数 %d', ai_case.id, len(ai_case.steps))
+        return Response({
+            'message': '步骤已追加到用例「%s」' % ai_case.name,
+            'ai_case_id': ai_case.id,
+            'steps_count': len(ai_case.steps),
+        })
+
+    def _run_midscene_web(self, request, ai_case):
+        """Midscene Web 自动化执行分支: 读取结构化 steps, 驱动 Playwright 浏览器执行"""
+        if not ai_case.steps:
+            return Response({'error': '该 Midscene Web 用例没有步骤 (steps) 配置'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 获取模型配置（真源：AIModelConfig role=midscene_vision）
+        from .midscene_web_engine import load_midscene_model_config
+        model_config = load_midscene_model_config()
+        if not model_config.get('api_key'):
+            return Response(
+                {'error': '未配置 Midscene 视觉模型：请在「AI 模型配置」中新增 role=midscene_vision '
+                          '且已启用的多模态模型（需含 api_key / base_url / model_name）。'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        execution_record = AIExecutionRecord.objects.create(
+            project=ai_case.project,
+            ai_case=ai_case,
+            case_name=ai_case.name,
+            task_description=ai_case.task_description or '(Midscene Web 结构化步骤)',
+            execution_mode='midscene_web',
+            status='running',
+            executed_by=request.user,
+            logs='[MidsceneWeb] 正在启动 Playwright 浏览器...\n'
+        )
+
+        def run_task():
+            STOP_SIGNALS[execution_record.id] = False
+            try:
+                from .midscene_web_engine import MidsceneWebEngine
+                engine = MidsceneWebEngine(model_config=model_config, headless=True)
+                result = engine.execute_steps(ai_case.steps)
+
+                logs = list(engine.logs)
+                logs.append('\n[MidsceneWeb] 执行结束: %s' % result.get('status', 'unknown'))
+                if result.get('error'):
+                    logs.append('错误: %s' % result['error'])
+
+                context_dump = result.get('context', {})
+                if context_dump:
+                    logs.append('\n[MidsceneWeb] 业务上下文 (extract 结果):')
+                    for k, v in context_dump.items():
+                        logs.append('  ${{%s}} = %s' % (k, v))
+
+                execution_record.end_time = timezone.now()
+                execution_record.duration = (execution_record.end_time - execution_record.start_time).total_seconds()
+                execution_record.logs += '\n'.join(logs)
+                execution_record.status = 'completed' if result.get('status') == 'success' else 'failed'
+                execution_record.error_message = result.get('error', '')
+
+                if execution_record.planned_tasks:
+                    self._auto_mark_completed_tasks(execution_record)
+
+                execution_record.save()
+            except Exception as e:
+                execution_record.status = 'failed'
+                execution_record.end_time = timezone.now()
+                execution_record.duration = (execution_record.end_time - execution_record.start_time).total_seconds()
+                execution_record.logs += '\n[MidsceneWeb] 执行出错: %s' % str(e)
+                execution_record.error_message = str(e)
+                execution_record.save()
+                logger.warning('[MidsceneWeb] 执行失败: %s', e)
+            finally:
+                STOP_SIGNALS.pop(execution_record.id, None)
+
+        import threading
+        thread = threading.Thread(target=run_task)
+        thread.daemon = True
+        thread.start()
+
+        return Response({
+            'message': 'Midscene Web 用例开始执行',
             'execution_id': execution_record.id
         })
 
@@ -4250,6 +4577,71 @@ class AIExecutionRecordViewSet(viewsets.ModelViewSet):
             logs="正在分析任务...\n"
         )
 
+        # Midscene Web 模式：使用 MidsceneWebEngine 执行
+        if execution_mode == 'midscene_web':
+            import threading
+            
+            # 提取 URL（第一行）和任务描述（剩余部分）
+            lines = task_description.strip().split('\n', 1)
+            url = lines[0].strip() if lines else ''
+            task_desc = lines[1].strip() if len(lines) > 1 else task_description
+            
+            def run_midscene_web_task():
+                STOP_SIGNALS[execution_record.id] = False
+                try:
+                    from .midscene_web_engine import MidsceneWebEngine
+                    
+                    # 获取模型配置（真源：AIModelConfig role=midscene_vision）
+                    from .midscene_web_engine import load_midscene_model_config
+                    model_config = load_midscene_model_config()
+
+                    engine = MidsceneWebEngine(base_url=url, model_config=model_config, headless=True)
+                    
+                    # 创建步骤：先导航到 URL，然后执行任务描述
+                    steps = [
+                        {'action': 'navigate', 'prompt': url, 'name': '导航到目标网址'},
+                        {'action': 'aiAct', 'prompt': task_desc, 'name': '执行任务'},
+                    ]
+                    
+                    execution_record.logs += '[MidsceneWeb] 启动浏览器...\n'
+                    execution_record.save(update_fields=['logs'])
+                    
+                    result = engine.execute_steps(steps)
+                    
+                    # 合并日志
+                    logs = list(engine.logs)
+                    logs.append('\n[MidsceneWeb] 执行结束: %s' % result.get('status', 'unknown'))
+                    if result.get('error'):
+                        logs.append('错误: %s' % result['error'])
+                    
+                    execution_record.end_time = timezone.now()
+                    execution_record.duration = (execution_record.end_time - execution_record.start_time).total_seconds()
+                    execution_record.logs += '\n'.join(logs)
+                    execution_record.status = 'passed' if result.get('status') == 'success' else 'failed'
+                    execution_record.error_message = result.get('error', '')
+                    execution_record.save()
+                    
+                except Exception as e:
+                    execution_record.status = 'failed'
+                    execution_record.end_time = timezone.now()
+                    execution_record.duration = (execution_record.end_time - execution_record.start_time).total_seconds()
+                    execution_record.logs += '\n[MidsceneWeb] 执行出错: %s' % str(e)
+                    execution_record.error_message = str(e)
+                    execution_record.save()
+                    logger.warning('[MidsceneWeb Adhoc] 执行失败: %s', e)
+                finally:
+                    STOP_SIGNALS.pop(execution_record.id, None)
+            
+            thread = threading.Thread(target=run_midscene_web_task)
+            thread.daemon = True
+            thread.start()
+            
+            return Response({
+                'message': 'Midscene Web 任务开始执行',
+                'execution_id': execution_record.id
+            })
+
+        # 文本模式：使用 browser-use 执行
         # 异步执行
         import threading
         from asgiref.sync import sync_to_async
@@ -5389,8 +5781,10 @@ def _build_test_case_from_steps(user, project, case_name, steps, app_package="")
             assert_type=st.get('assert_type', ''),
             assert_value=st.get('assert_value', ''),
             description=st.get('description', ''),
-            center_x=ed.get('center_x') if ed else None,
-            center_y=ed.get('center_y') if ed else None,
+            # 坐标既可能在 element 内（录制步骤），也可能在 step 顶层（Airtest 导入的
+            # touch((x,y)) 坐标点击，element=None）。顶层优先，避免导入的坐标被静默丢弃。
+            center_x=st.get('center_x') if st.get('center_x') is not None else (ed.get('center_x') if ed else None),
+            center_y=st.get('center_y') if st.get('center_y') is not None else (ed.get('center_y') if ed else None),
         )
 
     return test_case, created_elements, len(all_steps)
@@ -5454,8 +5848,8 @@ def generate_recording_case(request):
                         'assert_type': st.get('assert_type', ''),
                         'assert_value': st.get('assert_value', ''),
                         'element': element_obj,
-                        'center_x': ed.get('center_x') if ed else None,
-                        'center_y': ed.get('center_y') if ed else None,
+                        'center_x': st.get('center_x') if st.get('center_x') is not None else (ed.get('center_x') if ed else None),
+                        'center_y': st.get('center_y') if st.get('center_y') is not None else (ed.get('center_y') if ed else None),
                     }
                 )
             step_count = len(steps)
