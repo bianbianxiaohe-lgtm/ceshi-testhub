@@ -104,3 +104,14 @@ media/modao_samples/
 .codebuddy/skills/
 _fake_mig.py
 nul; Write-Output cleaned
+
+# 一次性排查/修复脚本及其输出（根目录 _ 前缀，全部为本地临时产物，禁止入库）
+/_*.py
+/_*.txt
+/_*.tar
+/_*.jpg
+/_*.json
+/_*.out
+.debug_tmps/
+frontend/_build_out.txt
+frontend/_build_err.txt
