@@ -67,6 +67,12 @@ services:
       - dev-logs:/app/logs
       - dev-knowledge:/app/knowledge-bases
       - dev-chroma:/app/chroma
+      # Midscene 运行时（Node runtime + @midscene/web Node 服务）持久化。
+      # 它是首次运行期下载的运行产物（约 350MB），不挂卷的话容器一重建就得重新
+      # 下载 Node + npm install（约 5 分钟）。
+      # 注：Chrome 不在这里——引擎已改为复用镜像自带的 playwright chromium，
+      # 见 apps/ui_automation/midscene_web_engine.py::_find_chrome_executable。
+      - dev-midscene:/root/.midscene
     depends_on:
       mysql:
         condition: service_healthy
@@ -107,3 +113,4 @@ volumes:
   dev-logs:
   dev-knowledge:
   dev-chroma:
+  dev-midscene:
