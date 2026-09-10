@@ -313,6 +313,23 @@ for _col in ('app_config_id', 'device_id'):
     else:
         print('%s on ui_ai_cases already nullable' % _col)
 
+# 确保 App 设备表有 platform 列（区分 Android / iOS）。
+# 背景：该表原为纯 Android 设计，接入 iOS 后需要平台字段做分类。
+# 部分环境 manage.py migrate 不可用（历史迁移状态不一致），这里用幂等 DDL 兜底。
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'app_automation_devices' "
+    "AND column_name = 'platform'"
+)
+if not cur.fetchone():
+    cur.execute(
+        "ALTER TABLE app_automation_devices "
+        "ADD COLUMN platform VARCHAR(20) NOT NULL DEFAULT 'android'"
+    )
+    print('ensured column platform on app_automation_devices')
+else:
+    print('platform already exists on app_automation_devices')
+
 
 # 确保 App 自动化流水线运行记录表存在（新功能：选应用 + 自定义阶段 + 运行记录重跑）。
 # 注意：app_configs / app_devices 库内主键实际为 INT（与模型 BigAutoField 存在漂移），

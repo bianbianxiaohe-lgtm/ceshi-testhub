@@ -33,13 +33,22 @@
           style="margin-left: 8px"
           @change="onAutoDiscoverChange"
         />
+        <el-radio-group
+          v-model="platformFilter"
+          size="small"
+          style="margin-left: 12px"
+        >
+          <el-radio-button label="">全部({{ platformCounts.all }})</el-radio-button>
+          <el-radio-button label="android">Android({{ platformCounts.android }})</el-radio-button>
+          <el-radio-button label="ios">iOS({{ platformCounts.ios }})</el-radio-button>
+        </el-radio-group>
       </div>
     </div>
 
     <!-- 设备列表 -->
     <el-table
       v-loading="loading"
-      :data="devices"
+      :data="filteredDevices"
       style="width: 100%; margin-top: 20px"
       :empty-text="emptyText"
     >
@@ -82,7 +91,18 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="android_version" :label="$t('appAutomation.device.androidVersion')" width="120" />
+      <el-table-column prop="platform" label="平台" width="100">
+        <template #default="{ row }">
+          <el-tag
+            :type="(row.platform || 'android') === 'ios' ? 'primary' : 'success'"
+            size="small"
+          >
+            {{ (row.platform || 'android') === 'ios' ? 'iOS' : 'Android' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+
+      <el-table-column prop="android_version" label="系统版本" width="120" />
 
       <el-table-column prop="connection_type" :label="$t('appAutomation.device.connectionType')" width="120">
         <template #default="{ row }">
@@ -441,6 +461,24 @@ const refreshTimer = ref(null)
 const autoDiscover = ref(true)       // 自动发现开关（默认开：周期调 discover，自动把设备+电脑IP同步到执行设备表）
 const editingAdbHostId = ref(null)  // 正在编辑 adb_host 的设备 ID
 const originalAdbHost = ref('')      // 编辑前的原值（用于取消恢复）
+const platformFilter = ref('')       // 平台筛选：'' 全部 / android / ios
+
+// 按平台筛选（Android / iOS 分类展示）
+const filteredDevices = computed(() => {
+  if (!platformFilter.value) return devices.value
+  return devices.value.filter(d => (d.platform || 'android') === platformFilter.value)
+})
+
+// 各类设备数量（用于筛选按钮角标）
+const platformCounts = computed(() => {
+  const counts = { all: devices.value.length, android: 0, ios: 0 }
+  devices.value.forEach(d => {
+    const p = d.platform || 'android'
+    if (p === 'ios') counts.ios += 1
+    else counts.android += 1
+  })
+  return counts
+})
 
 const remoteDeviceForm = ref({
   ip_address: '',

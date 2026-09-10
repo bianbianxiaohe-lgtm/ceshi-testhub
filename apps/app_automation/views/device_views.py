@@ -24,6 +24,7 @@ def sync_devices_to_ui_automation(devices):
 
     - 按 udid 匹配（app-automation 的 device_id 即 ui-automation 的 udid）。
     - 仅同步「真实设备」（排除模拟器/占位/远程 IP 形式），更新 name/adb_host/status。
+    - 平台沿用源设备的 platform 字段（ADB 发现的设备为 android，手动登记的 iOS 为 ios）。
     - 不删除 ui-automation 中已存在的设备，仅 upsert 新增与更新。
     """
     try:
@@ -53,7 +54,7 @@ def sync_devices_to_ui_automation(devices):
                 udid=device_id,
                 defaults={
                     'name': dev.name or device_id,
-                    'platform': 'android',
+                    'platform': dev.platform or 'android',
                     'platform_version': dev.android_version or '',
                     'device_type': 'real',
                     'adb_host': dev.adb_host or '',
