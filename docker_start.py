@@ -177,6 +177,9 @@ for col, ddl in (
     ('page_smoke_json', 'ALTER TABLE modao_page ADD COLUMN page_smoke_json LONGTEXT NOT NULL'),
     ('page_approved', 'ALTER TABLE modao_page ADD COLUMN page_approved TINYINT(1) NOT NULL DEFAULT 0'),
     ('screenshot_segments', "ALTER TABLE modao_page ADD COLUMN screenshot_segments LONGTEXT NOT NULL DEFAULT ('[]')"),
+    # 画布所属文件夹（墨刀页面树层级），对应迁移 0016_modao_page_folder；
+    # prod 的 manage.py migrate 不可用，必须在这里兜底，否则 modao_list 会因缺列 500。
+    ('folder', "ALTER TABLE modao_page ADD COLUMN folder VARCHAR(500) NOT NULL DEFAULT ''"),
 ):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
@@ -188,6 +191,27 @@ for col, ddl in (
         print(f'ensured column {col} on modao_page')
     else:
         print(f'{col} already exists')
+
+# modao_page 这几个文本列在老库是 text（上限 64KB），画布工作日志 / 错误信息 / 重跑阶段
+# 写满会被截断，迁移后应为 longtext。这里幂等扩容兜底（保留原有可空性）。
+for _col in ('work_log', 'error_message', 'rerun_stages'):
+    cur.execute(
+        "SELECT data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'modao_page' AND column_name = %s",
+        (_col,),
+    )
+    _row = cur.fetchone()
+    if _row is None:
+        print('skip widening %s on modao_page (column not found)' % _col)
+    elif _row[0] != 'longtext':
+        cur.execute(
+            'ALTER TABLE modao_page MODIFY %s LONGTEXT %s'
+            % (_col, 'NULL' if _row[1] == 'YES' else 'NOT NULL')
+        )
+        print('widened %s on modao_page to longtext' % _col)
+    else:
+        print('%s on modao_page already longtext' % _col)
+
 
 
 # 确保墨刀原型表有 work_log 列（工作日志：各阶段进度记录）
@@ -312,6 +336,33 @@ for _col in ('app_config_id', 'device_id'):
         print('ensured column %s on ui_ai_cases is nullable' % _col)
     else:
         print('%s on ui_ai_cases already nullable' % _col)
+
+# ui_ai_cases.steps 在老库是 text（上限 64KB，且无法做 JSON 查询），迁移后应为 json。
+# 只有现存数据全部是合法 JSON 时才转换，避免 ALTER 失败阻断启动。
+cur.execute(
+    "SELECT data_type, is_nullable FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = 'steps'"
+)
+_row = cur.fetchone()
+if _row is None:
+    print('skip steps on ui_ai_cases (column not found)')
+elif _row[0] != 'json':
+    cur.execute(
+        "SELECT COUNT(*) FROM ui_ai_cases "
+        "WHERE steps IS NOT NULL AND steps <> '' AND NOT JSON_VALID(steps)"
+    )
+    _bad = cur.fetchone()[0]
+    if _bad:
+        print('skip converting steps to json: %s rows are not valid json' % _bad)
+    else:
+        cur.execute(
+            'ALTER TABLE ui_ai_cases MODIFY steps JSON %s'
+            % ('NULL' if _row[1] == 'YES' else 'NOT NULL')
+        )
+        print('converted ui_ai_cases.steps to json')
+else:
+    print('ui_ai_cases.steps already json')
+
 
 # 确保 App 设备表有 platform 列（区分 Android / iOS）。
 # 背景：该表原为纯 Android 设计，接入 iOS 后需要平台字段做分类。
