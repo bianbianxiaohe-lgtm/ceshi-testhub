@@ -145,6 +145,8 @@
                 <option value="writer_vision">视觉识别专家（画布截图 OCR）</option>
                 <option value="writer_vision_ocr">OCR 专用视觉模型（可选，留空回退到 writer_vision）</option>
                 <option value="reviewer">测试评审专家</option>
+                <option value="browser_use_text">Browser Use - 文本模式（AI 智能测试 Web）</option>
+                <option value="midscene_vision">Midscene 视觉驱动模型（APP 真机自动化）</option>
                 <option value="embedder">文本向量化专家（去重 / 知识库检索）</option>
               </select>
             </div>

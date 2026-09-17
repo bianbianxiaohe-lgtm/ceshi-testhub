@@ -1027,10 +1027,29 @@ export function deleteAICase(id) {
 }
 
 // 运行 AI 用例
-export function runAICase(id) {
+// deviceId 可选：执行时在弹窗里临时指定的设备，只对本次执行生效，
+// 不会改写用例本身绑定的设备。不传则用用例绑定的设备。
+// 也支持传数组（多台并行）：这时发 device_ids，后端会为每台设备各建一条
+// 执行记录（上限由后端 MAX_PARALLEL_DEVICES 控制）。
+export function runAICase(id, deviceId) {
+  const data = {}
+  if (Array.isArray(deviceId)) {
+    const ids = deviceId.filter((v) => v !== undefined && v !== null && v !== '')
+    if (ids.length === 1) {
+      // 单台仍走 device_id，保持与旧后端兼容
+      data.device_id = ids[0]
+    } else if (ids.length > 1) {
+      data.device_ids = ids
+    }
+  } else if (deviceId !== undefined && deviceId !== null && deviceId !== '') {
+    data.device_id = deviceId
+  }
   return request({
     url: `/ui-automation/ai-cases/${id}/run/`,
-    method: 'post'
+    method: 'post',
+    data,
+    // 多设备时后端要先逐台做真实探活（每台最多 5s），超时要放宽
+    timeout: 120000
   })
 }
 
@@ -1176,6 +1195,16 @@ export function setDeviceStatus(id, status) {
   })
 }
 
+// 实时探测设备可达性并修正在线/离线（ids 可选，不传则探测全部；busy 设备自动跳过）
+export function refreshDeviceStatus(ids) {
+  return request({
+    url: '/ui-automation/app-devices/refresh_status/',
+    method: 'post',
+    data: ids && ids.length ? { ids } : {},
+    timeout: 120000
+  })
+}
+
 // 获取应用配置列表
 export function getAppConfigs(params) {
   return request({
@@ -1266,6 +1295,89 @@ export function stopRecording(data) {
 export function generateRecordingCase(data) {
   return request({
     url: '/ui-automation/recording/generate/',
+    method: 'post',
+    data
+  })
+}
+
+// ==================== 业务动作库（Prompt 与代码分离） ====================
+
+// 把一次成功的 AI 执行固化成确定性脚本（坐标回放，后续不再调用视觉模型）
+export function freezeCaseToScript(data) {
+  return request({
+    url: '/ui-automation/ai-cases/freeze-to-script/',
+    method: 'post',
+    data
+  })
+}
+
+// 自然语言 → 结构化步骤（只生成不落库，由编辑器预览确认后自行保存）
+export function generateCaseSteps(data) {
+  return request({
+    url: '/ui-automation/ai-cases/generate-steps/',
+    method: 'post',
+    data,
+    timeout: 180000
+  })
+}
+
+// 获取业务动作列表
+export function getBusinessActions(params) {
+  return request({
+    url: '/ui-automation/business-actions/',
+    method: 'get',
+    params
+  })
+}
+
+// 创建业务动作
+export function createBusinessAction(data) {
+  return request({
+    url: '/ui-automation/business-actions/',
+    method: 'post',
+    data
+  })
+}
+
+// 更新业务动作
+export function updateBusinessAction(id, data) {
+  return request({
+    url: `/ui-automation/business-actions/${id}/`,
+    method: 'patch',
+    data
+  })
+}
+
+// 删除业务动作
+export function deleteBusinessAction(id) {
+  return request({
+    url: `/ui-automation/business-actions/${id}/`,
+    method: 'delete'
+  })
+}
+
+// 把 Midscene Playground 验证过的步骤沉淀进指定 AI 用例的 steps（midscene 模式固化）
+export function saveMidsceneStep(data) {
+  return request({
+    url: '/ui-automation/ai-cases/midscene-save-step/',
+    method: 'post',
+    data
+  })
+}
+
+// 把 Midscene Web Playground 验证过的步骤沉淀进指定 AI 用例的 steps（midscene_web 模式固化）
+export function saveMidsceneWebStep(data) {
+  return request({
+    url: '/ui-automation/ai-cases/midscene-web-save-step/',
+    method: 'post',
+    data
+  })
+}
+
+// 扫描远程设备并自动入库：iOS 探测 WDA（http://host:port/status），Android 走远程 adb devices
+export function discoverAppDevice(data) {
+  return request({
+    url: '/ui-automation/app-devices/discover/',
     method: 'post',
     data
   })

@@ -109,13 +109,14 @@
                 </template>
                 <template v-else>
                   <el-option label="Playwright" value="playwright" />
+                  <el-option label="Midscene Web (AI)" value="midscene_web" />
                   <el-option label="Selenium" value="selenium" />
                   <el-option label="Appium" value="appium" />
                   <el-option label="Airtest" value="airtest" />
                 </template>
               </el-select>
               <!-- Web 引擎选项（仅 Playwright/Selenium 需要浏览器和运行模式） -->
-              <template v-if="selectedEngine === 'playwright' || selectedEngine === 'selenium'">
+              <template v-if="selectedEngine === 'playwright' || selectedEngine === 'selenium' || selectedEngine === 'midscene_web'">
                 <el-select v-model="selectedBrowser" placeholder="选择浏览器" size="small" style="width: 120px; margin-right: 10px">
                   <el-option label="Chrome" value="chrome" />
                   <el-option label="Firefox" value="firefox" />
@@ -230,6 +231,14 @@
                             <el-option label="关闭应用" value="close_app" />
                             <el-option label="返回" value="back" />
                             <el-option label="主页" value="home" />
+                            <el-option-group label="Midscene AI">
+                              <el-option label="AI操作" value="aiAct" />
+                              <el-option label="AI点击" value="aiTap" />
+                              <el-option label="AI输入" value="aiInput" />
+                              <el-option label="AI查询" value="aiQuery" />
+                              <el-option label="AI断言" value="aiAssert" />
+                              <el-option label="导航" value="navigate" />
+                            </el-option-group>
                           </el-select>
                           <el-select
                             v-if="needsElement(element.action_type)"
@@ -580,9 +589,29 @@
         title="把 Airtest IDE 录制导出的 .py / .air 脚本粘贴进来（或上传文件），系统会自动解析为统一的测试用例步骤并入库。"
       />
       <el-form label-width="110px">
-        <el-form-item label="目标项目">
-          <el-tag v-if="realProjectId" type="success">{{ currentProjectName }}</el-tag>
-          <el-tag v-else type="warning">请先在右上角选择项目</el-tag>
+        <el-form-item label="目标项目" prop="project">
+          <el-select
+            v-model="importProjectId"
+            placeholder="选择导入目标项目"
+            filterable
+            clearable
+            style="width: 100%"
+            :disabled="!allProjects || allProjects.length === 0"
+            @change="onImportProjectChange"
+          >
+            <el-option
+              v-for="p in allProjects"
+              :key="p.id"
+              :label="p.name"
+              :value="p.id"
+            />
+            <template #empty>
+              <div style="padding: 10px; text-align: center; color: #909399;">
+                <p>暂无可用项目</p>
+                <p style="font-size: 12px; margin-top: 4px;">请先在 AI 生成用例模块创建项目</p>
+              </div>
+            </template>
+          </el-select>
         </el-form-item>
         <el-form-item label="用例名称">
           <el-input v-model="importForm.case_name" placeholder="留空则自动命名（Airtest导入_时间戳）" />
@@ -1088,12 +1117,33 @@ const onProjectChange = async () => {
   executionResult.value = null
 
   realProjectId.value = await resolveUiProjectId(projectId.value)
+  await loadAppDevicesAndConfigs()
+  fillAppPackageFromProject()
   await Promise.all([
     loadTestCases(),
     loadElements()
   ]).catch((e) => {
     console.error('加载用例或元素失败:', e)
   })
+}
+
+// 根据当前选中项目在应用配置里的包名，自动填充导入 Airtest 脚本的「应用包名」
+// 优先匹配 UiProject(project)，其次匹配 AI 项目(ai_project)；取第一个匹配的 AppConfig 包名
+const fillAppPackageFromProject = () => {
+  if (!realProjectId.value) return
+  const projectIdNum = Number(realProjectId.value)
+  const unified = projectId.value || ''
+  // 找到绑定该项目的应用配置
+  const matched = appConfigs.value.find(a => {
+    if (unified.startsWith('proj_')) {
+      return Number(a.ai_project) === projectIdNum
+    }
+    // ui_xxx 或纯数字：匹配 UiProject
+    return Number(a.project) === projectIdNum
+  })
+  if (matched && matched.package_name) {
+    importForm.app_package = matched.package_name
+  }
 }
 
 const selectTestCase = async (testCase) => {
@@ -1202,15 +1252,19 @@ const onStepsReorder = () => {
 
 const onActionTypeChange = (step) => {
   // 根据操作类型重置相关参数
-  if (!['fill', 'input', 'swipe'].includes(step.action_type)) {
+  if (!['fill', 'input', 'swipe', 'aiInput', 'navigate'].includes(step.action_type)) {
     step.input_value = ''
   }
   if (step.action_type !== 'wait') {
     step.wait_time = 1000
   }
-  if (step.action_type !== 'assert') {
+  if (!['assert', 'aiAssert'].includes(step.action_type)) {
     step.assert_type = 'textContains'
     step.assert_value = ''
+  }
+  // Midscene 动作不需要元素选择，清空 element_id
+  if (['aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'navigate'].includes(step.action_type)) {
+    step.element_id = null
   }
 }
 
@@ -1223,7 +1277,7 @@ const onElementChange = (step) => {
 }
 
 const needsInputValue = (actionType) => {
-  return ['fill', 'input', 'swipe', 'long_press'].includes(actionType)
+  return ['fill', 'input', 'swipe', 'long_press', 'aiInput', 'navigate'].includes(actionType)
 }
 
 const needsWaitTime = (actionType) => {
@@ -1231,7 +1285,7 @@ const needsWaitTime = (actionType) => {
 }
 
 const needsElement = (actionType) => {
-  return !['wait', 'switchTab', 'screenshot', 'swipe', 'launch_app', 'close_app', 'back', 'home'].includes(actionType)
+  return !['wait', 'switchTab', 'screenshot', 'swipe', 'launch_app', 'close_app', 'back', 'home', 'aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'navigate'].includes(actionType)
 }
 
 const expandAllSteps = () => {
@@ -1646,7 +1700,13 @@ const getActionTypeText = (actionType) => {
     'launch_app': '启动应用',
     'close_app': '关闭应用',
     'back': '返回',
-    'home': '主页'
+    'home': '主页',
+    'aiAct': 'AI操作',
+    'aiTap': 'AI点击',
+    'aiInput': 'AI输入',
+    'aiQuery': 'AI查询',
+    'aiAssert': 'AI断言',
+    'navigate': '导航'
   }
   return textMap[actionType] || actionType
 }
@@ -1679,7 +1739,13 @@ const getActionText = (actionType) => {
     'launch_app': '启动应用',
     'close_app': '关闭应用',
     'back': '返回',
-    'home': '主页'
+    'home': '主页',
+    'aiAct': 'AI操作',
+    'aiTap': 'AI点击',
+    'aiInput': 'AI输入',
+    'aiQuery': 'AI查询',
+    'aiAssert': 'AI断言',
+    'navigate': '导航'
   }
   return actionMap[actionType] || actionType
 }
@@ -1714,6 +1780,9 @@ const loadAppDevicesAndConfigs = async () => {
     const [devicesRes, newDevicesRes, configsRes] = await Promise.allSettled([
       getAppDevices({ status: 'online', page_size: 999 }),
       getNewDeviceList({ status: 'online', page_size: 999 }),
+      // 不带 project 过滤：很多项目未单独配应用（AppConfig.project 为 null），
+      // 若按项目过滤会得到空列表导致应用下拉显示"无数据"。
+      // 应用下拉统一展示全量 AppConfig，用户按需切换；切项目时仅做"是否仍命中"的兜底。
       getAppConfigs({ page_size: 999 })
     ])
     // 合并新旧设备源，按 udid/device_id 去重（新版优先）
@@ -1740,6 +1809,14 @@ const loadAppDevicesAndConfigs = async () => {
     if (configsRes.status === 'fulfilled') {
       appConfigs.value = configsRes.value.data.results || configsRes.value.data || []
     }
+    // 默认选中：当前选中项不在新列表里时，自动选第一个，避免用户每次进页面都得手动点
+    // （常见场景：项目未配置专属应用，回退到全量列表里的第一项）
+    if (appConfigs.value.length && !appConfigs.value.some(a => a.id === selectedAppConfigId.value)) {
+      selectedAppConfigId.value = appConfigs.value[0].id
+    }
+    if (appDevices.value.length && !appDevices.value.some(d => d.device_id === selectedDeviceId.value)) {
+      selectedDeviceId.value = appDevices.value[0].device_id
+    }
   } catch (error) {
     // 加载失败不影响主流程
   }
@@ -1760,7 +1837,8 @@ const doDumpPage = async () => {
     const response = await dumpPageElements({
       device_id: selectedDeviceId.value,
       app_config_id: selectedAppConfigId.value,
-      app_name: '万年历'
+      app_name: '万年历',
+      engine: recordingEngine.value  // 跟随用户当前选择的录制引擎（airtest/appium）
     })
     if (response.data.success) {
       dumpedElements.value = response.data.candidates || response.data.elements || []
@@ -1846,22 +1924,70 @@ const importForm = reactive({
   case_name: '',
   app_package: ''
 })
+// 导入的原始文件（.air 压缩包 / .py），用于上传模板图
+const importFile = ref(null)
+// 导入弹窗内独立维护的目标项目（unified id 与 resolved UiProject id），
+// 不污染右上角 projectId / realProjectId 主状态
+const importProjectId = ref('')
+const importRealProjectId = ref(null)
+
+// 当前导入项目名（用于包名自动填充匹配 AppConfig.ai_project）
+const importCurrentProjectName = computed(() => {
+  const p = allProjects.value.find(x => x.id === importProjectId.value)
+  return p ? p.name : ''
+})
+
+// 选择项目后：resolve 到 UiProject id，并自动按新项目填充包名
+const onImportProjectChange = async () => {
+  importRealProjectId.value = await resolveUiProjectId(importProjectId.value)
+  // 用新的 importProjectId / importRealProjectId 重算包名
+  fillAppPackageFromImportProject()
+}
+
+// 按当前 importProjectId 从 AppConfig 里找包名填入
+const fillAppPackageFromImportProject = () => {
+  if (!importRealProjectId.value) return
+  const projectIdNum = Number(importRealProjectId.value)
+  const unified = importProjectId.value || ''
+  const matched = appConfigs.value.find(a => {
+    if (unified.startsWith('proj_')) {
+      return Number(a.ai_project) === projectIdNum
+    }
+    return Number(a.project) === projectIdNum
+  })
+  if (matched && matched.package_name) {
+    importForm.app_package = matched.package_name
+  }
+}
 const currentProjectName = computed(() => {
   const p = allProjects.value.find(x => x.id === projectId.value)
   return p ? p.name : ''
 })
 
-const openImportDialog = () => {
-  if (!realProjectId.value) {
+const openImportDialog = async () => {
+  if (!projectId.value) {
     ElMessage.warning('请先在右上角选择目标项目')
     return
   }
+  // 默认继承右上角当前项目（弹窗内可改选）
+  importProjectId.value = projectId.value
+  importRealProjectId.value = realProjectId.value
+  // 打开时若当前项目已配置应用包名，自动填入
+  fillAppPackageFromImportProject()
   showImportDialog.value = true
 }
 
 const onAirtestFileChange = (file) => {
   const raw = file?.raw
   if (!raw) return
+  importFile.value = raw
+  const isArchive = /\.(air|zip)$/i.test(raw.name)
+  if (isArchive) {
+    // .air 压缩包：保留原始文件供上传提取模板图；文本留空（后端解压解析）
+    importForm.script = ''
+    ElMessage.success(`已选择压缩包：${raw.name}（将解析脚本并提取模板图）`)
+    return
+  }
   const reader = new FileReader()
   reader.onload = (e) => {
     importForm.script = e.target?.result || ''
@@ -1875,6 +2001,9 @@ const resetImportForm = () => {
   importForm.script = ''
   importForm.case_name = ''
   importForm.app_package = ''
+  importProjectId.value = ''
+  importRealProjectId.value = null
+  importFile.value = null
 }
 
 const closeImportDialog = () => {
@@ -1882,22 +2011,43 @@ const closeImportDialog = () => {
 }
 
 const submitImport = async () => {
-  if (!realProjectId.value) {
-    ElMessage.warning('请先在右上角选择目标项目')
+  if (!importProjectId.value) {
+    ElMessage.warning('请选择目标项目')
     return
   }
-  if (!importForm.script.trim()) {
+  if (!importRealProjectId.value) {
+    // 兜底：万一未触发 change（例如直接打开后未动下拉）
+    importRealProjectId.value = await resolveUiProjectId(importProjectId.value)
+    if (!importRealProjectId.value) {
+      ElMessage.error('项目解析失败')
+      return
+    }
+  }
+  const hasArchive = importFile.value && /\.(air|zip)$/i.test(importFile.value.name)
+  if (!hasArchive && !importForm.script.trim()) {
     ElMessage.warning('请粘贴或上传脚本内容')
     return
   }
   isImporting.value = true
   try {
-    const response = await importAirtestScript({
-      project_id: realProjectId.value,
-      case_name: importForm.case_name.trim(),
-      app_package: importForm.app_package.trim(),
-      script: importForm.script
-    })
+    let payload
+    if (hasArchive) {
+      // .air 压缩包：FormData 上传，后端解压提取脚本+模板图
+      const fd = new FormData()
+      fd.append('script_file', importFile.value)
+      fd.append('project_id', importRealProjectId.value)
+      if (importForm.case_name.trim()) fd.append('case_name', importForm.case_name.trim())
+      if (importForm.app_package.trim()) fd.append('app_package', importForm.app_package.trim())
+      payload = fd
+    } else {
+      payload = {
+        project_id: importRealProjectId.value,
+        case_name: importForm.case_name.trim(),
+        app_package: importForm.app_package.trim(),
+        script: importForm.script
+      }
+    }
+    const response = await importAirtestScript(payload)
     if (response.data.success) {
       ElMessage.success(response.data.message)
       showImportDialog.value = false

@@ -11,6 +11,25 @@ import json
 logger = logging.getLogger('django')
 
 
+def _normalize_shot(raw: str) -> str:
+    """把截图统一成 <img src> 能直接用的形式。
+
+    引擎返回的是**裸 base64**（`iVBORw0KGgo...`），前端 `<img :src>` 拿到裸串
+    是渲染不出来的 —— 必须补成 data URI。已经是 data URI 的原样返回。
+    """
+    if not raw or not isinstance(raw, str):
+        return ''
+    text = raw.strip()
+    if text.startswith('data:'):
+        return text
+    if text.startswith('http://') or text.startswith('https://') or text.startswith('/'):
+        return text
+    # 只对看起来像 base64 的内容包 data URI，避免把普通文本塞进 img
+    if len(text) > 128 and re.fullmatch(r'[A-Za-z0-9+/=\s]+', text):
+        return 'data:image/png;base64,' + re.sub(r'\s+', '', text)
+    return ''
+
+
 class AIExecutionReportGenerator:
     """AI执行报告生成器"""
 
@@ -316,19 +335,45 @@ class AIExecutionReportGenerator:
         }
 
     def _parse_detailed_steps(self, logs: str, steps_completed: List) -> List[Dict[str, Any]]:
-        """解析详细步骤信息"""
+        """解析详细步骤信息。
+
+        注意字段来源：Midscene 引擎写的步骤用的是 `index` / `name` / `prompt`，
+        而不是 browser-use 的 `step_number` / `element`。这里两种都要兼容 ——
+        否则 Midscene 用例的步骤会全部变成「步骤 0 / 操作 aiAct」，看不出做了什么。
+        """
         detailed_steps = []
 
-        # 先从 steps_completed 中提取信息
-        for step in steps_completed:
+        for pos, step in enumerate(steps_completed or []):
+            if not isinstance(step, dict):
+                continue
+            # index 是 0 基的，展示时统一成 1 基
+            raw_idx = step.get('index')
+            try:
+                step_number = int(raw_idx) + 1
+            except (TypeError, ValueError):
+                try:
+                    step_number = int(step.get('step_number') or (pos + 1))
+                except (TypeError, ValueError):
+                    step_number = pos + 1
+
             detailed_steps.append({
-                'step_number': step.get('step_number', 0),
+                'step_number': step_number,
                 'action': step.get('action', ''),
-                'element': step.get('element', ''),
+                # Midscene 没有 element 概念，用 name（步骤说明）顶上；
+                # 再退一步用 prompt，让用户至少知道这一步在做什么
+                'element': step.get('element') or step.get('name') or '',
+                'prompt': step.get('prompt', '') or '',
                 'status': step.get('status', 'completed'),
                 'timestamp': step.get('timestamp', ''),
                 'thinking': step.get('thinking', ''),
-                'screenshot': step.get('screenshot', ''),
+                'error': step.get('error', ''),
+                # 每一步都要有自己的截图：失败用失败截图，成功用执行后的画面
+                'screenshot': _normalize_shot(
+                    step.get('screenshot') or step.get('fail_screenshot') or ''
+                ),
+                'is_failure_shot': bool(
+                    not step.get('screenshot') and step.get('fail_screenshot')
+                ),
             })
 
         # 如果没有 steps_completed，从日志中解析

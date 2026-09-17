@@ -1,37 +1,119 @@
-# 开发环境 - 独立后端容器
-# 用法:
-#   启动: docker compose -f docker-compose.dev.yml up -d
-#   停止: docker compose -f docker-compose.dev.yml down
-# 生产环境不受影响，正常使用: docker compose up -d
+name: testhub-dev
 
 services:
-  backend-dev:
-    image: testhub-backend:latest
-    container_name: testhub-backend-dev
+  mysql:
+    image: mysql:8.0
     restart: unless-stopped
     env_file:
-      - .env
+      - .env.dev
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-testhub_dev}
+      MYSQL_USER: ${MYSQL_USER:-testhub_dev}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - dev-mysql-data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    networks:
+      - dev-net
+    ports:
+      - "127.0.0.1:${DEV_MYSQL_PORT:-13306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "${MYSQL_USER:-testhub_dev}", "-p${MYSQL_PASSWORD}"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    mem_limit: 1g
+    cpus: 1.0
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - dev-redis-data:/data
+    networks:
+      - dev-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+    cpus: 0.5
+
+  backend:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      REDIS_URL: redis://redis:6379/0
+      # midscene v1.8.7 要求显式指定模型 family（其 Node 服务从环境变量读取，
+      # 不会继承 Python 请求线程里设置的 os.environ）。dashscope 多模态模型 qwen3.7-plus 配 qwen3-vl 协议。
+      MIDSCENE_MODEL_FAMILY: qwen3-vl
     volumes:
       - ./apps:/app/apps
       - ./backend:/app/backend
-      - ./knowledge-base:/app/knowledge-bases
-      - testhub-media:/app/media
-      - testhub-logs:/app/logs
+      - ./scripts:/app/scripts
+      - ./manage.py:/app/manage.py
+      - ./docker_start.py:/app/docker_start.py
+      - dev-media:/app/media
+      - dev-logs:/app/logs
+      - dev-knowledge:/app/knowledge-bases
+      - dev-chroma:/app/chroma
+      # Midscene 运行时（Node runtime + @midscene/web Node 服务）持久化。
+      # 它是首次运行期下载的运行产物（约 350MB），不挂卷的话容器一重建就得重新
+      # 下载 Node + npm install（约 5 分钟）。
+      # 注：Chrome 不在这里——引擎已改为复用镜像自带的 playwright chromium，
+      # 见 apps/ui_automation/midscene_web_engine.py::_find_chrome_executable。
+      - dev-midscene:/root/.midscene
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
-      - testhub-net
+      - dev-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "8001:8000"
-    command: ["python", "docker_start.py"]
+      # 绑定 0.0.0.0：插着手机的电脑（局域网内其它机器）要能直接
+      # POST /api/ui-automation/device-agent/register/ 上报设备，
+      # 绑 127.0.0.1 时只能从本机访问。
+      - "${DEV_BACKEND_PORT:-18000}:8000"
+    mem_limit: 4g
+    cpus: 2.0
+
+  frontend:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend.dev
+    restart: unless-stopped
+    depends_on:
+      - backend
+    networks:
+      - dev-net
+    ports:
+      - "${DEV_FRONTEND_PORT:-18080}:80"
+    mem_limit: 256m
+    cpus: 0.5
 
 networks:
-  testhub-net:
-    external: true
-    name: testhub_testhub-net
+  dev-net:
+    driver: bridge
 
 volumes:
-  testhub-media:
-    external: true
-    name: testhub_testhub-media
-  testhub-logs:
-    external: true
-    name: testhub_testhub-logs
+  dev-mysql-data:
+  dev-redis-data:
+  dev-media:
+  dev-logs:
+  dev-knowledge:
+  dev-chroma:
+  dev-midscene:

@@ -63,24 +63,31 @@ class AppTestConfig(models.Model):
 
 
 class AppDevice(models.Model):
-    """Android 设备模型 - 整合了设备管理功能"""
+    """移动测试设备模型（Android / iOS）- 整合了设备管理功能"""
     STATUS_CHOICES = [
         (DeviceStatus.AVAILABLE, '可用'),
         (DeviceStatus.LOCKED, '已锁定'),
         (DeviceStatus.ONLINE, '在线'),
         (DeviceStatus.OFFLINE, '离线'),
     ]
-    
+
+    PLATFORM_CHOICES = [
+        ('android', 'Android'),
+        ('ios', 'iOS'),
+    ]
+
     CONNECTION_TYPE_CHOICES = [
         ('emulator', '本地模拟器'),
         ('remote_emulator', '远程模拟器'),
         ('real_device', '真实设备'),
     ]
-    
+
     device_id = models.CharField(max_length=255, unique=True, verbose_name='设备序列号')
     name = models.CharField(max_length=255, blank=True, default='', verbose_name='设备名称')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=DeviceStatus.OFFLINE, verbose_name='状态')
-    android_version = models.CharField(max_length=50, blank=True, default='', verbose_name='Android版本')
+    # 平台：Android / iOS。ADB 发现的设备一律为 android；iOS 需手动登记（走 WDA）。
+    platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default='android', verbose_name='平台')
+    android_version = models.CharField(max_length=50, blank=True, default='', verbose_name='系统版本')
     connection_type = models.CharField(max_length=20, choices=CONNECTION_TYPE_CHOICES, default='emulator', verbose_name='连接类型')
     ip_address = models.CharField(max_length=50, blank=True, default='', verbose_name='IP地址')
     port = models.IntegerField(default=5555, verbose_name='端口')

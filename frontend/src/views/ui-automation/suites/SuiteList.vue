@@ -228,8 +228,10 @@
         <el-form-item label="测试引擎">
           <el-select v-model="runConfig.engine" placeholder="请选择测试引擎">
             <el-option label="Playwright" value="playwright" />
+            <el-option label="Midscene Web (AI语义自动化)" value="midscene_web" />
             <el-option label="Selenium" value="selenium" />
             <el-option label="Appium (App自动化)" value="appium" />
+            <el-option label="Airtest (App自动化)" value="airtest" />
           </el-select>
         </el-form-item>
         <!-- Web引擎配置 -->
@@ -249,8 +251,8 @@
             </el-radio-group>
           </el-form-item>
         </template>
-        <!-- Appium 配置 -->
-        <template v-if="runConfig.engine === 'appium'">
+        <!-- Appium / Airtest 配置（都需要设备+应用） -->
+        <template v-if="runConfig.engine === 'appium' || runConfig.engine === 'airtest'">
           <el-form-item label="测试设备" required>
             <el-select v-model="runConfig.device_id" placeholder="请选择测试设备" filterable style="width: 100%">
               <el-option
@@ -432,6 +434,7 @@ const onProjectChange = async () => {
   pagination.currentPage = 1
   // 解析统一 ID，获取实际 UiProject ID
   realProjectId.value = await resolveUiProjectId(projectId.value)
+  await loadAppDevicesAndConfigs()
   await loadSuites()
 }
 
@@ -585,7 +588,7 @@ const loadAppDevicesAndConfigs = async () => {
   try {
     const [devicesRes, configsRes] = await Promise.allSettled([
       getAppDevices({ status: 'online', page_size: 999 }),
-      getAppConfigs({ page_size: 999 })
+      getAppConfigs({ page_size: 999, project: projectId.value || undefined })
     ])
     if (devicesRes.status === 'fulfilled') {
       appDevices.value = devicesRes.value.data.results || devicesRes.value.data || []
@@ -600,8 +603,8 @@ const loadAppDevicesAndConfigs = async () => {
 
 // 确认运行套件
 const confirmRunSuite = async () => {
-  // Appium 引擎校验
-  if (runConfig.engine === 'appium') {
+  // Appium / Airtest 引擎校验（均需要设备+应用）
+  if (runConfig.engine === 'appium' || runConfig.engine === 'airtest') {
     if (!runConfig.device_id) {
       ElMessage.warning('请选择测试设备')
       return
@@ -620,8 +623,8 @@ const confirmRunSuite = async () => {
       browser: runConfig.browser,
       headless: runConfig.headless
     }
-    // Appium 额外参数
-    if (runConfig.engine === 'appium') {
+    // Appium / Airtest 额外参数
+    if (runConfig.engine === 'appium' || runConfig.engine === 'airtest') {
       requestData.device_id = runConfig.device_id
       requestData.app_config_id = runConfig.app_config_id
     }
@@ -822,6 +825,7 @@ onMounted(async () => {
   if (allProjects.value.length > 0) {
     projectId.value = allProjects.value[0].id
     realProjectId.value = await resolveUiProjectId(projectId.value)
+    await loadAppDevicesAndConfigs()
     await loadSuites()
   }
 })

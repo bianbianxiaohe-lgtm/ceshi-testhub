@@ -280,7 +280,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   getTestCaseExecutions,
@@ -370,8 +370,8 @@ const getScreenshotUrls = (shots) => shots.map(s => getImageUrl(s)).filter(Boole
 
 // ---- 数据加载 ----
 
-const loadExecutions = async () => {
-  loading.value = true
+const loadExecutions = async (silent = false) => {
+  if (!silent) loading.value = true
   try {
     const params = {
       page: currentPage.value,
@@ -388,9 +388,9 @@ const loadExecutions = async () => {
     total.value = data.count || 0
   } catch (error) {
     console.error('加载执行记录失败:', error)
-    ElMessage.error('加载执行记录失败')
+    if (!silent) ElMessage.error('加载执行记录失败')
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -435,9 +435,12 @@ const stepActionText = (actionType) => {
 
 // 自动刷新执行中的记录
 const startAutoRefresh = () => {
+  if (refreshTimer) return
   refreshTimer = setInterval(() => {
+    // 页面在后台时不刷新，避免无效请求
+    if (document.visibilityState !== 'visible') return
     const hasRunning = executions.value.some(e => ['running', 'pending'].includes(e.status))
-    if (hasRunning) loadExecutions()
+    if (hasRunning) loadExecutions(true)
   }, 5000)
 }
 
@@ -448,13 +451,35 @@ const stopAutoRefresh = () => {
   }
 }
 
+// 页面可见性变化：切到后台暂停轮询，回到前台恢复
+const handleVisibilityChange = () => {
+  if (document.visibilityState === 'visible') {
+    startAutoRefresh()
+  } else {
+    stopAutoRefresh()
+  }
+}
+
 onMounted(() => {
   getAllUiProjects().then(res => { projectList.value = (res.data || []).filter(p => p.source === 'ui') }).catch(() => {})
   loadExecutions()
   startAutoRefresh()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
-onUnmounted(() => stopAutoRefresh())
+onUnmounted(() => {
+  stopAutoRefresh()
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+})
+
+// 看详情弹窗时暂停轮询，关闭后恢复（避免弹窗内容被后台刷新干扰）
+watch(detailVisible, (visible) => {
+  if (visible) {
+    stopAutoRefresh()
+  } else {
+    startAutoRefresh()
+  }
+})
 </script>
 
 <style scoped lang="scss">

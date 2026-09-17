@@ -5,16 +5,43 @@
     </div>
 
     <div class="card-container">
+      <!-- 执行模式选择器 -->
+      <div class="mode-selector">
+        <el-radio-group v-model="executionMode" @change="handleModeChange">
+          <el-radio-button value="text">
+            <el-icon><ChatDotRound /></el-icon>
+            文本模式
+          </el-radio-button>
+          <el-radio-button value="midscene_web">
+            <el-icon><Monitor /></el-icon>
+            Midscene Web
+          </el-radio-button>
+        </el-radio-group>
+        <el-tooltip content="文本模式使用 browser-use 驱动，Midscene Web 使用视觉模型理解页面" placement="top">
+          <el-icon style="margin-left: 8px; cursor: help; color: #909399;"><QuestionFilled /></el-icon>
+        </el-tooltip>
+      </div>
+
       <el-row :gutter="20">
         <el-col :span="12">
           <div class="section-title">任务输入</div>
           <el-form :model="taskForm" label-position="top">
+            <!-- Midscene Web 模式：显示 URL 输入 -->
+            <el-form-item v-if="executionMode === 'midscene_web'" label="目标网址" required>
+              <el-input
+                v-model="taskForm.url"
+                placeholder="https://example.com"
+                clearable
+              />
+            </el-form-item>
             <el-form-item label="任务描述" required>
               <el-input
                 v-model="taskForm.description"
                 type="textarea"
                 :rows="10"
-                placeholder="请用自然语言描述要执行的任务，例如：&#10;1. 访问 https://www.baidu.com&#10;2. 搜索 'TestHub'&#10;3. 点击第一条搜索结果"
+                :placeholder="executionMode === 'midscene_web'
+                  ? '用自然语言描述要执行的操作步骤，例如：\n1. 点击页面右上角的「登录」按钮\n2. 在搜索框中输入“人工智能”\n3. 提取当前页面的所有商品名称'
+                  : '请用自然语言描述要执行的任务，例如：\n1. 访问 https://www.baidu.com\n2. 搜索 \'TestHub\'\n3. 点击第一条搜索结果'"
                 maxlength="2000"
                 show-word-limit
               />
@@ -154,10 +181,17 @@ const plannedTasks = ref([])
 const currentExecutionId = ref(null)
 const logContainer = ref(null)
 
+const executionMode = ref('text')
+
 const taskForm = reactive({
   description: '',
+  url: '',
   enableGif: true  // GIF录制开关，默认开启
 })
+
+const handleModeChange = (mode) => {
+  executionMode.value = mode
+}
 
 const showSaveDialog = ref(false)
 const saveForm = reactive({
@@ -178,11 +212,25 @@ const handleRun = async () => {
   plannedTasks.value = []
 
   try {
-    const response = await runAdhocAITask({
-      task_description: taskForm.description,
-      execution_mode: 'text',  // 始终使用文本模式
-      enable_gif: taskForm.enableGif  // 传递GIF录制开关状态
-    })
+    const payload = {
+      execution_mode: executionMode.value,
+      enable_gif: taskForm.enableGif
+    }
+
+    if (executionMode.value === 'midscene_web') {
+      const url = (taskForm.url || '').trim()
+      if (!url) {
+        ElMessage.warning('请输入目标网址')
+        running.value = false
+        analyzing.value = false
+        return
+      }
+      payload.task_description = url + '\n' + taskForm.description
+    } else {
+      payload.task_description = taskForm.description
+    }
+
+    const response = await runAdhocAITask(payload)
 
     // analyzing.value = false // 移除过早设置，改为在轮询获取到任务列表后再取消
     
@@ -274,11 +322,16 @@ const confirmSaveCase = async () => {
     if (valid) {
       saving.value = true
       try {
-        await createAICase({
+        const casePayload = {
           name: saveForm.name,
           description: saveForm.description,
+          execution_mode: executionMode.value,
           task_description: taskForm.description
-        })
+        }
+        if (executionMode.value === 'midscene_web') {
+          casePayload.task_description = (taskForm.url || '') + '\n' + taskForm.description
+        }
+        await createAICase(casePayload)
 
         ElMessage.success('保存成功')
         showSaveDialog.value = false
@@ -317,6 +370,15 @@ const confirmSaveCase = async () => {
   padding: 20px;
   box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
   min-height: calc(100vh - 140px);
+}
+
+.mode-selector {
+  margin-bottom: 20px;
+  padding: 12px 16px;
+  background: #f5f7fa;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
 }
 
 .section-title {

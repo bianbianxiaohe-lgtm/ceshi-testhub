@@ -166,7 +166,7 @@
                 v-for="p in uiProjects"
                 :key="p.id"
                 :label="p.name"
-                :value="'ui_' + p.id"
+                :value="p.id"
               />
             </el-option-group>
             <el-option-group label="AI用例项目">
@@ -174,7 +174,7 @@
                 v-for="p in aiProjects"
                 :key="p.id"
                 :label="p.name"
-                :value="'proj_' + p.id"
+                :value="p.id"
               />
             </el-option-group>
             <template #empty>
@@ -219,7 +219,7 @@ const aiProjects = computed(() => projects.value.filter(p => p.source === 'proj'
 // 筛选栏用的项目列表（合并所有项目，value为字符串 "ui_xxx" 或 "proj_xxx"）
 const allProjectsForSelect = computed(() => projects.value.map(p => ({
   id: p.id,
-  name: p.name
+  name: p.name + (p.source === 'ui' ? '（UI）' : '（AI）')
 })))
 const selectedProjectName = ref(null)
 const pagination = reactive({ currentPage: 1, pageSize: 10 })
@@ -238,8 +238,8 @@ const defaultForm = {
   app_activity: '',
   app_path: '',
   version: '',
-  project: null,
-  ai_project: null
+  // 合并字段：'ui_xxx' 表示 UI 自动化项目，'proj_xxx' 表示 AI 用例项目
+  project: null
 }
 
 const form = reactive({ ...defaultForm })
@@ -296,7 +296,21 @@ const loadProjects = async () => {
       })
     }
     
-    projects.value = Array.from(mergedMap.values())
+    // 按名称去重：同名项目只保留一份（AI 项目优先）。
+    // 业务源头是 AI 生成用例模块：先创建 AI 项目，再由它衍生出 UI 自动化等功能。
+    // 因此同名项目只保留 AI 那份（proj_），不再额外展示/派生 UiProject 副本。
+    const byName = new Map()
+    for (const p of Array.from(mergedMap.values())) {
+      const exist = byName.get(p.name)
+      if (!exist) {
+        byName.set(p.name, p)
+        continue
+      }
+      if (exist.source !== 'proj' && p.source === 'proj') {
+        byName.set(p.name, p)
+      }
+    }
+    projects.value = Array.from(byName.values())
   } catch (error) {
     // 项目列表加载失败不影响主功能
   }
@@ -311,14 +325,8 @@ const onProjectNameSelect = (mergedId) => {
   if (project) {
     // 自动填充应用名称为项目名称
     form.name = project.name
-    // 自动关联所属项目
-    if (project.source === 'ui') {
-      form.project = 'ui_' + project.id
-      form.ai_project = null
-    } else if (project.source === 'proj') {
-      form.ai_project = 'proj_' + project.id
-      form.project = null
-    }
+    // 自动关联所属项目（统一用合并字段）
+    form.project = project.id
   }
   selectedProjectName.value = null
 }
@@ -331,9 +339,11 @@ const resetForm = () => {
   formRef.value?.resetFields()
 }
 
-const handleEdit = (row) => {
+const handleEdit = async (row) => {
   isEditing.value = true
   editingId.value = row.id
+  // 先确保项目列表加载完成，否则 el-select 无法把 value 解析成 label 会显示 raw value
+  await loadProjects()
   Object.assign(form, {
     name: row.name,
     platform: row.platform,
@@ -341,8 +351,8 @@ const handleEdit = (row) => {
     app_activity: row.app_activity || '',
     app_path: row.app_path || '',
     version: row.version || '',
-    project: row.project ? 'ui_' + row.project : null,
-    ai_project: row.ai_project ? 'proj_' + row.ai_project : null
+    // 把后端两个字段统一回显为一个合并字段
+    project: row.project ? 'ui_' + row.project : (row.ai_project ? 'proj_' + row.ai_project : null)
   })
   showCreateDialog.value = true
 }
@@ -357,7 +367,7 @@ const handleSubmit = async () => {
       ...form,
       // 解析所属项目：根据前缀判断是 UiProject 还是 AI Project
       project: form.project && form.project.startsWith('ui_') ? parseInt(form.project.replace('ui_', '')) : null,
-      ai_project: form.ai_project && form.ai_project.startsWith('proj_') ? parseInt(form.ai_project.replace('proj_', '')) : null,
+      ai_project: form.project && form.project.startsWith('proj_') ? parseInt(form.project.replace('proj_', '')) : null,
       app_activity: form.platform === 'ios' ? '' : form.app_activity
     }
     if (isEditing.value) {

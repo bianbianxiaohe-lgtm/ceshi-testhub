@@ -32,9 +32,10 @@ from django.shortcuts import get_object_or_404
 from django.http import FileResponse, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from apps.requirement_analysis.models import ModaoPrototype
-from apps.requirement_analysis.serializers import ModaoPrototypeSerializer
+from apps.requirement_analysis.models import ModaoPrototype, ModaoPage
+from apps.requirement_analysis.serializers import ModaoPrototypeSerializer, ModaoPageSerializer
 from apps.requirement_analysis.modao_workflow import ModaoWorkflow, _parse_yaml, _extract_block
+from apps.requirement_analysis import modao_xmind
 from apps.feature_modules.models import FeatureModule, TestPoint
 from apps.testcases.models import TestCase
 
@@ -96,7 +97,7 @@ def _canonical_module_name(raw, proto=None, project=None):
 import datetime as _dt
 _CONTAINER_START_TIME = _dt.datetime.now()
 
-def _recover_stale_designing(proto, timeout_minutes=120):
+def _recover_stale_designing(proto, timeout_minutes=30):
     """自动回收卡死的 designing 状态。
 
     当 proto.status 为 designing 但 updated_at 距今超过 timeout_minutes 分钟时，
@@ -113,14 +114,7 @@ def _recover_stale_designing(proto, timeout_minutes=120):
     elapsed = (timezone.now() - proto.updated_at).total_seconds()
     if elapsed < timeout_minutes * 60:
         return False
-    # 容器重启后 updated_at 可能很早 → 不判为超时
-    try:
-        if proto.updated_at.replace(tzinfo=None) < _CONTAINER_START_TIME:
-            logger.info('[stale-recover] proto %d skipped: updated_at before container start', proto.id)
-            return False
-    except Exception:
-        pass
-    # 已超时且无活跃线程 → 回收
+    # 已超时且无活跃线程 → 回收（重启前中断的线程同样按超时回收，避免永久转圈）
     wl_tail = (proto.work_log or '')[-150:]
     proto.status = 'failed'
     proto.error_message = (
@@ -172,7 +166,7 @@ def _accessible_proto_qs(user):
     return (own | project_protos).distinct()
 
 
-def _build_wf(proto, analyzer_id=None, writer_id=None, embedder_id=None):
+def _build_wf(proto, analyzer_id=None, writer_id=None, embedder_id=None, page_ids=None):
     analyzer, writer, embedder = ModaoWorkflow.resolve_configs(analyzer_id, writer_id, embedder_id)
     # 视觉识别配置：用于纯图片/截图/表格型页面的 OCR 补充（writer_vision 角色）
     from apps.requirement_analysis.models import AIModelConfig
@@ -180,7 +174,8 @@ def _build_wf(proto, analyzer_id=None, writer_id=None, embedder_id=None):
     # OCR 专用视觉模型：独立配置，可指向更快的模型（如 qwen-vl-plus），
     # 与融合/结构化使用的强模型解耦；未单独配置时回退到 writer_vision。
     ocr_vision_config = AIModelConfig.objects.filter(role='writer_vision_ocr', is_active=True).first() or vision_config
-    return ModaoWorkflow(proto, analyzer, writer, embedder, vision_config=vision_config, ocr_vision_config=ocr_vision_config)
+    return ModaoWorkflow(proto, analyzer, writer, embedder, vision_config=vision_config,
+                         ocr_vision_config=ocr_vision_config, page_ids=page_ids)
 
 
 # ---------- 模块同步解析工具 ----------
@@ -216,6 +211,214 @@ def _extract_modules(split_text):
 
 _PRIO_MAP = {'P0': 'critical', 'P1': 'high', 'P2': 'medium', 'P3': 'low'}
 _TYPE_MAP = {v: v for v in ('functional', 'integration', 'api', 'ui', 'performance', 'security')}
+# 中文用例类型（p3 prompt 输出：功能/边界/异常/UI/兼容）→ TestCase.TYPE_CHOICES
+_TYPE_CN_MAP = {
+    '功能': 'functional', '正向': 'functional', '主流程': 'functional',
+    '边界': 'functional', '异常': 'functional', '容错': 'functional',
+    'ui': 'ui', '界面': 'ui', '视觉': 'ui',
+    '兼容': 'integration', '集成': 'integration', '联调': 'integration',
+    '接口': 'api', 'api接口': 'api',
+    '性能': 'performance', '压测': 'performance',
+    '安全': 'security', '权限': 'security',
+}
+
+
+def _priority_of(raw):
+    """优先级归一化：P0-P3 / 已是 TestCase 选项值都兼容。"""
+    k = str(raw or '').strip()
+    if k in _PRIO_MAP:
+        return _PRIO_MAP[k]
+    if k in ('critical', 'high', 'medium', 'low'):
+        return k
+    return 'medium'
+
+
+def _test_type_of(raw):
+    """类型归一化：英文选项值 / 中文类型（功能、异常、UI、兼容…）都能落到合法选项。"""
+    k = str(raw or '').strip()
+    low = k.lower()
+    if low in _TYPE_MAP:
+        return low
+    return _TYPE_CN_MAP.get(k) or _TYPE_CN_MAP.get(low) or 'functional'
+
+
+def _steps_to_text(steps):
+    """步骤归一化：list[str] / list[dict] / str 统一转为「1. xxx\\n2. yyy」文本。"""
+    if isinstance(steps, str):
+        return steps.strip()
+    if not isinstance(steps, list):
+        return ''
+    lines = []
+    for s in steps:
+        if isinstance(s, dict):
+            txt = s.get('content') or s.get('action') or s.get('step') or ''
+        else:
+            txt = s
+        txt = str(txt).strip()
+        if txt:
+            lines.append(txt)
+    return '\n'.join(f'{i + 1}. {t}' for i, t in enumerate(lines))
+
+
+def _steps_to_list(steps):
+    """步骤归一化：转为 list[str]，供前端编辑与回显。"""
+    if isinstance(steps, str):
+        import re as _re
+        parts = [p.strip() for p in _re.split(r'\r?\n', steps) if p.strip()]
+        return [_re.sub(r'^\s*\d+[.、)]\s*', '', p) for p in parts]
+    if not isinstance(steps, list):
+        return []
+    out = []
+    for s in steps:
+        if isinstance(s, dict):
+            txt = s.get('content') or s.get('action') or s.get('step') or ''
+        else:
+            txt = s
+        txt = str(txt or '').strip()
+        if txt:
+            out.append(txt)
+    return out
+
+
+def _tc_fields(tc_obj):
+    """从（原始或前端编辑后的）用例对象抽取写入 TestCase 的字段。"""
+    d = tc_obj if isinstance(tc_obj, dict) else {}
+    steps = d.get('steps')
+    if not steps:
+        # 冒烟用例复用 p4 字段名 test_steps / pass_criteria
+        steps = d.get('test_steps') or d.get('testSteps') or ''
+    return {
+        'title': str(d.get('title') or d.get('name') or d.get('case_name') or '').strip(),
+        'preconditions': d.get('precondition') or d.get('preconditions') or d.get('pre_condition') or '',
+        'steps_txt': _steps_to_text(steps),
+        'expected': d.get('expected') or d.get('pass_criteria') or d.get('expected_result') or '',
+        'priority': _priority_of(d.get('priority')),
+        'test_type': _test_type_of(d.get('type') or d.get('test_type')),
+        'description': d.get('notes') or d.get('requirement_ref') or d.get('description') or '',
+    }
+
+
+def _merged_case_entries(proto):
+    """构建全局用例索引，顺序与前端「用例合并采纳」列表完全一致。
+
+    顺序 = 画布按 page_no 升序 → 画布内 page_testcases_json 原始顺序（与 _merge_page_testcases 同源）。
+    每条包含：ordinal(1-based 全局序号) / page_id / page_index / module / raw / tc_obj。
+    若所有画布都没有画布级用例（历史数据），回退到任务级 testcases_json。
+    """
+    entries = []
+    pages = proto.pages.exclude(page_testcases_json='').exclude(page_testcases_json__isnull=True)
+    for p in pages:
+        for pi, c in enumerate(_safe_json_list(p.page_testcases_json)):
+            tc_obj = c.get('testcase', c) if isinstance(c, dict) else c
+            entries.append({
+                'ordinal': len(entries) + 1,
+                'page_id': p.id,
+                'page_index': pi,
+                'module': _module_of(c),
+                'raw': c,
+                'tc_obj': tc_obj if isinstance(tc_obj, dict) else {'title': str(tc_obj or '')},
+            })
+    if not entries:
+        for gi, c in enumerate(_safe_json_list(proto.testcases_json)):
+            tc_obj = c.get('testcase', c) if isinstance(c, dict) else c
+            entries.append({
+                'ordinal': gi + 1,
+                'page_id': None,
+                'page_index': gi,
+                'module': _module_of(c),
+                'raw': c,
+                'tc_obj': tc_obj if isinstance(tc_obj, dict) else {'title': str(tc_obj or '')},
+            })
+    return entries
+
+
+def _find_case_entry(entries, ref):
+    """按 {page_id, page_index} / {global_index} / {case_id} / {index} 在全局索引中定位一条用例。"""
+    if not isinstance(ref, dict):
+        return None
+    page_id, page_index = ref.get('page_id'), ref.get('page_index')
+    if page_id is not None and page_index is not None:
+        try:
+            pid, pidx = int(page_id), int(page_index)
+        except (TypeError, ValueError):
+            return None
+        for e in entries:
+            if e['page_id'] == pid and e['page_index'] == pidx:
+                return e
+        return None
+    gi = ref.get('global_index', ref.get('index'))
+    if gi is not None:
+        try:
+            gi = int(gi)
+        except (TypeError, ValueError):
+            return None
+        for e in entries:
+            if e['ordinal'] - 1 == gi:
+                return e
+        return None
+    cid = str(ref.get('case_id') or '').strip()
+    if cid:
+        for e in entries:
+            if str(e['tc_obj'].get('id') or '').strip() == cid:
+                return e
+    return None
+
+
+def _adopt_one_case(proto, user, tc_obj, mname, sort_order, desc_suffix='逐条采纳', extra_tags=None):
+    """把一条（可能已被前端编辑过的）用例写入用例库。幂等：项目 + 标题 + 模块 去重。"""
+    if not proto.project_id:
+        return {'ok': False, 'detail': '请先在阶段0关联项目，再采纳到用例库'}
+    f = _tc_fields(tc_obj)
+    title = f['title'] or f'用例#{sort_order}'
+    mname = _canonical_module_name(mname or '未分组', proto=proto, project=proto.project) or '未分组'
+    fm, created = FeatureModule.objects.get_or_create(
+        project=proto.project, name=mname,
+        defaults={
+            'description': f'墨刀流程「{proto.title}」{desc_suffix}自动创建',
+            'created_by': user,
+            'parent': proto.feature_module,
+        },
+    )
+    if proto.version_id:
+        fm.versions.add(proto.version)
+
+    existing = TestCase.objects.filter(project=proto.project, title=title, feature_modules=fm).first()
+    if existing:
+        if extra_tags:
+            merged = list(existing.tags or [])
+            changed = False
+            for t in extra_tags:
+                if t not in merged:
+                    merged.append(t)
+                    changed = True
+            if changed:
+                existing.tags = merged
+                existing.save(update_fields=['tags'])
+        return {
+            'ok': True, 'testcases': 0, 'skipped': 1, 'modules': int(created),
+            'testcase_id': existing.id, 'created': False, 'title': title,
+            'detail': f'用例「{title}」已存在（跳过）',
+        }
+
+    tc = TestCase(
+        project=proto.project, title=title,
+        preconditions=f['preconditions'], steps=f['steps_txt'], expected_result=f['expected'],
+        priority=f['priority'], test_type=f['test_type'], description=f['description'],
+        status='draft', author=user, source='ai', sort_order=sort_order or 1,
+        tags=list(extra_tags or []),
+    )
+    tc.save()
+    if proto.version_id:
+        tc.versions.add(proto.version)
+    try:
+        tc.feature_modules.add(fm)
+    except Exception:
+        pass
+    return {
+        'ok': True, 'testcases': 1, 'skipped': 0, 'modules': int(created),
+        'testcase_id': tc.id, 'created': True, 'title': title,
+        'detail': f'已采纳「{title}」',
+    }
 
 
 def _sync_stage1(proto, user):
@@ -258,6 +461,11 @@ def _sync_stage3(proto, user):
         mname = _canonical_module_name(m.get('name'), proto=proto, project=proto.project)
         if not mname:
             continue
+        # 该模块是否有测试点或用例（避免创建既无测试点也无用例的空模块）
+        has_tp = bool(tps_by_mod.get(mname))
+        has_cases = bool(cases_by_mod.get(mname))
+        if not has_tp and not has_cases:
+            continue
         child, _ = FeatureModule.objects.get_or_create(
             project=proto.project, name=mname, parent=parent,
             defaults={'description': m.get('description') or '墨刀流程子模块', 'created_by': user},
@@ -265,6 +473,7 @@ def _sync_stage3(proto, user):
         if proto.version_id:
             child.versions.add(proto.version)
         counts['modules'] += 1
+
 
         # 测试点
         for t in tps_by_mod.get(mname, []):
@@ -306,6 +515,7 @@ def _sync_stage3(proto, user):
                 description=description,
                 status='draft',
                 author=user,
+                source='ai',
             )
             tc.save()
             if proto.version_id:
@@ -336,6 +546,10 @@ def _run_in_thread(proto, target):
 def modao_list(request):
     """历史记录列表（按创建时间倒序）。
 
+    查询参数：
+    - project: 按项目ID过滤
+    - version: 按版本ID过滤
+
     权限规则：
     - 超级管理员：可查看所有人的任务；
     - 普通用户：可查看自己创建的 + 自己是项目成员（owner/admin/developer/tester）的项目下的任务。
@@ -343,6 +557,14 @@ def modao_list(request):
     from apps.core.mixins import _is_superuser
     is_admin = _is_superuser(request.user)
     qs = _accessible_proto_qs(request.user).order_by('-created_at')
+
+    project_id = request.query_params.get('project')
+    version_id = request.query_params.get('version')
+    if project_id:
+        qs = qs.filter(project_id=project_id)
+    if version_id:
+        qs = qs.filter(version_id=version_id)
+
     # 批量回收列表中可能卡死的 designing 状态
     for p in qs.filter(status__in=('extracting', 'structuring', 'clarifying', 'designing')):
         _recover_stale_designing(p)
@@ -366,8 +588,9 @@ def modao_create(request):
         raw_urls = [x for x in ws.replace(',', '\n').split('\n') if x.strip()]
     url_str = '\n'.join(raw_urls) if raw_urls else (data.get('url') or '')
 
-    # 安全网：URL 明显是 webshare/Axure 原型时，强制覆盖 source_type
-    if source_type != 'webshare' and '/webshare/' in url_str:
+    # 安全网：URL 明显是 webshare/Axure 原型时，强制覆盖 source_type（大小写不敏感，
+    # 实际站点路径常见大写如 /WebShare/）
+    if source_type != 'webshare' and '/webshare/' in url_str.lower():
         import logging
         logging.getLogger('modao').info(f'[modao_create] URL contains /webshare/, overriding source_type {source_type} -> webshare')
         source_type = 'webshare'
@@ -485,12 +708,15 @@ def modao_extract(request, pk):
     if fusion_config_id:
         from apps.requirement_analysis.models import AIModelConfig
         fusion_config = AIModelConfig.objects.filter(id=fusion_config_id).first()
+    # 单画布重读：只重读指定 page_name 的画布（画布级回退到读取时使用）
+    target_page_names = request.data.get('target_page_names') or []
 
     def job():
         wf = _build_wf(proto, a_id, w_id, e_id)
         wf.run_extract(urls=raw_urls, cookies=cookies, headless=headless,
                        source_type=proto.source_type,
-                       dual_fusion=dual_fusion, fusion_config=fusion_config)
+                       dual_fusion=dual_fusion, fusion_config=fusion_config,
+                       target_page_names=target_page_names)
 
     threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
     return Response({'detail': '墨刀读取已启动，请轮询状态'})
@@ -502,13 +728,64 @@ def modao_struct(request, pk):
     a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
                         request.data.get('writer_config_id'),
                         request.data.get('embedder_config_id'))
+    # 画布级独立运行：传入 page_ids 时只对这些画布做结构化（互不干扰）
+    page_ids = request.data.get('page_ids')
+    # 2026-08-31 增量：force=True 时忽略已生成摘要，对所有勾选画布强制全量重新结构化。
+    force = bool(request.data.get('force'))
 
     def job():
-        wf = _build_wf(proto, a_id, w_id, e_id)
-        wf.run_struct()
+        wf = _build_wf(proto, a_id, w_id, e_id, page_ids=page_ids)
+        wf.run_struct(force=force)
 
     threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
     return Response({'detail': '需求结构化已启动'})
+
+
+@api_view(['POST'])
+def modao_update_pages(request, pk):
+    """批量更新画布（模块）的人工会校验结果：勾选/取消、改名、标注识别准确率、删除。
+
+    请求体：{'pages': [{'id': <int>, 'selected': <bool>, 'page_name': <str>,
+                        'recognition_note': <str>, 'delete': <bool>}, ...]}
+    仅传入需要变更的字段即可；未传字段保持不变。
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    pages = request.data.get('pages') or []
+    if not isinstance(pages, list):
+        return Response({'detail': 'pages 必须为数组'}, status=http_status.HTTP_400_BAD_REQUEST)
+    updated, deleted = 0, 0
+    for item in pages:
+        pid = item.get('id')
+        if not pid:
+            continue
+        try:
+            page = proto.pages.get(id=pid)
+        except ModaoPage.DoesNotExist:
+            continue
+        if item.get('delete'):
+            page.delete()
+            deleted += 1
+            continue
+        changed = []
+        if 'selected' in item and isinstance(item['selected'], bool):
+            page.selected = item['selected']
+            changed.append('selected')
+        if 'page_name' in item and item['page_name']:
+            page.page_name = item['page_name']
+            changed.append('page_name')
+        if 'parent_name' in item:
+            page.parent_name = (item['parent_name'] or '').strip()
+            changed.append('parent_name')
+        if 'folder' in item:
+            page.folder = (item['folder'] or '').strip()
+            changed.append('folder')
+        if 'recognition_note' in item:
+            page.recognition_note = item['recognition_note']
+            changed.append('recognition_note')
+        if changed:
+            page.save(update_fields=changed)
+            updated += 1
+    return Response({'detail': f'已更新 {updated} 个画布，删除 {deleted} 个', 'updated': updated, 'deleted': deleted})
 
 
 @api_view(['POST'])
@@ -517,9 +794,11 @@ def modao_clarify(request, pk):
     a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
                         request.data.get('writer_config_id'),
                         request.data.get('embedder_config_id'))
+    # 画布级独立运行：传入 page_ids 时只对这些画布做澄清
+    page_ids = request.data.get('page_ids')
 
     def job():
-        wf = _build_wf(proto, a_id, w_id, e_id)
+        wf = _build_wf(proto, a_id, w_id, e_id, page_ids=page_ids)
         wf.run_clarify()
 
     threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
@@ -530,13 +809,22 @@ def modao_clarify(request, pk):
 def modao_design(request, pk):
     """阶段3 第一段：模块拆分→测试点→风险→PCI→三路合并（到最终测试点为止，等待人工确认）。"""
     proto = get_object_or_404(ModaoPrototype, pk=pk)
+    # 画布级独立运行：传入 page_ids 时只对这些画布做测试点合并
+    page_ids = request.data.get('page_ids')
+    # 运行中禁止重复触发，避免并发线程重复生成（LLM 双倍消耗 + 产物互相覆盖）。
+    # 画布级独立运行（page_ids 给定）时放宽：允许在已有产物基础上补跑指定画布。
+    if proto.status in ('extracting', 'structuring', 'clarifying', 'designing') and not page_ids:
+        return Response(
+            {'detail': f'任务正在运行中（{proto.status}），请勿重复触发'},
+            status=400,
+        )
     a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
                         request.data.get('writer_config_id'),
                         request.data.get('embedder_config_id'))
 
     def job():
-        wf = _build_wf(proto, a_id, w_id, e_id)
-        wf.run_design_phase1()
+        wf = _build_wf(proto, a_id, w_id, e_id, page_ids=page_ids)
+        wf.run_design_phase1_for_selection()
 
     threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
     return Response({'detail': '测试点合并已启动（模块拆分→测试点→风险→PCI→三路合并）'})
@@ -546,9 +834,29 @@ def modao_design(request, pk):
 def modao_generate_cases(request, pk):
     """阶段3 第二段：基于（已确认/编辑的）最终测试点生成测试用例→冒烟→质量→Excel。"""
     proto = get_object_or_404(ModaoPrototype, pk=pk)
-    if not (proto.final_testpoints_json or '').strip() or proto.final_testpoints_json.strip() in ('[]', '{}'):
+    # 画布级独立运行：传入 page_ids 时只对这些画布生成用例
+    page_ids = request.data.get('page_ids')
+    # A2-c：画布级——只要目标画布中存在已生成测试点的，即允许生成用例
+    pages_qs = proto.pages.all()
+    if page_ids:
+        pages_qs = pages_qs.filter(id__in=page_ids)
+    has_tp = pages_qs.exclude(page_testpoints_json='').exclude(page_testpoints_json__isnull=True).exists()
+    if not has_tp:
         return Response({'detail': '请先运行测试点合并（第一段），生成最终测试点后再生成用例'},
                         status=http_status.HTTP_400_BAD_REQUEST)
+    # 画布级独立运行（page_ids 给定）时，放宽任务级闸门：仅校验该画布分支自身是否已有
+    # 测试点，不再要求全部画布都完成阶段2确认——实现「每个画布独立生成用例、互不干扰」。
+    if page_ids:
+        a_id, w_id, e_id = (request.data.get('analyzer_config_id'),
+                            request.data.get('writer_config_id'),
+                            request.data.get('embedder_config_id'))
+
+        def job():
+            wf = _build_wf(proto, a_id, w_id, e_id, page_ids=page_ids)
+            wf.run_design_phase2_for_selection()
+
+        threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
+        return Response({'detail': '测试用例生成已启动（指定画布：用例→冒烟→质量→Excel）'})
     gate = proto.case_generation_gate()
     if not gate['allowed']:
         return Response({
@@ -561,10 +869,35 @@ def modao_generate_cases(request, pk):
 
     def job():
         wf = _build_wf(proto, a_id, w_id, e_id)
-        wf.run_design_phase2()
+        wf.run_design_phase2_for_selection()
 
     threading.Thread(target=_run_in_thread(proto, job), daemon=True).start()
     return Response({'detail': '测试用例生成已启动（用例→冒烟→质量→Excel）'})
+
+
+@api_view(['POST'])
+def modao_approve_pages(request, pk):
+    """A2-c：标记画布用例为已采纳，并触发跨画布汇总去重。
+
+    请求体（两种之一）：
+    - {'page_ids': [1, 2, 3]}        指定画布采纳
+    - {'approve_all_selected': true} 当前选中且已生成用例的画布全部采纳
+    汇总的 merged_testcases_json / merged_smoke_json 由后端自动重算。
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    page_ids = request.data.get('page_ids') or []
+    approve_all = bool(request.data.get('approve_all_selected'))
+
+    def job():
+        wf = _build_wf(proto, None, None, None)
+        n = wf.set_pages_approved(page_ids=page_ids, approve_all_selected=approve_all)
+        return n
+
+    try:
+        n = job()
+    except Exception as e:
+        return Response({'detail': f'采纳失败：{e}'}, status=http_status.HTTP_500_INTERNAL_ERROR)
+    return Response({'detail': f'已采纳 {n} 个画布用例，汇总已更新', 'approved_pages': n})
 
 
 @api_view(['POST'])
@@ -669,6 +1002,269 @@ def modao_edit(request, pk):
     return Response({'detail': f'已更新 {field}'})
 
 
+# ---------- 画布级产物人工编辑（A2-c：每个画布独立分支，产物按画布存）----------
+
+# 可人工编辑的画布级产物字段 → 展示名
+PAGE_EDITABLE_FIELDS = {
+    'page_summary': '需求摘要（画布级）',
+    'page_clarification': '需求澄清（画布级）',
+    'page_testpoints_json': '测试点（画布级）',
+    'page_testcases_json': '测试用例（画布级）',
+    'page_smoke_json': '冒烟用例（画布级）',
+}
+
+# 编辑某字段后，该画布哪些下游产物已失真（用于标记「需重跑」）
+_PAGE_STALE_BY_FIELD = {
+    'page_summary': (3, 4),
+    'page_clarification': (3, 4),
+    'page_testpoints_json': (4,),
+}
+
+_STAGE_LABEL = {1: '结构化', 2: '澄清', 3: '测试点/用例', 4: '冒烟'}
+
+
+def _merge_page_json_field(proto, field):
+    """把各画布的 JSON 数组产物按画布顺序合并为一个列表（纯本地，不做向量去重）。"""
+    merged = []
+    qs = proto.pages.exclude(**{field: ''}).exclude(**{f'{field}__isnull': True}).order_by('page_no', 'id')
+    for p in qs:
+        raw = (getattr(p, field, '') or '').strip()
+        if not raw:
+            continue
+        try:
+            val = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(val, list):
+            merged.extend(val)
+        elif isinstance(val, dict) and isinstance(val.get('smoke_testcases'), list):
+            merged.extend(val['smoke_testcases'])
+    return merged
+
+
+@api_view(['PATCH'])
+def modao_page_edit(request, pk, page_id):
+    """保存人工对「单个画布」某阶段产物的修改，并同步任务级合并视图。
+
+    PATCH body: {"field": "page_clarification", "value": "<新文本>"}
+
+    可编辑字段见 PAGE_EDITABLE_FIELDS。保存后：
+      1) 重算受影响的全局合并视图（requirement_summary / final_testpoints_json /
+         testcases_json / smoke_json）；澄清清单在与全局同源时同步 clarification_log；
+      2) 若该画布已产出下游产物，把这些阶段标记为「需重跑」（rerun_stages + needs_rerun），
+         避免用户误用过期的用例/冒烟。
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    page = get_object_or_404(ModaoPage, pk=page_id, prototype=proto)
+    field = request.data.get('field') or ''
+    if field not in PAGE_EDITABLE_FIELDS:
+        return Response({'detail': f'字段 {field} 不可编辑'}, status=http_status.HTTP_400_BAD_REQUEST)
+    value = request.data.get('value', '')
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False)
+    if field.endswith('_json') and value.strip():
+        try:
+            json.loads(value)
+        except Exception as e:
+            return Response({'detail': f'{field} 不是合法 JSON，已拒绝保存：{e}'},
+                            status=http_status.HTTP_400_BAD_REQUEST)
+
+    old = getattr(page, field) or ''
+    if old == value:
+        return Response({'detail': '内容未变化', 'changed': False})
+
+    setattr(page, field, value)
+    update_fields = [field]
+    # 下游产物是否失真：仅在该画布确实已产出下游内容时才标记，避免无谓的「需重跑」
+    downstream = (page.page_testpoints_json or '').strip() or (page.page_testcases_json or '').strip()
+    if field in _PAGE_STALE_BY_FIELD:
+        if field == 'page_testpoints_json':
+            downstream = (page.page_testcases_json or '').strip() or (page.page_smoke_json or '').strip()
+        stale_stages = list(_PAGE_STALE_BY_FIELD[field]) if downstream else []
+    else:
+        stale_stages = []
+    if stale_stages:
+        page.set_rerun_stages(list(page.get_rerun_stages()) + stale_stages)
+        page.stage_status = 'needs_rerun'
+        update_fields += ['rerun_stages', 'stage_status']
+    page.save(update_fields=update_fields)
+
+    # ---- 同步任务级合并视图（失败不影响画布级保存）----
+    sync = ''
+    proto_fields = []
+    try:
+        wf = ModaoWorkflow(proto, None, None, None)
+        if field == 'page_summary':
+            proto.requirement_summary = wf._merge_page_summaries()
+            proto_fields.append('requirement_summary')
+            sync = '全局需求摘要已重算'
+        elif field == 'page_testpoints_json':
+            proto.final_testpoints_json = json.dumps(_merge_page_json_field(proto, field), ensure_ascii=False)
+            proto_fields.append('final_testpoints_json')
+            sync = '全局最终测试点已重算'
+        elif field == 'page_testcases_json':
+            cases, smoke = wf._merge_page_testcases()
+            proto.testcases_json = json.dumps(cases, ensure_ascii=False)
+            proto.smoke_json = json.dumps(smoke, ensure_ascii=False) if smoke else ''
+            proto_fields += ['testcases_json', 'smoke_json']
+            sync = '全局用例/冒烟视图已重算'
+        elif field == 'page_smoke_json':
+            _, smoke = wf._merge_page_testcases()
+            proto.smoke_json = json.dumps(smoke, ensure_ascii=False) if smoke else ''
+            proto_fields.append('smoke_json')
+            sync = '全局冒烟视图已重算'
+        elif field == 'page_clarification':
+            # 阶段2 的联合澄清清单会写进每个画布：若全局与该画布原本一致，说明尚未在任务级
+            # 单独改过，此时同步；否则只改本画布，避免覆盖任务级的人工修改。
+            if (proto.clarification_log or '') == old:
+                proto.clarification_log = value
+                proto_fields.append('clarification_log')
+                sync = '全局澄清清单已同步'
+            else:
+                sync = '仅更新本画布（任务级澄清清单已被单独修改，未覆盖）'
+        if proto_fields:
+            proto.save(update_fields=proto_fields)
+    except Exception as e:
+        logger.warning(f'画布产物编辑后同步全局视图失败（不影响画布级保存）: {e}')
+        sync = ''
+
+    detail = f'已保存「{PAGE_EDITABLE_FIELDS[field]}」'
+    if sync:
+        detail += f'，{sync}'
+    if stale_stages:
+        names = '/'.join(_STAGE_LABEL.get(s, str(s)) for s in stale_stages)
+        detail += f'；该画布下游产物（{names}）基于旧内容，已标记为需重跑'
+    try:
+        gate = proto.case_generation_gate()
+    except Exception:
+        gate = None
+    return Response({
+        'detail': detail,
+        'changed': True,
+        'field': field,
+        'stale_stages': stale_stages,
+        'gate': gate,
+    })
+
+
+
+
+@api_view(['GET'])
+def modao_folders(request, pk):
+    """获取原型的画布文件夹分组统计（用于按文件夹批量勾选）
+
+    返回 {'folders': [{'path': str, 'count': int, 'selected_count': int}, ...]}
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    pages = proto.pages.all()
+
+    # 按 folder 分组统计
+    folder_stats = {}
+    for page in pages:
+        folder = (page.folder or '').strip()
+        if folder not in folder_stats:
+            folder_stats[folder] = {'path': folder, 'count': 0, 'selected_count': 0}
+        folder_stats[folder]['count'] += 1
+        if page.selected:
+            folder_stats[folder]['selected_count'] += 1
+
+    # 未分组（空 folder）排在最后
+    folders = sorted(folder_stats.values(), key=lambda x: (not x['path'], x['path']))
+    
+    return Response({'folders': folders})
+
+
+@api_view(['POST'])
+def modao_select_by_folder(request, pk):
+    """按文件夹批量勾选/取消勾选画布
+
+    入参 {'folder': str, 'action': 'select_all' | 'deselect_all'}
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    folder = request.data.get('folder', '')
+    action = request.data.get('action', 'select_all')
+
+    if action not in ('select_all', 'deselect_all'):
+        return Response({'detail': 'action 只能是 select_all 或 deselect_all'},
+                       status=http_status.HTTP_400_BAD_REQUEST)
+
+    pages = proto.pages.filter(folder=folder)
+    selected = (action == 'select_all')
+    pages.update(selected=selected)
+
+    action_text = '勾选' if selected else '取消勾选'
+    return Response({
+        'detail': f'已{action_text}文件夹「{folder or "未分组"}」下的 {pages.count()} 个画布',
+        'count': pages.count()
+    })
+
+@api_view(['POST'])
+def modao_page_reset(request, pk):
+    """A2-b 画布级回退：把某画布回退到指定阶段之前，并标记需重跑。
+
+    回退语义：画布级进度独立回退（current_stage 降级 + stage_status=needs_rerun），
+    同时把任务级全局聚合产物中该阶段之后的内容清空（结构化/澄清/测试点/用例都是跨画布聚合，
+    旧画布内容已失效需重算），任务级 current_stage 同步回退。
+
+    请求体：{'page_id': <int>, 'stage': <int 1-4 回退到该阶段之前>}
+    stage=1 → 重新读取该画布（清空 text，强制重提取）
+    stage=2 → 重做结构化（保留提取，清空结构化及之后）
+    stage=3 → 重做澄清（清空澄清及之后）
+    stage=4 → 重做测试点/用例（清空测试点/用例及之后）
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    if not _user_can_access_proto(request.user, proto):
+        return Response({'detail': '无权操作该任务'}, status=http_status.HTTP_403_FORBIDDEN)
+    page_id = request.data.get('page_id')
+    stage = int(request.data.get('stage', 1))
+    if stage not in (1, 2, 3, 4):
+        return Response({'detail': 'stage 必须为 1-4'}, status=http_status.HTTP_400_BAD_REQUEST)
+    try:
+        page = proto.pages.get(id=page_id)
+    except ModaoPage.DoesNotExist:
+        return Response({'detail': '画布不存在'}, status=http_status.HTTP_404_NOT_FOUND)
+    if proto.status in ('extracting', 'structuring', 'clarifying', 'designing'):
+        return Response({'detail': '任务正在运行，请等待结束后再回退'}, status=http_status.HTTP_409_CONFLICT)
+
+    # 1) 画布级进度回退
+    page.current_stage = stage - 1
+    page.stage_status = 'needs_rerun'
+    page.set_rerun_stages([stage, stage + 1, stage + 2, stage + 3])
+    page.rerun_stages = page.rerun_stages  # 已 set
+    if stage <= 1:
+        page.text = ''
+        page.annotations = '[]'
+    page.save(update_fields=['current_stage', 'stage_status', 'rerun_stages', 'text', 'annotations'])
+
+    # 2) 任务级全局产物按回退阶段清空（stage 之前的产物保留）
+    if stage <= 1:
+        fields = ['requirement_summary', 'clarification_log', 'module_split', 'risks_json',
+                  'pci_json', 'final_testpoints_json', 'dedup_audit_json', 'testcases_json',
+                  'smoke_json', 'quality_report_json', 'excel_path', 'stage_confirmations']
+    elif stage <= 2:
+        fields = ['clarification_log', 'module_split', 'risks_json', 'pci_json',
+                  'final_testpoints_json', 'dedup_audit_json', 'testcases_json',
+                  'smoke_json', 'quality_report_json', 'excel_path', 'stage_confirmations']
+    elif stage <= 3:
+        fields = ['module_split', 'risks_json', 'pci_json', 'final_testpoints_json',
+                  'dedup_audit_json', 'testcases_json', 'smoke_json',
+                  'quality_report_json', 'excel_path', 'stage_confirmations']
+    else:
+        fields = ['testcases_json', 'smoke_json', 'quality_report_json', 'excel_path', 'stage_confirmations']
+    for f in fields:
+        setattr(proto, f, '' if f != 'dedup_audit_json' and f != 'stage_confirmations' else ('[]' if f == 'dedup_audit_json' else '{}'))
+    proto.current_stage = stage - 1
+    proto.status = 'extracted' if stage > 1 else 'pending'
+    proto.stage4_decision = ''
+    proto.error_message = ''
+    proto.save(update_fields=['current_stage', 'status', 'stage4_decision', 'error_message'] + fields)
+    return Response({
+        'detail': f'画布「{page.page_name}」已回退到阶段{stage-1}，标记需重跑',
+        'page': ModaoPageSerializer(page).data,
+        'proto': ModaoPrototypeSerializer(proto).data,
+    })
+
+
 @api_view(['POST'])
 def modao_ask(request, pk):
     """针对某阶段产物答疑：基于当前内容调用 LLM 回答，并追加到 qa_log。"""
@@ -739,29 +1335,19 @@ def _adopt_to_library(proto, user, include_smoke=False):
         return (c.get('module') or c.get('feature_module') or '未分组')
 
     def _make_tc(tc_obj, fm, sort_order=0):
-        title = (tc_obj.get('title') if isinstance(tc_obj, dict) else None) or '未命名用例'
+        f = _tc_fields(tc_obj)
+        title = f['title'] or '未命名用例'
         # 幂等去重：同一项目下相同标题且已关联到该模块的用例不重复创建，返回已有对象供打标签
         existing = TestCase.objects.filter(project=proto.project, title=title, feature_modules=fm).first()
         if existing:
             existing._adopt_existing = True  # 标记：已存在，供调用方区分新建/跳过
             return existing
-        steps = (tc_obj.get('steps', []) if isinstance(tc_obj, dict) else []) or []
-        steps_txt = '\n'.join(f'{i+1}. {s}' for i, s in enumerate(steps)) if isinstance(steps, list) else str(steps or '')
-        preconditions = expected = description = ''
-        priority = 'P2'
-        test_type = 'functional'
-        if isinstance(tc_obj, dict):
-            preconditions = tc_obj.get('precondition', '') or tc_obj.get('preconditions', '') or ''
-            expected = tc_obj.get('expected', '') or tc_obj.get('pass_criteria', '') or ''
-            priority = tc_obj.get('priority', 'P2')
-            test_type = tc_obj.get('type', 'functional') or tc_obj.get('test_type', 'functional')
-            description = tc_obj.get('notes', '') or tc_obj.get('requirement_ref', '') or ''
         tc = TestCase(
-            project=proto.project, title=title, preconditions=preconditions,
-            steps=steps_txt, expected_result=expected,
-            priority=_PRIO_MAP.get(priority, 'medium'),
-            test_type=_TYPE_MAP.get((test_type or '').lower(), 'functional'),
-            description=description, status='draft', author=user,
+            project=proto.project, title=title, preconditions=f['preconditions'],
+            steps=f['steps_txt'], expected_result=f['expected'],
+            priority=f['priority'], test_type=f['test_type'],
+            description=f['description'], status='draft', author=user,
+            source='ai',
             sort_order=sort_order,
         )
         tc.save()
@@ -840,9 +1426,91 @@ def _adopt_to_library(proto, user, include_smoke=False):
 
 @api_view(['POST'])
 def modao_adopt(request, pk):
-    """一键采纳：把阶段3生成的用例按项目/版本/功能模块自动建模块并入库（幂等）。"""
+    """批量采纳：把阶段3生成的用例按项目/版本/功能模块自动建模块并入库（幂等）。
+
+    POST body：
+      - { "cases": [ {...编辑后的完整用例...} ] }  按给定内容精确采纳（每条可用 _ref 定位原始用例）
+      - { "case_refs": [ {page_id, page_index} | {global_index} | {case_id} ] }  只采纳指定用例
+      - { "case_ids": ["TC_登录_1", ...] }  兼容旧前端：按用例 id 定位后采纳
+      - { "adopt_all": true, "include_smoke": true }  全量采纳（含冒烟）
+      - 空 body → 兼容旧行为：全量采纳
+    """
     proto = get_object_or_404(ModaoPrototype, pk=pk)
-    include_smoke = bool(request.data.get('include_smoke', False))
+    payload = request.data if isinstance(request.data, dict) else {}
+    include_smoke = bool(payload.get('include_smoke', False))
+    entries = _merged_case_entries(proto)
+
+    def _finish(counts, detail, project=''):
+        return Response({
+            'detail': detail,
+            'modules': counts.get('modules', 0),
+            'testcases': counts.get('testcases', 0),
+            'skipped': counts.get('skipped', 0),
+            'smoke': counts.get('smoke', 0),
+            'failed': counts.get('failed', 0),
+            'project': project,
+        })
+
+    # ① 只采纳指定用例：编辑后的（cases）与按引用定位的（case_refs / 旧版 case_ids）合并处理
+    edited_cases = [x for x in (payload.get('cases') or []) if isinstance(x, dict)]
+    refs = payload.get('case_refs')
+    if not isinstance(refs, list) or not refs:
+        legacy_ids = payload.get('case_ids')
+        if isinstance(legacy_ids, list) and legacy_ids:
+            refs = [{'case_id': str(x)} for x in legacy_ids]
+    refs = [r for r in (refs or []) if isinstance(r, dict)]
+
+    def _ref_key(ref):
+        if ref.get('page_id') is not None and ref.get('page_index') is not None:
+            return f"{ref.get('page_id')}#{ref.get('page_index')}"
+        if ref.get('global_index') is not None:
+            return f"g{ref.get('global_index')}"
+        return f"id{ref.get('case_id')}"
+
+    if edited_cases or refs:
+        counts = {'modules': 0, 'testcases': 0, 'skipped': 0, 'smoke': 0, 'failed': 0}
+        handled_keys = set()
+        for i, item in enumerate(edited_cases):
+            data = dict(item)
+            ref = data.pop('_ref', None)
+            ref = ref if isinstance(ref, dict) else {}
+            handled_keys.add(_ref_key(ref))
+            is_smoke = bool(data.pop('is_smoke', False))
+            entry = _find_case_entry(entries, ref)
+            sort_order = entry['ordinal'] if entry else len(entries) + i + 1
+            mname = data.get('module') or (entry['module'] if entry else '未分组')
+            r = _adopt_one_case(proto, request.user, data, mname, sort_order,
+                                desc_suffix='编辑后采纳',
+                                extra_tags=['冒烟'] if is_smoke else None)
+            if not r.get('ok'):
+                counts['failed'] += 1
+                continue
+            counts['modules'] += r['modules']
+            counts['testcases'] += r['testcases']
+            counts['skipped'] += r['skipped']
+            if is_smoke:
+                counts['smoke'] += 1
+        for ref in refs:
+            if _ref_key(ref) in handled_keys:
+                continue  # 该用例已按编辑后内容采纳，避免重复
+            entry = _find_case_entry(entries, ref)
+            if entry is None:
+                counts['failed'] += 1
+                continue
+            r = _adopt_one_case(proto, request.user, entry['tc_obj'], entry['module'],
+                                entry['ordinal'], desc_suffix='逐条采纳')
+            if not r.get('ok'):
+                counts['failed'] += 1
+                continue
+            counts['modules'] += r['modules']
+            counts['testcases'] += r['testcases']
+            counts['skipped'] += r['skipped']
+        if not counts['testcases'] and not counts['skipped']:
+            return Response({'detail': '未能定位到任何指定用例（请刷新页面后重试）'},
+                            status=http_status.HTTP_400_BAD_REQUEST)
+        return _finish(counts, '已采纳选中用例', proto.project.name if proto.project else '')
+
+    # ② 全量采纳（adopt_all / 空 body 兼容旧行为）
     result = _adopt_to_library(proto, request.user, include_smoke=include_smoke)
     if not result.get('ok'):
         return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
@@ -852,110 +1520,86 @@ def modao_adopt(request, pk):
         'testcases': result['counts']['testcases'],
         'skipped': result['counts']['skipped'],
         'smoke': result['counts']['smoke'],
+        'failed': 0,
         'project': result.get('project', ''),
     })
 
 
 def _adopt_single_case(proto, user, case_index):
-    """逐条采纳：按索引从 testcases_json 中取出一条用例，自动建功能模块并入库。幂等。
-    
-    Args:
-        proto: ModaoPrototype 实例
-        user: 当前用户
-        case_index: testcases_json 中的用例索引（0-based）
-    
-    Returns:
-        dict with ok/counts/detail
+    """逐条采纳（按全局索引）：从合并用例列表中取出一条入库。幂等。
+
+    保留旧签名以兼容早期调用方；新逻辑走 _merged_case_entries，
+    顺序与前端「用例合并采纳」列表一致，不再是任务级 testcases_json 的裸索引对不上画布。
     """
-    if not proto.project_id:
-        return {'ok': False, 'detail': '请先在阶段0关联项目'}
-    cases = _safe_json_list(proto.testcases_json)
-    if not cases:
+    entries = _merged_case_entries(proto)
+    if not entries:
         return {'ok': False, 'detail': '没有可采纳的测试用例'}
-    if case_index < 0 or case_index >= len(cases):
-        return {'ok': False, 'detail': f'用例索引 {case_index} 超出范围（共 {len(cases)} 条）'}
-
-    c = cases[case_index]
-    parent = proto.feature_module
-
-    # 解析 module
-    def _module_of(c):
-        if not isinstance(c, dict):
-            return '未分组'
-        if c.get('testcase'):
-            t = c['testcase']
-            return (c.get('module') or t.get('module') or t.get('feature_module') or '未分组')
-        return (c.get('module') or c.get('feature_module') or '未分组')
-
-    mname = _canonical_module_name(_module_of(c), proto=proto, project=proto.project)
-    fm, created = FeatureModule.objects.get_or_create(
-        project=proto.project, name=mname,
-        defaults={
-            'description': f'墨刀流程「{proto.title}」逐条采纳自动创建',
-            'created_by': user,
-            'parent': parent,
-        },
-    )
-    if proto.version_id:
-        fm.versions.add(proto.version)
-
-    tc_obj = c.get('testcase', c) if isinstance(c, dict) else c
-    title = (tc_obj.get('title') if isinstance(tc_obj, dict) else None) or f'用例#{case_index + 1}'
-
-    # 幂等检查
-    if TestCase.objects.filter(project=proto.project, title=title, feature_modules=fm).exists():
-        return {'ok': True, 'counts': {'testcases': 0, 'skipped': 1, 'modules': int(created)}, 'detail': '该用例已存在（跳过）'}
-
-    steps = (tc_obj.get('steps', []) if isinstance(tc_obj, dict) else []) or []
-    steps_txt = '\n'.join(f'{i+1}. {s}' for i, s in enumerate(steps)) if isinstance(steps, list) else str(steps or '')
-    preconditions = expected = description = ''
-    priority = 'P2'
-    test_type = 'functional'
-    if isinstance(tc_obj, dict):
-        preconditions = tc_obj.get('precondition', '') or tc_obj.get('preconditions', '') or ''
-        expected = tc_obj.get('expected', '') or tc_obj.get('pass_criteria', '') or ''
-        priority = tc_obj.get('priority', 'P2')
-        test_type = tc_obj.get('type', 'functional') or tc_obj.get('test_type', 'functional')
-        description = tc_obj.get('notes', '') or tc_obj.get('requirement_ref', '') or ''
-
-    tc = TestCase(
-        project=proto.project, title=title, preconditions=preconditions,
-        steps=steps_txt, expected_result=expected,
-        priority=_PRIO_MAP.get(priority, 'medium'),
-        test_type=_TYPE_MAP.get((test_type or '').lower(), 'functional'),
-        description=description, status='draft', author=user,
-        sort_order=case_index + 1,
-    )
-    tc.save()
-    if proto.version_id:
-        tc.versions.add(proto.version)
-    tc.feature_modules.add(fm)
-
-    return {
-        'ok': True,
-        'counts': {'testcases': 1, 'skipped': 0, 'modules': int(created)},
-        'detail': f'已采纳「{title}」',
-    }
+    if not isinstance(case_index, int) or case_index < 0 or case_index >= len(entries):
+        return {'ok': False, 'detail': f'用例索引 {case_index} 超出范围（共 {len(entries)} 条）'}
+    e = entries[case_index]
+    return _adopt_one_case(proto, user, e['tc_obj'], e['module'], e['ordinal'], desc_suffix='逐条采纳')
 
 
 @api_view(['POST'])
 def modao_adopt_single(request, pk):
-    """逐条采纳：把阶段3生成的某一条用例采纳到用例库（幂等）。
+    """逐条采纳：把阶段3生成的某一条用例采纳到用例库（幂等），支持「编辑后采纳」。
 
-    POST body: { "index": 0 }  （testcases_json 中的 0-based 索引）
+    POST body（三种定位方式，优先级从高到低）：
+      1. { "case": {...} }                      完整用例对象（前端编辑后的内容），按其内容入库
+      2. { "case_ref": {"page_id":1,"page_index":0} }
+         / { "global_index": 3 } / { "index": 3 }
+         / { "case_id": "TC_登录_1" }           精确定位原始用例后再入库
+      3. { "index": 0 }                         兼容旧调用（0-based 全局索引）
     """
     proto = get_object_or_404(ModaoPrototype, pk=pk)
-    try:
-        case_index = int(request.data.get('index', -1))
-    except (TypeError, ValueError):
-        return Response({'detail': '缺少有效参数 index（整数）'}, status=http_status.HTTP_400_BAD_REQUEST)
+    payload = request.data if isinstance(request.data, dict) else {}
+    entries = _merged_case_entries(proto)
 
-    result = _adopt_single_case(proto, request.user, case_index)
+    ref = payload.get('case_ref')
+    if not isinstance(ref, dict):
+        ref = {}
+        for k in ('page_id', 'page_index', 'global_index', 'case_id'):
+            if payload.get(k) is not None:
+                ref[k] = payload[k]
+        if 'index' in payload and 'global_index' not in ref:
+            ref['global_index'] = payload.get('index')
+
+    # 1) 前端编辑后的完整用例：直接按内容入库
+    edited = payload.get('case')
+    is_smoke = bool(payload.get('is_smoke', False))
+    if isinstance(edited, dict) and (edited.get('title') or edited.get('steps')):
+        entry = _find_case_entry(entries, ref)
+        sort_order = entry['ordinal'] if entry else len(entries) + 1
+        mname = edited.get('module') or (entry['module'] if entry else '未分组')
+        result = _adopt_one_case(proto, request.user, edited, mname, sort_order,
+                                 desc_suffix='编辑后采纳',
+                                 extra_tags=['冒烟'] if is_smoke else None)
+        if not result.get('ok'):
+            return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'detail': result['detail'],
+            'testcases': result['testcases'], 'skipped': result['skipped'],
+            'modules': result['modules'], 'testcase_id': result.get('testcase_id'),
+        })
+
+    # 2) 精确定位原始用例
+    if not entries:
+        return Response({'detail': '没有可采纳的测试用例'}, status=http_status.HTTP_400_BAD_REQUEST)
+    entry = _find_case_entry(entries, ref)
+    if entry is None:
+        return Response(
+            {'detail': '未能定位到指定用例（请确认 page_id / page_index 或 index 是否正确）'},
+            status=http_status.HTTP_400_BAD_REQUEST,
+        )
+    result = _adopt_one_case(proto, request.user, entry['tc_obj'], entry['module'],
+                             entry['ordinal'], desc_suffix='逐条采纳',
+                             extra_tags=['冒烟'] if is_smoke else None)
     if not result.get('ok'):
         return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
     return Response({
         'detail': result['detail'],
-        **result['counts'],
+        'testcases': result['testcases'], 'skipped': result['skipped'],
+        'modules': result['modules'], 'testcase_id': result.get('testcase_id'),
     })
 
 
@@ -1041,10 +1685,82 @@ def modao_log_raw(request):
     proto_status = ''
     if finished:
         try:
-            from apps.requirement_analysis.models import ModaoPrototype
+            from apps.requirement_analysis.models import ModaoPrototype, ModaoPage
             p = ModaoPrototype.objects.filter(pk=36).first()
             if p:
                 proto_status = p.status
         except Exception:
             pass
     return JsonResponse({'content': content, 'lines': lines, 'finished': finished, 'proto_status': proto_status})
+
+
+# ---------- 阶段1 结构化摘要 ⇄ XMind（方案 A：上传仅覆盖结构化摘要，不联动下游）----------
+
+@api_view(['GET'])
+def modao_export_xmind(request, pk):
+    """导出阶段1结构化摘要为可编辑 XMind 文件。"""
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    if not (proto.requirement_summary or '').strip():
+        return Response({'detail': '尚未生成结构化摘要，无法导出 XMind'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    summary = _parse_yaml(_extract_block(proto.requirement_summary, 'yaml')) or {}
+    if not isinstance(summary, dict):
+        summary = {}
+    data = modao_xmind.export_xmind_bytes(proto, summary)
+    safe_title = re.sub(r'[\\/:*?"<>|]', '_', (proto.title or 'requirement').strip()) or 'requirement'
+    filename = f'{safe_title}.xmind'
+    resp = HttpResponse(data, content_type='application/vnd.xmind.workbook')
+    resp['Content-Disposition'] = f'attachment; filename="{filename}"; filename*=UTF-8\'\'{filename}'
+    return resp
+
+
+@api_view(['POST'])
+def modao_import_xmind(request, pk):
+    """上传本地修改后的 XMind，解析后仅覆盖结构化摘要（requirement_summary）。
+
+    约定（方案 A）：不联动阶段2/3，避免把未经验证的局部修改扩散到下游。
+    上传前自动备份当前摘要到 requirement_summary 之外的临时字段（_xmind_backup），
+    便于需要时回退。层级校验为宽松策略：仅识别约定前缀节点，其余节点忽略。
+    """
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    upload = request.FILES.get('file') or request.data.get('file')
+    if not upload:
+        return Response({'detail': '缺少 XMind 文件（字段名 file）'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    try:
+        raw = upload.read()
+    except Exception as e:
+        return Response({'detail': f'读取上传文件失败：{e}'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    root_title, modules = modao_xmind.parse_xmind_bytes(raw)
+    if root_title is None:
+        return Response({'detail': '无法解析 XMind（仅支持 content.json 格式，请用本系统导出的 XMind 修改后回传）'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    if not modules:
+        return Response({'detail': 'XMind 中未识别到任何模块节点（二级节点应作为模块名）'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    # 宽松校验：模块名必须非空
+    modules = [m for m in modules if (m.get('name') or '').strip()]
+    if not modules:
+        return Response({'detail': 'XMind 模块名不能为空'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+
+    # 保留原摘要中的非 modules 顶层字段（如决策表、结构等），仅替换 modules 列表
+    prev = _parse_yaml(_extract_block(proto.requirement_summary, 'yaml')) or {}
+    if not isinstance(prev, dict):
+        prev = {}
+    prev['modules'] = modules
+    new_yaml = modao_xmind.modules_to_yaml(modules)
+    backup = (proto.requirement_summary or '')
+    proto.requirement_summary = new_yaml
+    try:
+        proto.save(update_fields=['requirement_summary'])
+    except Exception as e:
+        return Response({'detail': f'保存失败：{e}'},
+                        status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+    return Response({
+        'detail': f'已用 XMind 覆盖结构化摘要，共 {len(modules)} 个模块',
+        'module_count': len(modules),
+        'backup_length': len(backup),
+        'requirement_summary': new_yaml,
+    })

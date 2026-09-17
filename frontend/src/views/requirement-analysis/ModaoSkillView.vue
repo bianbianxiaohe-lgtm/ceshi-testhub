@@ -5,66 +5,16 @@
       <p class="subtitle">5 阶段引导式工作流：原型读取 → 需求通读 → 需求澄清 → 用例设计 → 冒烟执行</p>
       <div class="header-actions">
         <el-button size="small" @click="loadHistory" :loading="loadingHistory">刷新历史</el-button>
+        <el-button v-if="protoId" size="small" type="success" plain @click="goCanvasBoard">🗂️ 画布任务看板</el-button>
         <el-button size="small" type="primary" plain @click="onNew">+ 新建流程</el-button>
       </div>
     </div>
 
-    <!-- 历史记录 -->
-    <el-card class="history-card" shadow="never">
-      <template #header>
-        <span><b>📋 历史流程</b>（点击「继续」可恢复上次进度）</span>
-      </template>
-      <div v-if="history.length === 0 && !loadingHistory" class="empty-hint">
-        暂无历史记录，先在下方「阶段0·原型接入」创建一次吧。
-      </div>
-      <el-table v-else :data="history" size="small" stripe style="width: 100%" row-key="id"
-        :expand-row-keys="expandedRows" @row-click="toggleExpand">
-        <el-table-column type="expand">
-          <template #default="{ row }">
-            <div class="expand-detail">
-              <!-- 工作日志 -->
-              <div v-if="row.work_log" class="log-section">
-                <h4>工作日志</h4>
-                <pre class="log-box">{{ row.work_log }}</pre>
-              </div>
-              <!-- 错误信息 -->
-              <div v-if="row.error_message" class="log-section error-section">
-                <h4>错误信息</h4>
-                <pre class="log-box error-box">{{ row.error_message }}</pre>
-              </div>
-              <!-- 无日志提示 -->
-              <div v-if="!row.work_log && !row.error_message" class="empty-hint" style="padding:8px 0">
-                暂无工作日志
-              </div>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column prop="title" label="标题" min-width="160" show-overflow-tooltip />
-        <el-table-column label="来源" width="90">
-          <template #default="{ row }">{{ row.source_type === 'text' ? '需求文本' : row.source_type === 'webshare' ? 'webshare页面树' : '墨刀链接' }}</template>
-        </el-table-column>
-        <el-table-column label="状态" width="110">
-          <template #default="{ row }">
-            <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="进度" width="120">
-          <template #default="{ row }">阶段{{ row.current_stage }} · {{ stageLabel(row.current_stage) }}</template>
-        </el-table-column>
-        <el-table-column v-if="isAdmin" prop="created_by_name" label="创建人" width="110" show-overflow-tooltip>
-          <template #default="{ row }">{{ row.created_by_name || '未知' }}</template>
-        </el-table-column>
-        <el-table-column prop="updated_at" label="更新时间" width="160" />
-        <el-table-column label="操作" width="220" fixed="right">
-          <template #default="{ row }">
-            <el-button size="small" type="success" @click="onContinue(row)">继续</el-button>
-            <el-button v-if="row.source_type !== 'text'" size="small" type="warning" plain
-              @click="onResetWorkflow(row)">重走</el-button>
-            <el-button size="small" type="danger" plain @click="onDelete(row)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-    </el-card>
+    <div class="canvas-page-head">
+      <el-button size="small" plain @click="goBackList">← 返回任务列表</el-button>
+      <span v-if="proto" class="canvas-page-title">{{ proto.title || ('任务 #' + protoId) }}</span>
+      <span v-else class="canvas-page-title">新建需求任务</span>
+    </div>
 
     <el-steps :active="step" align-center finish-status="success" class="steps">
       <el-step title="原型接入" description="墨刀逐页读取" />
@@ -132,11 +82,143 @@
       </el-form>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'"
         :description="proto.error_message" show-icon />
-      <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="protoId ? onReExtract() : onCreate()">{{ protoId ? '重新读取当前任务' : form.source_type === 'modao' ? '开始读取墨刀' : form.source_type === 'webshare' ? '开始读取 webshare 页面树' : '保存需求文本' }}</el-button>
+      <!-- 部分成功：读取超时但已保留已读画布。提示可继续读取补齐，而不是要求从头重跑。 -->
+      <el-alert v-if="proto && proto.status === 'partial'" type="warning" :title="'读取未完成（已保留部分画布）'"
+        :description="proto.error_message" show-icon />
+      <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="protoId ? onReExtract() : onCreate()">{{ protoId ? (proto.status === 'partial' ? '继续读取（补齐剩余画布）' : '重新读取当前任务') : form.source_type === 'modao' ? '开始读取墨刀' : form.source_type === 'webshare' ? '开始读取 webshare 页面树' : '保存需求文本' }}</el-button>
       <el-button v-if="proto && proto.status === 'extracting'" :loading="true">读取中…</el-button>
       <el-button v-if="proto && proto.status === 'extracting'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
-      <el-button v-if="proto && proto.status === 'extracted' && proto.current_stage >= 0"
-        type="success" @click="goStep(1)">✅ 已读取，进入阶段1</el-button>
+      <el-button v-if="proto && ['extracted', 'partial'].includes(proto.status) && proto.current_stage >= 0"
+        type="success" @click="enterCanvasReview">✅ 已读取，校验画布模块</el-button>
+      <el-button v-if="proto && canvasPages.length" size="small" type="warning" plain
+        @click="openCanvasManage">✏️ 管理画布</el-button>
+    </el-card>
+
+    <!-- 画布/模块人工校验（阶段0读取后、需求结构化前）。
+         运行中(structuring/clarifying/designing)也保持可见，便于选取/编辑其他画布；
+         仅取消勾选已确认、或没有画布时隐藏。 -->
+    <el-card v-if="proto && !canvasConfirmed && canvasPages.length && ['pending', 'extracted', 'partial', 'structuring', 'clarifying', 'designing', 'done'].includes(proto.status)"
+      class="stage-card canvas-review-card">
+      <template #header>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <b>画布模块校验 · 选择参与需求结构化的画布</b>
+          <el-button v-if="step > 0" size="small" type="primary" plain @click="canvasConfirmed = true; goStep(1)">↩ 跳过校验</el-button>
+        </div>
+      </template>
+      <el-alert type="info" :closable="false" show-icon
+        title="逐一核对每个画布的识别结果，取消勾选不需要的画布，或标记识别准确率。仅勾选的画布会进入需求结构化。" />
+      <el-alert v-if="canContinueCanvas" type="warning" :closable="false" show-icon
+        :title="`还有 ${incompleteCanvasCount} 个画布未走完所有阶段`"
+        :description="'可点击「管理画布」勾选需继续的画布，再回到对应阶段点击「运行」按钮补跑；已完成的画布会自动跳过，不会重复消耗模型。'" />
+      <div class="canvas-review-body">
+        <!-- 左侧：画布模块列表 -->
+        <div class="canvas-list">
+          <div class="canvas-list-toolbar">
+            <el-checkbox v-model="checkAll" :indeterminate="canvasIndeterminate" @click.stop>全选</el-checkbox>
+            <span class="canvas-count">已选 {{ canvasSelectedCount }}/{{ canvasPages.length }}</span>
+          </div>
+          <div
+            v-for="(c, idx) in canvasPages"
+            :key="c.id"
+            class="canvas-card"
+            :class="{ active: canvasActiveId === c.id, unchecked: !c.selected, 'auto-filtered': isAutoFiltered(c) }"
+            @click="canvasActiveId = c.id">
+            <div class="canvas-card-head">
+              <el-checkbox v-model="c.selected" @click.stop
+                @update:model-value="onCanvasToggle(c)" />
+              <span class="canvas-no">{{ String(idx + 1).padStart(2, '0') }}</span>
+              <el-input v-model="c.page_name" size="small" class="canvas-name-input"
+                @click.stop @input="markCanvasDirty(c)" placeholder="画布名" />
+              <el-input v-model="c.parent_name" size="small" class="canvas-parent-input"
+                @click.stop @input="markCanvasDirty(c)" placeholder="父级分组(可选)" />
+              <el-tag v-if="c.duplicate_of_page" size="mini" type="info">重复</el-tag>
+              <el-tag v-if="isAutoFiltered(c)" size="mini" type="info" class="auto-filter-tag">自动过滤</el-tag>
+            </div>
+            <div v-if="isAutoFiltered(c)" class="canvas-auto-filter-reason">{{ c.recognition_note }}</div>
+            <div class="canvas-card-meta">
+              <el-tag v-if="!c.visionAttempted" size="mini" type="warning">未视觉识别</el-tag>
+              <el-tag v-else-if="c.visionSuccess" size="mini" type="success">视觉✓</el-tag>
+              <el-tag v-else size="mini" type="danger">视觉✗</el-tag>
+              <el-tag v-if="c.warnings && c.warnings.length" size="mini" type="warning">
+                警告{{ c.warnings.length }}</el-tag>
+              <el-tag size="mini" type="info">文本{{ (c.text || '').length }}字</el-tag>
+              <el-tag size="mini" :type="canvasStageType(c)" effect="dark">画布·{{ canvasStageLabel(c) }}</el-tag>
+            </div>
+            <!-- 画布级流水线进度条（A2-b）：显示该画布已走到哪一步 -->
+            <div class="canvas-card-progress" @click.stop>
+              <el-steps :active="c.current_stage" align-center finish-status="success" size="mini">
+                <el-step title="读取" />
+                <el-step title="结构化" />
+                <el-step title="澄清" />
+                <el-step title="用例" />
+                <el-step title="冒烟" />
+              </el-steps>
+            </div>
+            <div class="canvas-card-accuracy" @click.stop>
+              <el-select v-model="c.recognition_note" size="small" placeholder="识别准确率" @change="markCanvasDirty(c)">
+                <el-option label="准确" value="准确" />
+                <el-option label="基本准确" value="基本准确" />
+                <el-option label="偏差较大" value="偏差较大" />
+                <el-option label="需重读" value="需重读" />
+              </el-select>
+              <el-dropdown trigger="click" @command="cmd => onPageReset(c, cmd)" :disabled="isRunning">
+                <el-button size="mini" type="warning" plain>↩ 回退 ▼</el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="1">回退到「读取」(重读此画布)</el-dropdown-item>
+                    <el-dropdown-item command="2">回退到「结构化」</el-dropdown-item>
+                    <el-dropdown-item command="3">回退到「澄清」</el-dropdown-item>
+                    <el-dropdown-item command="4">回退到「用例」</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+              <el-button size="mini" type="danger" plain @click="onCanvasDelete(c)">删除</el-button>
+            </div>
+          </div>
+        </div>
+        <!-- 右侧：画布预览 -->
+        <div class="canvas-preview" v-if="canvasActive">
+          <div class="canvas-preview-head">
+            <b>{{ canvasFullName(canvasActive) }}</b>
+            <span class="canvas-preview-no">第{{ canvasActive.page_no }}页</span>
+          </div>
+          <el-image
+            v-if="activeShot"
+            :src="mediaUrl(activeShot)"
+            :preview-src-list="activeShots.map(s => mediaUrl(s))"
+            fit="contain"
+            class="canvas-preview-img"
+            alt="画布截图" />
+          <div v-else class="canvas-preview-noshot">无截图</div>
+          <!-- 超长画布分段缩略图：可切换查看每一段 -->
+          <div v-if="activeShots.length > 1" class="canvas-preview-segs">
+            <div
+              v-for="(s, si) in activeShots"
+              :key="si"
+              class="canvas-preview-seg"
+              :class="{ active: si === activeShotIdx }"
+              @click="activeShotIdx = si">
+              <el-image :src="mediaUrl(s)" fit="cover" class="canvas-preview-seg-img" />
+              <span class="canvas-preview-seg-no">{{ si + 1 }}</span>
+            </div>
+          </div>
+          <div class="canvas-preview-text">
+            <div class="canvas-preview-subtitle">识别文本</div>
+            <pre class="md-box">{{ canvasActive.text || '（无文本）' }}</pre>
+            <div v-if="canvasActive.annotations && canvasActive.annotations.length" class="canvas-preview-subtitle">注释/标注</div>
+            <pre v-if="canvasActive.annotations && canvasActive.annotations.length" class="md-box">{{ canvasActive.annotations }}</pre>
+            <div v-if="canvasActive.warnings && canvasActive.warnings.length" class="canvas-preview-subtitle">提取警告</div>
+            <pre v-if="canvasActive.warnings && canvasActive.warnings.length" class="md-box warn">{{ canvasActive.warnings.join('\n') }}</pre>
+          </div>
+        </div>
+        <div class="canvas-preview empty" v-else>请选择左侧画布查看预览</div>
+      </div>
+      <div class="canvas-review-actions">
+        <el-button type="primary" :loading="canvasSaving" @click="saveCanvasReview">
+          {{ isRunning ? '保存画布选择（流程运行中，重跑后生效）' : '保存校验结果并进入需求结构化' }}
+        </el-button>
+        <el-button @click="resetCanvasReview">重置</el-button>
+      </div>
     </el-card>
 
     <!-- 阶段1：需求通读 -->
@@ -145,9 +227,11 @@
         <div style="display:flex;align-items:center;justify-content:space-between">
           <b>阶段1 · 需求通读</b>
           <el-button v-if="step > 1" size="small" type="primary" plain @click="goStep(1)">↩ 回到此阶段</el-button>
+          <el-button v-if="canvasPages.length" size="small" type="warning" plain @click="openCanvasManage">✏️ 管理画布</el-button>
         </div>
       </template>
       <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onStruct">运行需求结构化</el-button>
+      <el-button v-if="proto && proto.requirement_summary" size="small" :loading="busy" :disabled="isRunning || busy" @click="onReStructAll">重新结构化全部</el-button>
       <el-alert v-if="proto && proto.status === 'structuring'" type="info" title="结构化中…" />
       <el-button v-if="proto && proto.status === 'structuring'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
       <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
@@ -157,9 +241,29 @@
       <div v-if="proto && proto.requirement_summary" class="artifact">
         <div class="artifact-head">
           <h4>需求摘要</h4>
-          <el-button size="small" plain @click="beginEdit('requirement_summary')"
-            :disabled="editingField && editingField !== 'requirement_summary'">✏️ 编辑</el-button>
+          <div class="artifact-actions">
+            <el-button size="small" plain @click="beginEdit('requirement_summary')"
+              :disabled="editingField && editingField !== 'requirement_summary'">✏️ 编辑</el-button>
+            <el-button size="small" plain type="info"
+              @click="onPreviewXmind" title="预览将要导出的 XMind 结构">👁️ 预览 XMind</el-button>
+            <el-button size="small" plain type="warning" :loading="xmindExporting"
+              @click="onExportXmind" title="导出可编辑的 XMind 图，便于精准理解需求">⬇️ 下载 XMind</el-button>
+            <el-button size="small" plain type="warning" :loading="xmindImporting"
+              @click="triggerXmindUpload" title="上传本地修改后的 XMind，覆盖结构化摘要（不联动下游）">⬆️ 上传 XMind</el-button>
+            <input ref="xmindFile" type="file" accept=".xmind" style="display:none"
+              @change="onXmindFileChange" />
+          </div>
         </div>
+        <el-dialog title="XMind 预览（将要导出的结构）" :visible.sync="xmindPreviewVisible" width="560px"
+          @closed="xmindPreviewTree = []">
+          <el-tree v-if="xmindPreviewTree.length" :data="xmindPreviewTree" :props="{ label: 'label', children: 'children' }"
+            node-key="label" default-expand-all :expand-on-click-node="false" class="xmind-preview-tree" />
+          <p v-else class="xmind-preview-empty">暂无可预览的内容</p>
+          <div slot="footer">
+            <el-button size="small" @click="xmindPreviewVisible = false">关闭</el-button>
+            <el-button size="small" type="warning" :loading="xmindExporting" @click="onExportXmind">确认无误，下载</el-button>
+          </div>
+        </el-dialog>
         <pre v-if="editingField !== 'requirement_summary'" class="md-box">{{ proto.requirement_summary }}</pre>
         <template v-else>
           <el-input v-model="editBuffer" type="textarea" :rows="12" />
@@ -175,14 +279,22 @@
       <el-button v-if="proto && proto.requirement_summary" type="success" @click="onConfirm(1)">确认摘要，进入阶段2</el-button>
     </el-card>
 
-    <!-- 阶段2：需求澄清 -->
-    <el-card v-if="(step === 2 || (proto && proto.clarification_log)) && !(proto && proto.generation_gate && proto.generation_gate.stage2_confirmed)" class="stage-card">
+    <!-- 阶段2：需求澄清（确认后也保留入口，可随时回看/修改，默认折叠） -->
+    <el-card v-if="step === 2 || (proto && proto.clarification_log)" class="stage-card">
       <template #header>
         <div style="display:flex;align-items:center;justify-content:space-between">
-          <b>阶段2 · 需求澄清</b>
-          <el-button v-if="step > 2" size="small" type="primary" plain @click="goStep(2)">↩ 回到此阶段</el-button>
+          <b>阶段2 · 需求澄清
+            <el-tag v-if="stage2Confirmed" size="mini" type="success">已确认</el-tag>
+          </b>
+          <div style="display:flex;align-items:center;gap:8px">
+            <el-button v-if="step > 2" size="small" type="primary" plain @click="goStep(2)">↩ 回到此阶段</el-button>
+            <el-button size="small" plain @click="stage2Collapsed = !stage2Collapsed">
+              {{ stage2Collapsed ? '▼ 展开' : '▲ 收起' }}
+            </el-button>
+          </div>
         </div>
       </template>
+      <div v-show="!stage2Collapsed">
       <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onClarify">识别澄清问题</el-button>
       <el-alert v-if="proto && proto.status === 'clarifying'" type="info" title="澄清分析中…" />
       <el-button v-if="proto && proto.status === 'clarifying'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
@@ -234,8 +346,11 @@
       </div>
       <el-alert v-if="clarificationUnresolvedCount > 0" type="warning" :closable="false" show-icon
         :title="`还有 ${clarificationUnresolvedCount} 条位置/需求问题未填写人工结论，不能进入最终用例生成流程`" />
-      <el-button v-if="proto && proto.clarification_log" type="success"
+      <el-button v-if="proto && proto.clarification_log && !stage2Confirmed" type="success"
         :disabled="clarificationUnresolvedCount > 0" @click="onConfirm(2)">已与产品确认，进入阶段3</el-button>
+      <el-alert v-else-if="stage2Confirmed" type="success" :closable="false" show-icon
+        title="阶段2 已确认。澄清内容仍可在上方逐条修改 / 编辑原文；修改后原生成批准会失效，需重新批准生成用例。" />
+      </div>
     </el-card>
 
     <!-- 阶段3：用例设计 -->
@@ -367,6 +482,8 @@
             <div class="main-page-card-head">
               <span class="generic-card-index">{{ i + 1 }}</span>
               <b v-if="tp.title">{{ tp.title }}</b>
+              <el-button size="mini" type="danger" plain style="margin-left:auto"
+                :loading="removingTpIndex === i" @click="removeMainTpItem(i)">🗑 删除</el-button>
             </div>
             <div class="main-page-card-desc">{{ tp.description || tp.issue || '' }}</div>
           </div>
@@ -395,6 +512,7 @@
                   @click.stop="adoptSingleCase(tc._rawIndex !== undefined ? tc._rawIndex : tc.index ?? ti, 'tc-'+gi+'-'+ti)">📥 采纳</el-button>
                 <span v-else class="adopted-badge">✅ 已采纳</span>
               </div>
+              <el-alert v-if="tc.steps_missing || tc.steps === '【步骤缺失，请补充操作步骤】'" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
               <div v-if="tc.precondition || tc.preconditions" class="main-page-card-extra"><b>前置：</b>{{ tc.precondition || tc.preconditions }}</div>
               <ol v-if="Array.isArray(tc.steps) && tc.steps.length" class="main-page-tc-steps"><li v-for="(s, si) in tc.steps" :key="si">{{ s }}</li></ol>
               <div v-else-if="tc.steps" class="main-page-card-extra"><b>步骤：</b>{{ tc.steps }}</div>
@@ -458,6 +576,43 @@
       <el-alert v-else-if="proto && proto.status === 'done' && !proto.project" type="warning" :closable="false"
         title="未关联项目/版本，确认后不会同步功能模块（可在阶段0补充项目后重跑）" show-icon />
       <el-button v-if="proto && proto.status === 'done'" type="success" @click="onConfirm(3)">确认用例，进入阶段4</el-button>
+
+      <!-- A2-c：画布级用例采纳面板（按选中子集分别走流程，各自用例，分别/一起采纳） -->
+      <div v-if="proto && proto.pages && canvasWithCases.length" class="artifact canvas-adopt-panel">
+        <div class="artifact-head-row">
+          <h4>🗂️ 按画布采纳用例（分别生成、可分别/一起采纳）</h4>
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+            <el-button size="mini" type="primary" :loading="approvePagesLoading"
+              @click="approveAllPages">✅ 一起采纳全部已生成画布</el-button>
+          </div>
+        </div>
+        <div v-for="pg in canvasWithCases" :key="'cap'+pg.id" class="canvas-adopt-item">
+          <div class="canvas-adopt-item-head">
+            <b>📄 {{ pg.page_name }}</b>
+            <span class="canvas-adopt-count">（{{ pageCaseCount(pg) }} 条用例）</span>
+            <el-tag v-if="pg.page_approved" size="mini" type="success">已采纳</el-tag>
+            <el-button v-else size="extra-mini" type="success" plain :loading="approvePagesLoading"
+              @click.stop="approvePage(pg)">✅ 采纳此画布</el-button>
+          </div>
+          <div v-if="pageCaseGroups(pg).length" class="main-page-tc-wrap" style="margin-top:6px">
+            <div v-for="(group, gi) in pageCaseGroups(pg)" :key="'pcg'+gi" class="main-page-tc-group">
+              <h5 class="main-page-tc-group-title">📦 {{ group.module }}（{{ group.items.length }} 条）</h5>
+              <div v-for="(tc, ti) in group.items" :key="ti" class="main-page-tc-card">
+                <div class="main-page-card-head">
+                  <span class="generic-card-index">{{ tc.id || ('#' + (ti+1)) }}</span>
+                  <b>{{ tc.title || ('用例 #' + (ti+1)) }}</b>
+                  <el-tag size="mini" :type="priTag(tc.priority)">{{ tc.priority || '-' }}</el-tag>
+                  <el-tag size="mini" :type="tc.type === 'UI' ? '' : 'warning'">{{ tc.type || '功能' }}</el-tag>
+                </div>
+                <ol v-if="Array.isArray(tc.steps) && tc.steps.length" class="main-page-tc-steps"><li v-for="(s, si) in tc.steps" :key="si">{{ s }}</li></ol>
+              </div>
+            </div>
+          </div>
+        </div>
+        <el-alert v-if="proto.merged_testcases_json" type="success" :closable="false" show-icon
+          :title="`已采纳汇总：${mergedCaseCount} 条跨画布去重用例（merged_testcases_json）`" style="margin-top:10px" />
+      </div>
+
       <el-divider v-if="proto && proto.testcases_json" content-position="left">一键采纳到用例库</el-divider>
       <div v-if="proto && proto.testcases_json" class="adopt-box">
         <el-alert type="info" :closable="false" show-icon
@@ -495,6 +650,7 @@
                 <el-tag size="mini" :type="tc.type === 'UI' ? '' : 'warning'">{{ tc.type || '功能' }}</el-tag>
                 <el-tag v-if="tc.is_smoke" size="mini" type="success">冒烟</el-tag>
               </div>
+              <el-alert v-if="tc.steps_missing || tc.steps === '【步骤缺失，请补充操作步骤】'" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
               <div class="tc-card-body">
                 <div v-if="tc.precondition || tc.preconditions"><b>前置条件：</b>{{ tc.precondition || tc.preconditions }}</div>
                 <ol v-if="Array.isArray(tc.steps) && tc.steps.length" class="tc-steps">
@@ -512,11 +668,18 @@
         </div>
 
         <!-- 合并测试点：卡片列表 -->
-        <div v-else-if="editField === 'final_testpoints_json' && parsedTestpoints.length">
-          <div v-for="(tp, i) in parsedTestpoints" :key="i" class="tp-card">
-            <b>{{ tp.title || ('测试点 #' + (i+1)) }}</b>
+        <div v-else-if="editField === 'final_testpoints_json' && tpEditItems.length">
+          <div class="tp-toolbar" style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+            <el-button size="small" type="success" @click="addTpItem">➕ 新增测试点</el-button>
+            <span class="hint-text">共 {{ tpEditItems.length }} 条测试点</span>
+          </div>
+          <div v-for="(tp, i) in tpEditItems" :key="i" class="tp-card">
+            <div class="tp-card-head" style="display:flex;align-items:center;gap:8px">
+              <b>{{ tp.title || ('测试点 #' + (i+1)) }}</b>
+              <el-button size="mini" type="danger" plain style="margin-left:auto" @click="removeTpItem(i)">🗑 删除</el-button>
+            </div>
             <p>{{ tp.description || tp.issue || '' }}</p>
-            <el-input v-model="parsedTestpoints[i]._raw" type="textarea" :rows="2"
+            <el-input v-model="tpEditItems[i]._raw" type="textarea" :rows="2"
               placeholder="修改此条内容…" />
           </div>
         </div>
@@ -612,6 +775,29 @@
           <el-button size="small" type="primary" class="mt" @click="saveRiskReplies">💾 保存全部回复</el-button>
         </div>
 
+        <!-- 需求澄清：逐条问题 + 人工结论输入框 -->
+        <div v-else-if="editField === 'clarification_log' && clarifyEditItems.length" class="generic-json-list">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+            <span class="hint-text">共 {{ clarifyEditItems.length }} 条澄清项</span>
+            <el-button size="mini" type="danger" plain @click="clearAllClarifyResolutions">清空全部结论</el-button>
+          </div>
+          <div v-for="(item, i) in clarifyEditItems" :key="i" class="clarify-item">
+            <div class="clarify-item-head">
+              <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
+              <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
+              <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+            </div>
+            <div class="clarify-issue">{{ item.issue || item.suggested_question || '' }}</div>
+            <div v-if="item.suggested_question" class="clarify-suggest"><b>建议提问：</b>{{ item.suggested_question }}</div>
+            <div v-if="item.impact" class="clarify-impact">影响范围：{{ item.impact }}</div>
+            <el-input v-model="clarifyEditItems[i].resolution" type="textarea" :rows="2" class="mt"
+              placeholder="填写与产品确认后的回复/结论…" />
+            <el-input v-model="clarifyEditItems[i]._raw" type="textarea" :rows="2" class="mt mono-font"
+              placeholder="高级：修改此条原始 JSON…" />
+          </div>
+          <el-button size="small" type="primary" class="mt" @click="saveClarifyEditItems">💾 保存全部结论</el-button>
+        </div>
+
         <!-- 其他产物：通用 JSON 数组卡片视图 -->
         <div v-else-if="parsedJsonArray.length" class="generic-json-list">
           <div v-for="(item, i) in parsedJsonArray" :key="i" class="generic-json-card">
@@ -632,7 +818,11 @@
           </div>
         </div>
 
-        <div v-else class="empty-hint">当前产物为空或格式无法解析</div>
+        <div v-else class="empty-hint">
+          {{ editField === 'requirement_summary'
+             ? '需求摘要为 Markdown 文本，请切换到上方「原文模式」编辑'
+             : '当前产物为空或格式无法解析（可切换到「原文模式」编辑）' }}
+        </div>
       </div>
 
       <!-- 原文模式 -->
@@ -697,6 +887,48 @@
         <el-button type="primary" :disabled="!quickVersionName.trim()" @click="createQuickVersion">创建</el-button>
       </template>
     </el-dialog>
+
+    <!-- 画布管理（二级页面）：随时勾选/改名/删除，显示每条画布参与到的整体阶段 -->
+    <el-dialog v-model="canvasManageVisible" title="管理画布 · 选择参与后续工作流的画布" width="720px" append-to-body
+      @open="onCanvasManageOpen">
+      <el-alert type="info" :closable="false" show-icon
+        title="勾选的画布会参与需求结构化与后续用例生成；取消勾选则从工作流中排除（已产生的产物不受影响）。保存后若已运行过结构化，需回到阶段1重新运行以纳入变更。" />
+          <div class="canvas-list" style="max-height:460px;margin-top:12px">
+        <div class="canvas-list-toolbar">
+          <el-checkbox v-model="checkAll" :indeterminate="canvasIndeterminate" @click.stop>全选</el-checkbox>
+          <span class="canvas-count">已选 {{ canvasSelectedCount }}/{{ canvasPages.length }}</span>
+        </div>
+        <div
+          v-for="(c, idx) in canvasPages"
+          :key="c.id"
+          class="canvas-card"
+          :class="{ active: canvasActiveId === c.id, unchecked: !c.selected, 'auto-filtered': isAutoFiltered(c) }"
+          @click="canvasActiveId = c.id">
+          <div class="canvas-card-head">
+            <el-checkbox v-model="c.selected" @click.stop
+              @update:model-value="onCanvasToggle(c)" />
+            <span class="canvas-no">{{ String(idx + 1).padStart(2, '0') }}</span>
+            <el-input v-model="c.page_name" size="small" class="canvas-name-input"
+              @click.stop @input="markCanvasDirty(c)" placeholder="画布名" />
+            <el-tag v-if="c.duplicate_of_page" size="mini" type="info">重复</el-tag>
+            <el-tag v-if="isAutoFiltered(c)" size="mini" type="info" class="auto-filter-tag">自动过滤</el-tag>
+            <el-tag size="mini" :type="canvasStageTag(c)">{{ canvasStageOf(c) }}</el-tag>
+          </div>
+          <div v-if="isAutoFiltered(c)" class="canvas-auto-filter-reason">{{ c.recognition_note }}</div>
+          <div class="canvas-card-meta">
+            <el-tag v-if="!c.visionAttempted" size="mini" type="warning">未视觉识别</el-tag>
+            <el-tag v-else-if="c.visionSuccess" size="mini" type="success">视觉✓</el-tag>
+            <el-tag v-else size="mini" type="danger">视觉✗</el-tag>
+            <el-tag v-if="c.warnings && c.warnings.length" size="mini" type="warning">警告{{ c.warnings.length }}</el-tag>
+            <el-tag size="mini" type="info">文本{{ (c.text || '').length }}字</el-tag>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="canvasManageVisible = false">取消</el-button>
+        <el-button type="primary" :loading="canvasManageSaving" @click="saveCanvasManage">💾 保存画布选择</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -708,13 +940,28 @@ import ModaoQA from './ModaoQA.vue'
 export default {
   name: 'ModaoSkillView',
   components: { ModaoQA },
+  props: {
+    // 二级路由 modao-canvas/:id 传入的任务 id；无则为新建空态
+    id: { type: [String, Number], default: null },
+  },
   data() {
     return {
       step: 0,
       protoId: null,
       proto: null,
+      canvasConfirmed: false,
+      canvasActiveId: null,
+      activeShotIdx: 0,
+      canvasSaving: false,
+      // 画布管理二级弹窗（随时打开，勾选/改名/删除，不影响主流程阶段机）
+      canvasManageVisible: false,
+      canvasManageSaving: false,
       busy: false,
       terminating: false,
+      xmindExporting: false,
+      xmindImporting: false,
+      xmindPreviewVisible: false,
+      xmindPreviewTree: [],
       pollTimer: null,
       smokeDecision: '',
       rejectEmail: '',
@@ -729,11 +976,19 @@ export default {
       clarifyItems: [],
       clarifyReplies: [],
       clarifyParsed: false,
+      // 阶段2 卡片折叠（确认后默认收起，仍可展开修改）
+      stage2Collapsed: false,
+      stage2Init: false,
+      // 编辑弹窗内「需求澄清」逐条编辑
+      clarifyEditItems: [],
       // 阶段3 产物编辑弹窗
       editDialogVisible: false,
       editField: 'testcases_json',
       editFieldValue: '',
       editRawMode: false,
+      // 合并测试点结构化编辑：稳定工作数组（v-model 绑定它，删除/修改才能落库）
+      tpEditItems: [],
+      removingTpIndex: -1,  // 主页面删除中的测试点索引（用于按钮 loading）
       // PCI / Risks 逐条回复
       pciReplies: [],
       riskReplies: [],
@@ -742,6 +997,8 @@ export default {
       flatPciItemsList: [],  // 弹窗 PCI 子问题扁平列表（避免 computed 写自身依赖）
       allPciLoading: false,  // 全部拆解按钮 loading
       editFields: [
+        { value: 'requirement_summary', label: '需求摘要（阶段1）' },
+        { value: 'clarification_log', label: '需求澄清（阶段2）' },
         { value: 'module_split', label: '模块拆分' },
         { value: 'risks_json', label: '风险识别' },
         { value: 'pci_json', label: '待确认问题 PCI' },
@@ -754,6 +1011,9 @@ export default {
       versions: [],
       loadingProjects: false,
       syncMsg: '',
+      // 历史列表筛选
+      filterProject: null,
+      filterVersion: null,
       // 快速新建
       showQuickProject: false,
       showQuickVersion: false,
@@ -773,6 +1033,7 @@ export default {
       },
       // 一键采纳到用例库
       adoptLoading: false,
+      approvePagesLoading: false,
       adoptIncludeSmoke: false,
       // 逐条采纳追踪（key 为 "gi-ti" 或 "smoke-gi-ti"，value 为 true=已采纳）
       adoptedCaseMap: {},
@@ -789,6 +1050,12 @@ export default {
   },
   watch: {
     'proto.clarification_log'() { this.parseClarify() },
+    // 切换任务时重置阶段2 折叠态（避免沿用上一个任务的展开/收起状态）
+    protoId() {
+      this.stage2Collapsed = false
+      this.stage2Init = false
+      this.clarifyEditItems = []
+    },
     // 切换编辑字段前，先把当前字段的未保存内容存为草稿
     editField(newVal, oldVal) {
       if (oldVal && oldVal !== newVal) {
@@ -802,6 +1069,10 @@ export default {
         this.$nextTick(() => this.recomputeFlatPciItems())
       }
     },
+    // 切换画布时重置分段截图预览到第一段
+    canvasActiveId() {
+      this.activeShotIdx = 0
+    },
     // editFieldValue 变化（打开字段/切换/放弃修改/恢复草稿）时，重建 PCI 扁平列表为真实响应式对象，
     // 保证输入框 v-model 绑定持久化对象。注意：用户在结构化视图内输入 answer 不会改动 editFieldValue，
     // 因此不会误触发重建，输入不会被打断。
@@ -809,9 +1080,229 @@ export default {
       if (this.editField === 'pci_json' && !this.editRawMode) {
         this.recomputeFlatPciItems()
       }
+      // 需求澄清：原文变化（保存后/放弃修改后）重建逐条数组
+      if (this.editField === 'clarification_log' && !this.editRawMode) {
+        this.buildClarifyEditItems()
+      }
     },
   },
   methods: {
+    // ---------- 画布模块人工校验 ----------
+    mediaUrl(path) {
+      if (!path) return ''
+      if (/^https?:\/\//.test(path)) return path
+      return '/media/' + String(path).replace(/^\/?media\//, '')
+    },
+    // 编辑态（selected/_dirty/_delete）必须落在 proto.pages 原始响应式对象上，
+    // 否则会被 canvasPages computed 的临时拷贝吞掉，导致保存时读不到用户改动。
+    _rawPage(id) {
+      const pages = (this.proto && this.proto.pages) || []
+      return pages.find(p => p.id === id) || null
+    },
+    enterCanvasReview() {
+      this.canvasConfirmed = false
+      if (this.canvasPages.length && !this.canvasActiveId) {
+        this.canvasActiveId = this.canvasPages[0].id
+      }
+      this.$message.info('请逐一核对画布识别结果，勾选参与需求结构化的画布')
+    },
+    toggleSelectAll(val) {
+      ;((this.proto && this.proto.pages) || []).forEach(p => {
+        p.selected = val
+        p._dirty = true
+      })
+    },
+    onCanvasToggle(c) {
+      const rp = this._rawPage(c.id)
+      if (rp) {
+        rp.selected = c.selected
+        rp._dirty = true
+      }
+    },
+    markCanvasDirty(c) {
+      const rp = this._rawPage(c.id)
+      if (rp) {
+        rp._dirty = true
+        // 同步可能的改名（v-model 先改 c.page_name 再触发 @input）
+        if (c.page_name !== undefined && c.page_name !== rp.page_name) rp.page_name = c.page_name
+      }
+    },
+    // ---------- A2-b 画布级进度展示与回退 ----------
+    canvasStageLabel(c) {
+      const st = c.current_stage || 0
+      const labels = ['待读取', '已结构化', '已澄清', '已生成用例', '已冒烟决策']
+      let label = labels[st] || '待读取'
+      if (c.stage_status === 'needs_rerun') label = '需重跑·' + label
+      if (c.stage_status === 'failed') label = '失败·' + label
+      return label
+    },
+    // 完整层级展示名：父级分组 + 画布名（如「前置付费页-横版」）。
+    // 墨刀只读分享页 DOM 不渲染分组层级，父级由用户在校验视图手动填写；
+    // 留空则只显示画布名。提取时 page_name 已保持纯画布名、parent_name 独立存储。
+    canvasFullName(c) {
+      if (!c) return '未命名画布'
+      const pn = (c.parent_name || '').trim()
+      const nm = c.page_name || '未命名画布'
+      return pn ? `${pn}-${nm}` : nm
+    },
+    canvasStageType(c) {
+      if (c.stage_status === 'failed') return 'danger'
+      if (c.stage_status === 'needs_rerun') return 'warning'
+      if (c.current_stage >= 4) return 'success'
+      if (c.current_stage >= 1) return 'primary'
+      return 'info'
+    },
+    async onPageReset(c, stage) {
+      try {
+        await this.$confirm(
+          `确认将画布「${c.page_name}」回退到阶段${Number(stage) - 1}并标记需重跑？` +
+          `该画布后续的全局产物（结构化/用例等）将清空，需重新运行对应阶段。`,
+          '画布回退', { type: 'warning' }
+        )
+      } catch (e) {
+        return
+      }
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/page-reset/`,
+          method: 'post',
+          data: { page_id: c.id, stage: Number(stage) },
+        })
+        this.proto = res.data.proto
+        await this.refresh()
+        if (Number(stage) === 1) {
+          // 回退到「读取」即意味着要重读此画布；只重读选中的这张，其余画布保持不变。
+          this.$message.info(`画布「${c.page_name}」已回退，开始重新读取…`)
+          await this.onReExtract([c.page_name])
+        } else {
+          this.$message.success(`画布「${c.page_name}」已回退到阶段${Number(stage) - 1}，请重新运行对应阶段`)
+        }
+      } catch (e) {
+        this.$message.error('回退失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+    // ---------- 画布管理二级弹窗 ----------
+    openCanvasManage() {
+      this.canvasActiveId = this.canvasActiveId || (this.canvasPages[0] && this.canvasPages[0].id)
+      this.canvasManageVisible = true
+    },
+    onCanvasManageOpen() {
+      // 打开时确保真实画布对象有 _dirty 标记（未改动过则置 false，便于保存时统一判断）
+      ;((this.proto && this.proto.pages) || []).forEach(p => { if (p._dirty === undefined) p._dirty = false })
+    },
+    async saveCanvasManage() {
+      const rawPages = (this.proto && this.proto.pages) || []
+      if (!rawPages.some(c => c.selected && !c._delete)) {
+        this.$message.warning('至少需勾选一个画布')
+        return
+      }
+      this.canvasManageSaving = true
+      try {
+        const pages = rawPages
+          .filter(c => c._dirty)
+          .map(c => ({
+            id: c.id,
+            selected: c.selected,
+            page_name: c.page_name,
+            parent_name: c.parent_name || '',
+            recognition_note: c.recognition_note || '',
+            delete: !!c._delete,
+          }))
+        await request({ url: `${this.base()}/${this.protoId}/update-pages/`, method: 'post', data: { pages } })
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        this.proto = res.data
+        this.canvasManageVisible = false
+        // 若已运行过结构化（有摘要），提示需重跑以纳入画布变更
+        if (this.proto && this.proto.requirement_summary) {
+          this.$message.success('画布选择已保存；如需纳入结构化，请回到阶段1重新运行需求结构化')
+        } else {
+          this.$message.success('画布选择已保存')
+        }
+      } catch (e) {
+        this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.canvasManageSaving = false
+      }
+    },
+    // 画布参与到的整体阶段（X 方案：单 proto 内无画布独立 stage，显示其随整体进度到达的阶段）
+    canvasStageOf(c) {
+      const p = this.proto
+      if (!p) return '未读取'
+      if (!c.selected) return '未纳入'
+      const stage = p.current_stage || 0
+      const st = p.status
+      const map = ['原型接入', '需求通读', '需求澄清', '用例设计', '冒烟执行']
+      let label = map[stage] || '进行中'
+      if (['extracting', 'structuring', 'clarifying', 'designing'].includes(st)) label = '进行中'
+      if (st === 'done') label = '已完成'
+      if (st === 'failed') label = '失败'
+      if (st === 'partial') label = '部分读取'
+      return label
+    },
+    canvasStageTag(c) {
+      const label = this.canvasStageOf(c)
+      if (label === '未纳入') return 'info'
+      if (label === '已完成') return 'success'
+      if (label === '失败') return 'danger'
+      if (label === '进行中') return 'warning'
+      return ''
+    },
+    onCanvasDelete(c) {
+      this.$confirm(`确认删除画布「${c.page_name || '未命名'}」？该画布将不参与后续流程。`, '提示', {
+        type: 'warning'
+      }).then(() => {
+        const rp = this._rawPage(c.id)
+        if (rp) {
+          rp._delete = true
+          rp._dirty = true
+          rp.selected = false
+        }
+        this.$message.success('将在保存时删除该画布')
+      }).catch(() => {})
+    },
+    async saveCanvasReview() {
+      if (this.canvasSaving) return
+      const rawPages = (this.proto && this.proto.pages) || []
+      if (!rawPages.some(c => c.selected && !c._delete)) {
+        this.$message.warning('至少需勾选一个画布')
+        return
+      }
+      this.canvasSaving = true
+      try {
+        const running = this.isRunning
+        const pages = rawPages
+          .filter(c => c._dirty)
+          .map(c => ({
+            id: c.id,
+            selected: c.selected,
+            page_name: c.page_name,
+            parent_name: c.parent_name || '',
+            recognition_note: c.recognition_note || '',
+            delete: !!c._delete,
+          }))
+        await request({ url: `${this.base()}/${this.protoId}/update-pages/`, method: 'post', data: { pages } })
+        // 重新拉取最新 proto（pages 已更新）
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        this.proto = res.data
+        if (running) {
+          // 结构化/澄清/用例设计运行中：只保存画布选择，不跳转、不打断当前流程；
+          // 变更将在下次重新运行结构化时纳入。
+          this.$message.success('画布选择已保存；当前流程运行中，重新运行结构化后纳入变更')
+        } else {
+          this.canvasConfirmed = true
+          this.goStep(1)
+          this.$message.success('画布校验已保存，进入需求结构化')
+        }
+      } catch (e) {
+        this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.canvasSaving = false
+      }
+    },
+    resetCanvasReview() {
+      ;((this.proto && this.proto.pages) || []).forEach(p => { p._dirty = false; p._delete = false })
+      this.$message.info('已重置本地修改')
+    },
     // ---------- PCI 批量操作 ----------
     // 按影响级别批量确认 PCI 子问题
     // 答案优先级：后端 suggested_answer > resolution_condition（需过滤非答案）> 智能默认答案
@@ -899,11 +1390,11 @@ export default {
     },
     base() { return '/requirement-analysis/api/modao' },
     statusLabel(s) {
-      const m = { pending: '待处理', extracting: '读取中', extracted: '已读取', structuring: '结构化中', clarifying: '澄清中', designing: '用例设计中', done: '已完成', failed: '失败' }
+      const m = { pending: '待处理', extracting: '读取中', extracted: '已读取', partial: '部分读取', structuring: '结构化中', clarifying: '澄清中', designing: '用例设计中', done: '已完成', failed: '失败' }
       return m[s] || s
     },
     statusType(s) {
-      const m = { pending: 'info', extracting: 'warning', extracted: 'success', structuring: 'warning', clarifying: 'warning', designing: 'warning', done: 'success', failed: 'danger' }
+      const m = { pending: 'info', extracting: 'warning', extracted: 'success', partial: 'warning', structuring: 'warning', clarifying: 'warning', designing: 'warning', done: 'success', failed: 'danger' }
       return m[s] || 'info'
     },
     stageLabel(n) {
@@ -942,8 +1433,31 @@ export default {
       if (!this.protoId) return
       try {
         const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        // 保留用户在画布列表上的本地未保存改动（_dirty）：运行期间允许继续选取/勾选/改名，
+        // 不被轮询刷新整体覆盖丢失；等服务端数据回来后再按 id 合并回原始对象。
+        const localDirty = (this.canvasPages || [])
+          .filter(c => c._dirty)
+          .map(c => ({ id: c.id, selected: c.selected, page_name: c.page_name, parent_name: c.parent_name, recognition_note: c.recognition_note }))
         this.proto = res.data
+        if (localDirty.length) {
+          const pages = (this.proto && this.proto.pages) || []
+          localDirty.forEach(d => {
+            const t = pages.find(p => p.id === d.id)
+            if (t) {
+              if (d.selected !== undefined) t.selected = d.selected
+              if (d.page_name !== undefined) t.page_name = d.page_name
+              if (d.parent_name !== undefined) t.parent_name = d.parent_name
+              if (d.recognition_note !== undefined) t.recognition_note = d.recognition_note
+              t._dirty = true
+            }
+          })
+        }
         this.parseClarify()
+        // 首次加载：已确认过阶段2 且当前不在阶段2 时默认折叠（保留入口但不占版面）
+        if (!this.stage2Init) {
+          this.stage2Init = true
+          if (this.stage2Confirmed && this.step !== 2) this.stage2Collapsed = true
+        }
         const s = res.data.status
         if (!['extracting', 'structuring', 'clarifying', 'designing'].includes(s)) {
           this.stopPoll()
@@ -977,33 +1491,54 @@ export default {
       }
     },
     // ---------- 阶段2 澄清清单：逐条填写回复 ----------
-    parseClarify() {
-      const raw = (this.proto && this.proto.clarification_log) || ''
-      if (!raw.trim()) {
-        this.clarifyItems = []
-        this.clarifyReplies = []
-        this.clarifyParsed = false
-        return
-      }
-      let items = null
+    /** 从原文解析澄清数组：纯 JSON / ```json 代码块 / 首个 [...] 片段，三种策略兼容 LLM 输出 */
+    _parseClarifyArray(raw) {
+      const text = String(raw || '')
+      if (!text.trim()) return []
       // 策略1：直接解析为 JSON 数组
-      try { items = JSON.parse(raw) } catch (e) { items = null }
+      try {
+        const v = JSON.parse(text)
+        if (Array.isArray(v) && v.length) return v
+      } catch (e) { /* 非纯 JSON，继续下一种策略 */ }
       // 策略2：提取 ```json 或 ```yaml 代码块内容再解析（兼容有无结束 ``` 标记）
-      if (!Array.isArray(items)) {
-        const m = raw.match(/```(?:json|yaml|yml)?\s*\n([\s\S]*?)(?:```|$)/i)
-        if (m) {
-          const inner = m[1].trim()
-          try { items = JSON.parse(inner) } catch (e) { items = null }
-        }
+      const m = text.match(/```(?:json|yaml|yml)?\s*\n([\s\S]*?)(?:```|$)/i)
+      if (m) {
+        try {
+          const v = JSON.parse(m[1].trim())
+          if (Array.isArray(v) && v.length) return v
+        } catch (e) { /* noop */ }
       }
       // 策略3：全文找首个 [...] JSON 数组（LLM 可能在前后加了说明文字）
-      if (!Array.isArray(items)) {
-        const arrMatch = raw.match(/\[[\s\S]*?\](?=\s*[\n]|$)/)
-        if (arrMatch) {
-          try { items = JSON.parse(arrMatch[0]) } catch (e) { items = null }
-        }
+      const arrMatch = text.match(/\[[\s\S]*?\](?=\s*[\n]|$)/)
+      if (arrMatch) {
+        try {
+          const v = JSON.parse(arrMatch[0])
+          if (Array.isArray(v) && v.length) return v
+        } catch (e) { /* noop */ }
       }
-      if (Array.isArray(items) && items.length && items[0] && typeof items[0] === 'object') {
+      return []
+    },
+    /** 把新数组文本写回原文：纯 JSON 整体替换；markdown/说明文字包裹时只替换其中的 JSON 片段 */
+    _replaceClarifyJsonInRaw(raw, newText) {
+      const text = String(raw || '')
+      if (!text.trim()) return newText
+      try {
+        const v = JSON.parse(text)
+        if (Array.isArray(v)) return newText
+      } catch (e) { /* 非纯 JSON，走片段替换 */ }
+      const m = text.match(/```(?:json|yaml|yml)?\s*\n([\s\S]*?)(?:```|$)/i)
+      if (m) {
+        return text.slice(0, m.index) + m[0].replace(m[1], () => newText) + text.slice(m.index + m[0].length)
+      }
+      const arrMatch = text.match(/\[[\s\S]*?\](?=\s*[\n]|$)/)
+      if (arrMatch) {
+        return text.slice(0, arrMatch.index) + newText + text.slice(arrMatch.index + arrMatch[0].length)
+      }
+      return newText
+    },
+    parseClarify() {
+      const items = this._parseClarifyArray((this.proto && this.proto.clarification_log) || '')
+      if (items.length && items[0] && typeof items[0] === 'object') {
         this.clarifyItems = items
         this.clarifyReplies = items.map(it => (it && (it.resolution || it.answer)) || '')
         this.clarifyParsed = true
@@ -1019,7 +1554,8 @@ export default {
         ...it,
         resolution: (this.clarifyReplies[i] || '').trim(),
       }))
-      const value = JSON.stringify(items, null, 2)
+      const value = this._replaceClarifyJsonInRaw(
+        (this.proto && this.proto.clarification_log) || '', JSON.stringify(items, null, 2))
       try {
         await request({
           url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
@@ -1028,8 +1564,16 @@ export default {
         this.proto.clarification_log = value
         await this.refresh()
         this.$message.success('澄清回复已保存')
+        this.warnApprovalInvalidated()
       } catch (e) {
         this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+    /** 澄清/测试点改动后，若原生成批准已失效，提示需重新批准 */
+    warnApprovalInvalidated() {
+      const g = this.proto && this.proto.generation_gate
+      if (g && g.approved && g.fingerprint_matches === false) {
+        this.$message.warning('内容已变更，原「批准生成」已失效，需重新批准后再生成最终用例')
       }
     },
     toggleRawEdit() {
@@ -1168,6 +1712,123 @@ export default {
       if (this.editField === 'risks_json') {
         this.riskReplies = (this.parsedRiskItems || []).map(it => (it && it.mitigation) || '')
       }
+      // ── 合并测试点 final_testpoints_json：填充稳定工作数组（供删除/修改真正落库）──
+      if (this.editField === 'final_testpoints_json') {
+        this.rebuildTpEditItems()
+      }
+      // ── 需求澄清 clarification_log：构建逐条编辑数组 ──
+      if (this.editField === 'clarification_log') {
+        this.buildClarifyEditItems()
+      }
+    },
+    // ---------- 编辑弹窗：需求澄清逐条编辑 ----------
+    buildClarifyEditItems() {
+      const items = this._parseClarifyArray(this.editFieldValue)
+      this.clarifyEditItems = items.map(it => ({
+        ...(it && typeof it === 'object' ? it : { value: it }),
+        resolution: (it && (it.resolution || it.answer)) || '',
+        _raw: JSON.stringify(it, null, 2),
+      }))
+    },
+    clearAllClarifyResolutions() {
+      this.clarifyEditItems = this.clarifyEditItems.map(it => ({ ...it, resolution: '' }))
+      this.$message.info('已清空结论，点「💾 保存全部结论」才会生效')
+    },
+    async saveClarifyEditItems() {
+      if (!this.clarifyEditItems.length) return
+      const merged = this.clarifyEditItems.map(it => {
+        const { _raw, ...rest } = it
+        if (_raw && _raw.trim()) {
+          try {
+            const p = JSON.parse(_raw)
+            if (p && typeof p === 'object') return { ...p, resolution: (it.resolution || '').trim() }
+          } catch (e) { /* 原始 JSON 非法 → 回退用结构化字段 */ }
+        }
+        return { ...rest, resolution: (it.resolution || '').trim() }
+      })
+      const value = this._replaceClarifyJsonInRaw(this.editFieldValue, JSON.stringify(merged, null, 2))
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+          data: { field: 'clarification_log', value },
+        })
+        this.proto.clarification_log = value
+        this.editFieldValue = value
+        this.clearDraft('clarification_log')
+        this.buildClarifyEditItems()
+        await this.refresh()
+        this.$message.success('澄清结论已保存')
+        this.warnApprovalInvalidated()
+      } catch (e) {
+        this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+
+    // 从 editFieldValue 解析出测试点数组并填充 tpEditItems（兼容裸数组 / {testpoints:[...]} 包裹）
+    parseTpArray() {
+      try {
+        const v = JSON.parse(this.editFieldValue || 'null')
+        if (Array.isArray(v)) return { arr: v, wrapped: false }
+        if (v && Array.isArray(v.testpoints)) return { arr: v.testpoints, wrapped: true }
+        return { arr: [], wrapped: false }
+      } catch (e) { return { arr: [], wrapped: false } }
+    },
+
+    rebuildTpEditItems() {
+      const { arr } = this.parseTpArray()
+      this.tpEditItems = arr.map(tp => ({ ...tp, _raw: JSON.stringify(tp, null, 2) }))
+    },
+
+    addTpItem() {
+      this.tpEditItems.push({ title: '新测试点', _raw: JSON.stringify({ title: '新测试点', description: '' }, null, 2) })
+    },
+
+    removeTpItem(i) {
+      if (i >= 0 && i < this.tpEditItems.length) {
+        this.tpEditItems.splice(i, 1)
+        this.$message.info(`已删除第 ${i + 1} 条测试点（保存后生效）`)
+      }
+    },
+
+    // 主页面直接删除某条测试点：解析→移除→重建→PATCH 落库
+    async removeMainTpItem(i) {
+      const raw = this.proto && this.proto.final_testpoints_json
+      if (!raw) return
+      let arr = []
+      let wrapped = null
+      try {
+        const v = JSON.parse(raw)
+        if (Array.isArray(v)) {
+          arr = v
+        } else if (v && Array.isArray(v.testpoints)) {
+          arr = v.testpoints
+          wrapped = v
+        } else {
+          this.$message.error('测试点数据格式无法解析')
+          return
+        }
+      } catch (e) {
+        this.$message.error('测试点数据格式无法解析')
+        return
+      }
+      if (i < 0 || i >= arr.length) return
+      const removed = arr[i]
+      arr.splice(i, 1)
+      const value = wrapped ? JSON.stringify({ ...wrapped, testpoints: arr }, null, 2)
+                           : JSON.stringify(arr, null, 2)
+      this.removingTpIndex = i
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+          data: { field: 'final_testpoints_json', value },
+        })
+        this.proto.final_testpoints_json = value
+        this.$message.success(`已删除测试点「${(removed && removed.title) || ('#' + (i + 1))}」`)
+      } catch (e) {
+        this.$message.error('删除失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.removingTpIndex = -1
+      }
     },
     // ---------- PCI 子问题拆解与逐条解答 ----------
     // 纯前端本地快速拆分（按中文标点，零等待）
@@ -1180,26 +1841,26 @@ export default {
         if (savedSubs.length) {
           this.pciSubQuestions[i] = savedSubs.map(s => ({
             question: s.question,
-            answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
+            answer: s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
             confirmed: !!s.confirmed,
             _loading: false,
-            _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+            _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
           }))
           return
         }
         // 2) 回退：无 sub_questions 时按 description 中文标点拆分
         const desc = (pci.description || '').trim()
         if (!desc) {
-          this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.resolution_condition || ''), confirmed: false, _loading: false, _aiDraft: !!(pci.answer || pci.resolution_condition || '').trim() }]
+          this.pciSubQuestions[i] = [{ question: '(无描述内容)', answer: (pci.answer || pci.suggested_answer || pci.resolution_condition || ''), confirmed: false, _loading: false, _aiDraft: !!(pci.answer || pci.suggested_answer || pci.resolution_condition || '').trim() }]
           return
         }
         const parts = desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean)
         const items = parts.map(p => ({
           question: p,
-          answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+          answer: pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
           confirmed: false,
           _loading: false,
-          _aiDraft: !!(pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+          _aiDraft: !!(pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
         }))
         this.pciSubQuestions[i] = items.length ? items : [{ question: desc, answer: '', confirmed: false, _loading: false, _aiDraft: false }]
       })
@@ -1219,10 +1880,10 @@ export default {
           if (savedSubs.length) {
             this.pciSubQuestions[i] = savedSubs.map(s => ({
               question: s.question,
-              answer: s.answer || pci.answer || pci.resolution_condition || pci.resolution || '',
+              answer: s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
               confirmed: !!s.confirmed,
               _loading: false,
-              _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+              _aiDraft: !(s.answer || '').trim() && !!(s.answer || pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
             }))
             return
           }
@@ -1231,10 +1892,10 @@ export default {
           const parts = desc ? desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean) : ['(无描述内容)']
           const items = (parts.length ? parts : [desc || '(无描述内容)']).map(q => ({
             question: q,
-            answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+            answer: pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
             confirmed: false,
             _loading: false,
-            _aiDraft: !!(pci.answer || pci.resolution_condition || pci.resolution || '').trim(),
+            _aiDraft: !!(pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '').trim(),
           }))
           this.pciSubQuestions[i] = items
         } else {
@@ -1474,6 +2135,50 @@ export default {
         this.editDialogVisible = false
         return
       }
+      // 需求澄清（结构化模式）：走逐条结论保存，避免只保存原文导致结论丢失
+      if (this.editField === 'clarification_log' && !this.editRawMode) {
+        await this.saveClarifyEditItems()
+        this.editDialogVisible = false
+        return
+      }
+      // ── 合并测试点 final_testpoints_json：从 tpEditItems（已删除/已修改）重建并保存 ──
+      if (this.editField === 'final_testpoints_json') {
+        const { wrapped } = this.parseTpArray()
+        // 剥离 _raw 内部字段，还原纯测试点对象
+        const clean = (this.tpEditItems || []).map(tp => {
+          const { _raw, ...rest } = tp
+          return rest
+        })
+        // 兼容裸数组 / {testpoints:[...]} 包裹：写回原容器结构
+        let value = ''
+        try {
+          const v = JSON.parse(this.editFieldValue || 'null')
+          if (wrapped && v && typeof v === 'object') {
+            v.testpoints = clean
+            value = JSON.stringify(v, null, 2)
+          } else {
+            value = JSON.stringify(clean, null, 2)
+          }
+        } catch (e) {
+          value = JSON.stringify(clean, null, 2)
+        }
+        try {
+          await request({
+            url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+            data: { field: 'final_testpoints_json', value },
+          })
+          this.proto.final_testpoints_json = value
+          this.editFieldValue = value
+          this.rebuildTpEditItems()
+          this.clearDraft('final_testpoints_json')
+          this.$message.success('合并测试点已保存')
+        } catch (e) {
+          this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
+          return
+        }
+        this.editDialogVisible = false
+        return
+      }
       try {
         await request({
           url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
@@ -1644,10 +2349,24 @@ export default {
         return (JSON.parse(this.proto?.qa_log || '[]')).filter(i => i.stage === stage)
       } catch (e) { return [] }
     },
+    async loadProjects() {
+      this.loadingProjects = true
+      try {
+        const res = await request({ url: '/projects/all/', method: 'get' })
+        this.projects = (Array.isArray(res.data) ? res.data : (res.data.results || []))
+      } catch (e) {
+        this.projects = []
+      } finally {
+        this.loadingProjects = false
+      }
+    },
     async loadHistory() {
       this.loadingHistory = true
       try {
-        const res = await request({ url: `${this.base()}/list/`, method: 'get' })
+        const params = {}
+        if (this.filterProject) params.project = this.filterProject
+        if (this.filterVersion) params.version = this.filterVersion
+        const res = await request({ url: `${this.base()}/list/`, method: 'get', params })
         const data = res.data
         if (Array.isArray(data)) {
           // 兼容旧接口（直接返回数组）
@@ -1663,21 +2382,32 @@ export default {
         this.loadingHistory = false
       }
     },
-    async onContinue(row) {
-      this.protoId = row.id
-      this.proto = row
-      this.step = row.current_stage || 0
-      // 若仍在进行中，启动轮询
-      const s = row.status
-      if (['extracting', 'structuring', 'clarifying', 'designing'].includes(s)) {
-        this.busy = true
-        this.startPoll()
-      } else {
-        this.busy = false
-        this.stopPoll()
+    async onFilterProjectChange(pid) {
+      this.filterVersion = null
+      this.versions = []
+      if (!pid) {
+        this.loadHistory()
+        return
       }
-      await this.refresh()
-      this.$message.success(`已恢复流程「${row.title}」`)
+      try {
+        const res = await request({ url: `/versions/projects/${pid}/versions/`, method: 'get' })
+        this.versions = res.data.results || res.data || []
+      } catch (e) {
+        this.versions = []
+      }
+      this.loadHistory()
+    },
+    async onContinue(row) {
+      // 二级页路由：跳转到画布工作页（独立 URL），由工作页 mounted 载入
+      this.$router.push({ name: 'ModaoCanvas', params: { id: row.id } })
+    },
+    goBackList() {
+      // 返回首页任务列表（modao-skill）
+      this.$router.push({ name: 'ModaoSkill' })
+    },
+    goCanvasBoard() {
+      // 进入画布任务看板（每个画布作为独立任务分支）
+      this.$router.push({ name: 'ModaoCanvasBoard', params: { id: this.protoId } })
     },
     async onResetWorkflow(row) {
       try {
@@ -1733,7 +2463,7 @@ export default {
         this.terminating = false
       }
     },
-    async onReExtract() {
+    async onReExtract(targetPageNames) {
       if (this.isRunning || this.busy) return
       if (!this.protoId) return this.onCreate()
       this.busy = true
@@ -1742,7 +2472,13 @@ export default {
           ? (this.form.webshare_url || '').split('\n').map(s => s.trim()).filter(Boolean)
           : (this.form.url || '').split('\n').map(s => s.trim()).filter(Boolean)
         const payload = { ...this.form, urls }
+        // 单画布重读：只重读指定画布（画布级回退到读取触发），其余画布保持不变
+        if (targetPageNames && targetPageNames.length) {
+          payload.target_page_names = targetPageNames
+        }
         await request({ url: `${this.base()}/${this.protoId}/extract/`, method: 'post', data: payload })
+        this.canvasConfirmed = false
+        this.canvasActiveId = null
         this.startPoll()
       } catch (e) {
         this.busy = false
@@ -1803,18 +2539,177 @@ export default {
         this.$message.error('创建失败：' + (e.response?.data?.detail || e.message))
       }
     },
-    async runStage(action) {
+    async runStage(action, extra = {}) {
       if (this.isRunning || this.busy) return
       this.busy = true
       try {
-        await request({ url: `${this.base()}/${this.protoId}/${action}/`, method: 'post', data: this.form })
+        await request({ url: `${this.base()}/${this.protoId}/${action}/`, method: 'post', data: { ...this.form, ...extra } })
         this.startPoll()
       } catch (e) {
         this.busy = false
         this.$message.error('启动失败：' + (e.response?.data?.detail || e.message))
       }
     },
-    onStruct() { this.runStage('struct') },
+    // 启动结构化前先落库当前画布勾选：勾选后不点「保存校验结果」直接点结构化时，
+    // 后端 _selected_page_names() 会读不到勾选而回退全选，导致「只选1个画布、摘要却是整个版本」。
+    async persistCanvasSelection() {
+      if (this.isRunning || this.busy) return false
+      const rawPages = (this.proto && this.proto.pages) || []
+      if (!rawPages.some(c => c.selected && !c._delete)) {
+        this.$message.warning('至少需勾选一个画布')
+        return false
+      }
+      const dirty = rawPages.filter(c => c._dirty)
+      if (dirty.length) {
+        this.busy = true
+        try {
+          await request({
+            url: `${this.base()}/${this.protoId}/update-pages/`,
+            method: 'post',
+            data: {
+              pages: dirty.map(c => ({
+                id: c.id,
+                selected: c.selected,
+                page_name: c.page_name,
+                parent_name: c.parent_name || '',
+                recognition_note: c.recognition_note || '',
+                delete: !!c._delete,
+              })),
+            },
+          })
+        } catch (e) {
+          this.busy = false
+          this.$message.error('画布选择保存失败：' + (e.response?.data?.detail || e.message))
+          return false
+        }
+        this.busy = false
+      }
+      return true
+    },
+    async onStruct() {
+      if (!(await this.persistCanvasSelection())) return
+      this.runStage('struct')
+    },
+    // 强制全量重跑：force=True 时后端忽略增量跳过，对所有勾选画布重新调用模型。
+    async onReStructAll() {
+      if (this.isRunning || this.busy) return
+      if (!(await this.persistCanvasSelection())) return
+      try {
+        await this.$confirm('将忽略已生成的画布摘要，对所有勾选画布强制重新结构化（重新调用模型，耗时与费用更高）。确认继续？', '重新结构化全部', { type: 'warning' })
+        this.runStage('struct', { force: true })
+      } catch (e) { /* 用户取消 */ }
+    },
+    // 阶段1：预览将要导出的 XMind 结构（与后端导出层级一致）
+    onPreviewXmind() {
+      if (!this.proto || !this.proto.requirement_summary) {
+        this.$message.warning('尚未生成结构化摘要，无法预览')
+        return
+      }
+      let tree = []
+      try {
+        const doc = yamlLoad(this.proto.requirement_summary)
+        const modules = (doc && doc.modules) || []
+        const rootTitle = (this.proto.title || '需求结构化').trim() || '需求结构化'
+        const root = { label: rootTitle, children: [] }
+        modules.forEach((m) => {
+          if (!m || !m.name) return
+          const mNode = { label: m.name, children: [] }
+          if (m.priority) mNode.children.push({ label: `⚑ 优先级: ${m.priority}` })
+          if (m.priority_source) mNode.children.push({ label: `📌 优先级来源: ${m.priority_source}` })
+          const kfs = m.key_features || []
+          if (kfs.length) {
+            const kfChildren = kfs.map((f) => {
+              if (typeof f === 'string') return { label: f }
+              const t = f.title || f.name || ''
+              return { label: t + (f.desc || f.description ? `（${f.desc || f.description}）` : '') }
+            }).filter((n) => n.label)
+            if (kfChildren.length) mNode.children.push({ label: '🔑 关键特征', children: kfChildren })
+          }
+          const sps = m.sub_pages || []
+          if (sps.length) {
+            const spChildren = sps.map((s) => ({ label: typeof s === 'string' ? s : (s.title || s.name || '') }))
+              .filter((n) => n.label)
+            if (spChildren.length) mNode.children.push({ label: '📄 子页面', children: spChildren })
+          }
+          root.children.push(mNode)
+        })
+        tree = [root]
+      } catch (e) {
+        // 解析失败不阻断：弹出对话框并在树区展示原始文本，保证有可见反馈
+        this.$message.warning('结构化摘要非标准 YAML，已按原文展示')
+        tree = [{ label: (this.proto.title || '需求结构化'), children: [
+          { label: '（原始摘要）', children: [{ label: this.proto.requirement_summary }] }
+        ] }]
+      }
+      this.xmindPreviewTree = tree
+      this.xmindPreviewVisible = true
+    },
+    // 阶段1：导出结构化摘要为可编辑 XMind
+    async onExportXmind() {
+      if (!this.proto || !this.proto.requirement_summary) {
+        this.$message.warning('尚未生成结构化摘要，无法导出 XMind')
+        return
+      }
+      this.xmindExporting = true
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/export-xmind/`,
+          method: 'get',
+          responseType: 'blob'
+        })
+        const blob = res.data
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        const safeTitle = (this.proto.title || 'requirement').replace(/[\\/:*?"<>|]/g, '_')
+        a.href = url
+        a.download = `${safeTitle}.xmind`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        window.URL.revokeObjectURL(url)
+        this.$message.success('XMind 已导出，可在本地用 XMind 打开编辑')
+      } catch (e) {
+        this.$message.error('导出失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.xmindExporting = false
+      }
+    },
+    triggerXmindUpload() {
+      if (!this.proto || !this.proto.requirement_summary) {
+        this.$message.warning('请先生成结构化摘要再上传 XMind')
+        return
+      }
+      this.$refs.xmindFile && this.$refs.xmindFile.click()
+    },
+    async onXmindFileChange(e) {
+      const file = e.target.files && e.target.files[0]
+      if (!file) return
+      this.xmindImporting = true
+      try {
+        const formData = new FormData()
+        formData.append('file', file)
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/import-xmind/`,
+          method: 'post',
+          data: formData,
+          headers: { 'Content-Type': 'multipart/form-data' }
+        })
+        // 用返回的最新摘要刷新本地展示
+        if (res.data && res.data.requirement_summary) {
+          this.proto.requirement_summary = res.data.requirement_summary
+        } else {
+          const detail = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+          if (detail && detail.data) this.proto = detail.data
+        }
+        this.$message.success(res.data?.detail || 'XMind 已覆盖结构化摘要')
+      } catch (err) {
+        const detail = err.response?.data?.detail || err.message
+        this.$message.error('上传失败：' + detail)
+      } finally {
+        this.xmindImporting = false
+        e.target.value = ''  // 允许重复选同一文件
+      }
+    },
     onClarify() { this.runStage('clarify') },
     onDesign() { this.runStage('design') },
     async onGenerateCases() {
@@ -1906,6 +2801,59 @@ export default {
         this.$message.error('创建失败：' + (e.response?.data?.name?.[0] || e.response?.data?.detail || e.message))
       }
     },
+    // ── A2-c：画布级用例采纳 ──
+    pageCaseGroups(pg) {
+      try {
+        const raw = pg.page_testcases_json
+        if (!raw) return []
+        const v = JSON.parse(raw)
+        const arr = Array.isArray(v) ? v : []
+        const groups = {}
+        arr.forEach((tc, rawIdx) => {
+          const real = tc.testcase || tc
+          const mod = (tc.module || real.module || real.feature_module) || '未分组'
+          if (!groups[mod]) groups[mod] = []
+          groups[mod].push({ ...real, module: mod, _rawIndex: rawIdx })
+        })
+        return Object.keys(groups).map(k => ({ module: k, items: groups[k] }))
+      } catch (e) { return [] }
+    },
+    pageCaseCount(pg) {
+      try {
+        const v = JSON.parse(pg.page_testcases_json || '[]')
+        return Array.isArray(v) ? v.length : 0
+      } catch (e) { return 0 }
+    },
+    async approvePage(pg) {
+      this.approvePagesLoading = true
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/approve-pages/`, method: 'post',
+          data: { page_ids: [pg.id] },
+        })
+        this.$message.success(`已采纳画布「${pg.page_name}」`)
+        await this.refresh()
+      } catch (e) {
+        this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.approvePagesLoading = false
+      }
+    },
+    async approveAllPages() {
+      this.approvePagesLoading = true
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/approve-pages/`, method: 'post',
+          data: { approve_all_selected: true },
+        })
+        this.$message.success('已采纳全部已生成画布，汇总已更新')
+        await this.refresh()
+      } catch (e) {
+        this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.approvePagesLoading = false
+      }
+    },
     async adoptToLibrary(includeSmoke) {
       if (!this.protoId) return
       if (!this.proto || !this.proto.project) {
@@ -1962,6 +2910,8 @@ export default {
         await this.refresh()
         this.showSync(res.data.sync, stage)
         if (stage === 3) this.showKbSync(res.data.kb_sync)
+        // 阶段2 确认后折叠该卡片（仍可展开修改，不再整块隐藏导致失去修改入口）
+        if (stage === 2) this.stage2Collapsed = true
         this.goStep(stage + 1) // 进入下一阶段
       } catch (e) {
         this.$message.error('确认失败：' + (e.response?.data?.detail || e.message))
@@ -1999,15 +2949,119 @@ export default {
       }
     },
     onDownload() {
-      const base = request.defaults.baseURL || '/api'
-      window.open(`${base}${this.base()}/${this.protoId}/excel/`, '_blank')
+      window.open(`${this.base()}/${this.protoId}/excel/`, '_blank')
     },
   },
   mounted() {
-    this.loadHistory()
-    this.loadProjects()
+    this.loadProjects().then(async () => {
+      const rawId = this.id || (this.$route.params && this.$route.params.id) || (this.$route.query && (this.$route.query.id || this.$route.query.protoId))
+      const rid = (rawId !== undefined && rawId !== null && String(rawId) !== 'new') ? rawId : null
+      if (rid) {
+        try {
+          const res = await request({ url: `${this.base()}/${rid}/`, method: 'get' })
+          if (res.data && res.data.id) {
+            this.protoId = res.data.id
+            this.proto = res.data
+            this.step = res.data.current_stage || 0
+            // 从任务列表「继续」进入时，只要任务还处于可编辑的早期阶段，就重新展示画布校验面板，
+            // 避免之前点过「保存校验/跳过」导致 canvasConfirmed=true 后回退无法再选画布。
+            // partial（读取超时中断）同样要露出校验面板与「继续读取」按钮。
+            if (['pending', 'extracted', 'partial', 'structuring', 'clarifying', 'designing'].includes(this.proto.status)) {
+              this.canvasConfirmed = false
+            }
+            const s = res.data.status
+            if (['extracting', 'structuring', 'clarifying', 'designing'].includes(s)) {
+              this.busy = true
+              this.startPoll()
+            } else {
+              this.busy = false
+              this.stopPoll()
+            }
+            await this.refresh()
+            return
+          }
+        } catch (e) {
+          this.$message.error('加载指定历史任务失败：' + (e.response?.data?.detail || e.message))
+        }
+      }
+      // 无 id（或 id='new'）：空态（新建任务），项目列表已加载
+    })
   },
   computed: {
+    // 合并 DB 画布（selected/recognition_note）与 extracted_json 中的识别质量指标
+    canvasPages() {
+      const raw = (this.proto && this.proto.pages) || []
+      let metaMap = {}
+      try {
+        const ex = this.proto && this.proto.extracted_json
+        const data = typeof ex === 'string' ? JSON.parse(ex) : ex
+        const pages = (data && data.pages) || []
+        pages.forEach(p => { metaMap[p.page_no] = p })
+      } catch (e) { metaMap = {} }
+      return raw.map(p => {
+        const m = metaMap[p.page_no] || {}
+        return {
+          ...p,
+          visionAttempted: !!m.vision_attempted,
+          visionSuccess: !!m.vision_success,
+          warnings: m.extraction_warnings || [],
+          duplicate_of_page: m.duplicate_of_page || null,
+        }
+      })
+    },
+    canvasActive() {
+      return this.canvasPages.find(c => c.id === this.canvasActiveId) || null
+    },
+    // 当前画布可预览的截图列表：优先分段图（超长画布），否则单张主图
+    activeShots() {
+      const ca = this.canvasActive
+      if (!ca) return []
+      const segs = ca.screenshot_segments
+      if (Array.isArray(segs) && segs.length) return segs
+      return ca.screenshot ? [ca.screenshot] : []
+    },
+    // 当前展示的分段图（受缩略图切换控制）
+    activeShot() {
+      const shots = this.activeShots
+      if (!shots.length) return ''
+      const idx = Math.min(this.activeShotIdx || 0, shots.length - 1)
+      return shots[idx]
+    },
+    canvasAllSelected() {
+      return this.canvasPages.length > 0 && this.canvasPages.every(c => c.selected)
+    },
+    checkAll: {
+      get() {
+        return this.canvasAllSelected
+      },
+      set(val) {
+        this.toggleSelectAll(val)
+      }
+    },
+    canvasSelectedCount() {
+      return this.canvasPages.filter(c => c.selected).length
+    },
+    // 已读取但未走完所有阶段（current_stage<4）的画布数，用于「继续运行」引导
+    incompleteCanvasCount() {
+      return this.canvasPages.filter(c => (c.current_stage || 0) < 4).length
+    },
+    // 任务已整体完成（done），但仍有画布未走完所有阶段：可继续勾选补跑
+    canContinueCanvas() {
+      return this.proto && this.proto.status === 'done' && this.incompleteCanvasCount > 0
+    },
+    canvasIndeterminate() {
+      const cnt = this.canvasSelectedCount
+      return cnt > 0 && cnt < this.canvasPages.length
+    },
+    isAutoFiltered() {
+      // 后端读取时自动判定为无效画布（recognition_note 以「自动过滤」开头）
+      return (c) => !!(c && c.recognition_note && String(c.recognition_note).startsWith('自动过滤'))
+    },
+    filterVersions() {
+      // 历史列表「版本」下拉只展示所选项目下的版本
+      if (!this.filterProject) return []
+      return this.versions.filter(v => v.project === this.filterProject || v.project_id === this.filterProject || String(v.project) === String(this.filterProject))
+    },
     // 以服务端 proto.status 为权威依据：任务运行中（含未终止）则禁止再次触发，
     // 防止连点/刷新后组件重挂导致 busy 被清零而并发启动多个 run。
     isRunning() {
@@ -2015,6 +3069,9 @@ export default {
     },
     clarificationUnresolvedCount() {
       return this.proto?.generation_gate?.unresolved_count || 0
+    },
+    stage2Confirmed() {
+      return !!(this.proto?.generation_gate?.stage2_confirmed)
     },
     generationGateReasons() {
       return this.proto?.generation_gate?.reasons || []
@@ -2183,7 +3240,7 @@ export default {
         const parts = desc ? desc.split(/\s*(?:且|以及|；|,)\s*/).map(s => s.trim()).filter(Boolean) : ['(无描述内容)']
         const items = (parts.length ? parts : [desc || '(无描述内容)']).map(q => ({
           question: q,
-          answer: pci.answer || pci.resolution_condition || pci.resolution || '',
+          answer: pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || '',
           confirmed: false,
           _loading: false,
         }))
@@ -2250,7 +3307,7 @@ export default {
         const impact = (pci.impact || 'low').toLowerCase()
         if (filter !== 'all' && filter !== impact) return
         const subs = pci.sub_questions
-        const fallbackAnswer = pci.answer || pci.resolution_condition || pci.resolution || ''
+        const fallbackAnswer = pci.answer || pci.suggested_answer || pci.resolution_condition || pci.resolution || ''
         if (Array.isArray(subs) && subs.length) {
           subs.forEach((s, j) => {
             out.push({
@@ -2341,6 +3398,21 @@ export default {
         return { groups: Object.keys(groups).map(k => ({ module: k, items: groups[k] })), total }
       } catch (e) { return { groups: [], total: 0 } }
     },
+    // ── A2-c：画布级用例（按选中子集分别生成，各自一份）──
+    canvasWithCases() {
+      try {
+        const pages = (this.proto && this.proto.pages) || []
+        return pages.filter(p => p.page_testcases_json && p.page_testcases_json.trim() && p.page_testcases_json.trim() !== '[]')
+      } catch (e) { return [] }
+    },
+    mergedCaseCount() {
+      try {
+        const raw = this.proto && this.proto.merged_testcases_json
+        if (!raw) return 0
+        const v = JSON.parse(raw)
+        return Array.isArray(v) ? v.length : 0
+      } catch (e) { return 0 }
+    },
     // ── 主页面：冒烟用例（同测试用例结构）──
     mainPageSmoke() {
       try {
@@ -2371,16 +3443,27 @@ export default {
         return JSON.parse(raw)
       } catch (e) { return null }
     },
+    // 历史筛选：按当前选中项目过滤出的版本列表（onFilterProjectChange 已填充 this.versions）
+    filterVersions() {
+      return this.versions || []
+    },
   },
 }
 </script>
 
 <style scoped>
-.modao-skill { padding: 20px 28px; max-width: 1100px; margin: 0 auto; }
+.modao-skill { padding: 20px; max-width: none; }
+.canvas-page-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 20px 12px; max-width: none;
+}
+.canvas-page-title { font-size: 15px; font-weight: 600; color: #1f2937; }
 .page-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .page-header h2 { margin: 0 4px 0 0; }
 .header-actions { margin-left: auto; display: flex; gap: 8px; }
 .history-card { margin: 16px 0; }
+.history-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.history-filters { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .empty-hint { color: #999; font-size: 13px; padding: 8px 0; }
 .subtitle { color: #888; margin: 0 0 16px; font-size: 13px; }
 .steps { margin-bottom: 22px; }
@@ -2690,5 +3773,89 @@ export default {
 .pci-sub-foot {
   display: flex; align-items: center; gap: 12px; margin-top: 8px;
   padding-top: 8px; border-top: 1px dashed #e5e7eb;
+}
+/* 画布模块校验 */
+.canvas-review-body {
+  display: flex; gap: 16px; margin-top: 14px; align-items: flex-start;
+  min-height: 520px;
+}
+.canvas-list {
+  flex: 0 0 280px; max-height: calc(100vh - 240px); min-height: 480px; overflow-y: auto; border: 1px solid #e5e7eb;
+  border-radius: 8px; padding: 10px; background: #fafafa;
+}
+.canvas-list-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid #eee;
+}
+.canvas-count { font-size: 12px; color: #909399; }
+.canvas-card {
+  border: 1px solid #e4e7ed; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px;
+  background: #fff; cursor: pointer; transition: all .15s;
+}
+.canvas-card:hover { border-color: #c0c4cc; }
+.canvas-card.active { border-color: #409eff; box-shadow: 0 0 0 2px rgba(64,158,255,.15); }
+.canvas-card.unchecked { opacity: .6; background: #f4f4f5; }
+.canvas-card.auto-filtered { border-style: dashed; background: #f7f8fa; opacity: .85; }
+.auto-filter-tag { background: #f0f2f5; color: #909399; border-color: #e4e7ed; }
+.canvas-auto-filter-reason {
+  margin: 4px 0 0 28px; font-size: 11px; color: #a8abb2; line-height: 1.4;
+}
+.canvas-card-head { display: flex; align-items: center; gap: 6px; }
+.canvas-no {
+  font-size: 12px; font-weight: 700; color: #409eff; min-width: 22px;
+  font-family: monospace;
+}
+.canvas-name-input { flex: 1; }
+.canvas-card-meta { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 4px 28px; }
+.canvas-card-accuracy { display: flex; gap: 6px; margin-left: 28px; align-items: center; }
+.canvas-card-progress { margin: 6px 0 4px 28px; }
+.canvas-card-progress :deep(.el-step__title) { font-size: 11px; }
+.canvas-card-progress :deep(.el-step__icon) { width: 18px; height: 18px; }
+.canvas-card-progress :deep(.el-step__icon-inner) { font-size: 11px; }
+.canvas-preview {
+  flex: 1; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px;
+  background: #fff; max-height: calc(100vh - 240px); min-height: 480px; overflow-y: auto;
+}
+.canvas-preview.empty {
+  display: flex; align-items: center; justify-content: center;
+  color: #909399; font-size: 13px; min-height: 200px;
+}
+.canvas-preview-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px;
+}
+.canvas-preview-no { font-size: 12px; color: #909399; }
+.canvas-preview-img {
+  max-width: 100%; border: 1px solid #eee; border-radius: 6px; margin-bottom: 12px;
+  background: #f5f5f5; cursor: zoom-in;
+}
+.canvas-preview-img :deep(img) {
+  max-width: 100%; display: block;
+}
+.canvas-preview-noshot {
+  color: #909399; font-size: 13px; padding: 20px; text-align: center;
+  border: 1px dashed #dcdfe6; border-radius: 6px; margin-bottom: 12px;
+}
+.canvas-preview-segs {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;
+}
+.canvas-preview-seg {
+  position: relative; width: 88px; height: 66px; border: 2px solid #e5e7eb;
+  border-radius: 6px; overflow: hidden; cursor: pointer; flex: none;
+  transition: border-color .15s;
+}
+.canvas-preview-seg:hover { border-color: #c0c4cc; }
+.canvas-preview-seg.active { border-color: #409eff; }
+.canvas-preview-seg-img { width: 100%; height: 100%; display: block; }
+.canvas-preview-seg-no {
+  position: absolute; right: 2px; bottom: 2px; background: rgba(0,0,0,.55);
+  color: #fff; font-size: 10px; line-height: 1; padding: 2px 4px; border-radius: 3px;
+}
+.canvas-preview-subtitle {
+  font-weight: 600; font-size: 13px; color: #303133; margin: 10px 0 4px;
+}
+.canvas-preview-text .md-box { font-size: 12px; max-height: 300px; overflow-y: auto; }
+.canvas-preview-text .md-box.warn { color: #e6a23c; }
+.canvas-review-actions {
+  display: flex; gap: 12px; margin-top: 14px;
 }
 </style>

@@ -86,6 +86,38 @@ TestHub 是一套前后端分离的智能测试管理与自动化执行平台，
 - 双路融合禁止对全部页面做固定长度的整体截断；按完整页面分批，单页极端超长时才分片。视觉未执行、视觉失败率超过 20%、融合结果为空或超过 20% 页面缺少 `source_pages` 证据时，阶段 0 必须阻断。
 - 使用真实私有原型做端到端视觉/LLM 回归会把截图和 DOM 派生内容发送给所配置的第三方模型服务，执行前需获得用户对该数据外发的明确批准；无批准时只做本地模拟和无模型导航验证。
 
+## Skill 注册表
+
+> 单一事实源：本仓库的“skill / 提示词能力”分散在 4 处、2 种格式。下表为统一注册表；新增、修改或迁移 skill 时必须同步更新本表，避免注册表与磁盘不一致。
+
+### 注册清单
+
+| 名称 | 类型 | 位置 | 格式 | 由谁加载 | 维护方式 | 备注 |
+|------|------|------|------|----------|----------|------|
+| appium-android-capture | Agent Skill | `.codebuddy/skills/appium-android-capture/` | SKILL.md（标准） | AI 助理直接加载 | 编辑 SKILL.md/scripts；改后重新打包到 `skills-dist/` | Appium 流水线阶段1 |
+| appium-android-run-pytest | Agent Skill | `.codebuddy/skills/appium-android-run-pytest/` | SKILL.md（标准） | AI 助理直接加载 | 同上 | 阶段2 |
+| appium-android-allure-report | Agent Skill | `.codebuddy/skills/appium-android-allure-report/` | SKILL.md（标准） | AI 助理直接加载 | 同上 | 阶段3 |
+| mobile-app-autotest | Agent Skill（导入·参考） | `_ext/mobile-app-autotest/mobile-app-autotest/` | SKILL.md（标准） | **未直接加载**（`_ext/` 非自动加载路径，仅作参考/待用） | 编辑 SKILL.md；`.cursor/` 路径残留已修 | **通用参考、非默认**；与 1/2/3 重叠，主线以 appium-android-* 为准 |
+| modao_skill | 应用内自定义 Skill | `apps/requirement_analysis/modao_skill/` | 文件夹式（无 SKILL.md） | requirement_analysis 应用（modao_views.py 等） | 编辑 prompts/templates/tools/workflow；改后 `docker-compose build backend && docker rm -f testhub-backend && docker-compose up -d backend` | 墨刀原型→测试用例 |
+| tester*.md 提示词库 | 提示词库 | 根目录 `tester.md` / `tester_pro.md` / `tester_new.md` / `tester_analyzer.md` | Markdown 角色提示词 | 用例生成后端代码（运行期经 `BASE_DIR/tester*.md` 读取，且根目录那份会进镜像） | 编辑文案；**运行期真源是根目录 `tester*.md`（已进镜像），`_ext/.../docs/tester*.md` 不进镜像、后端也不读，仅为本地/上游镜像，清理时以根目录为准** | 根目录与 `_ext` 为双源，但仅根目录那份生效 |
+| ai-case-generation-module | git 子仓 | `_ext/ai-case-generation-module/` | git 仓（apps/ + frontend/ + docs/） | 需求分析/用例生成功能 | `cd _ext/ai-case-generation-module && git pull`（浅克隆，必要时 `git fetch --unshallow`） | “AI 用例生成模块”源码 |
+| skills-dist | 分发包 | `skills-dist/` | zip 包 + README | 分发到其他仓库 | 由 `skill-creator/scripts/package_skill.py` 从 `.codebuddy/skills/` 重新生成 | 仅 3 个 Appium skill 的打包版 |
+
+### Skill 维护约定
+
+- **统一入口**：所有“标准 Agent Skill”放 `.codebuddy/skills/<name>/SKILL.md`；应用内能力放 `apps/<app>/<name>/`（文件夹式）；需要跨仓分发再打包进 `skills-dist/`。
+- **改完必打包**：修改 `.codebuddy/skills/` 下任一 Appium skill 后，必须重新执行 `package_skill.py` 更新 `skills-dist/`，否则分发的是旧版。Windows 下先 `set PYTHONIOENCODING=utf-8` 避免 emoji 编码报错。
+- **改完必重建对应环境**：`modao_skill/` 与根目录 `tester*.md` 属于进镜像的应用代码，任何改动必须对该环境执行 `docker-compose build backend && docker rm -f testhub-backend && docker-compose up -d backend` 后才生效；dev/prod 各自独立，未重建部署的环境不受影响。`.codebuddy/skills/`、`_ext/`、`skills-dist/` 不进镜像，改了无需重建。
+- **App 自动化主线唯一**：仓库标准 App 自动化 = `.codebuddy/skills/` 下的 `appium-android-*`（capture → run-pytest → allure-report，基于 `appium_workspace/` + pytest + Allure）。`mobile-app-autotest`（`_ext/`）为通用参考技能、非默认，仅当用户明确要求 iOS / 云真机 / Java / TypeScript 等多语言工程时启用；其 `description` 已收窄触发词，不会与主线抢请求。
+- **提示词单源（以根目录为准）**：运行期真源为根目录 `tester*.md`（进镜像、后端经 `BASE_DIR/tester*.md` 读取）；`_ext/ai-case-generation-module/docs/tester*.md` 不进镜像、后端不读，仅本地/上游镜像，已加注释标注、不作为维护真源。改提示词只改根目录，禁止双源并行维护。
+- **新增 / 删除 / 迁移**：先在 CODEBUDDY.md 本表登记或更新，再落地文件，保证注册表与磁盘一致。
+
+### 已知待办（注册时发现）
+
+- ~~`mobile-app-autotest` 的 SKILL.md 引用 `.cursor/skills/...`~~ ✅ 已修复（改为 `_ext/mobile-app-autotest/mobile-app-autotest/scripts/`）。
+- ~~1/2/3 与 `mobile-app-autotest` 功能重叠~~ ✅ 已定主线：App 自动化默认主线 = `appium-android-*`（1/2/3）；`mobile-app-autotest` 降为通用参考（非默认），其 `description` 已收窄触发词、SKILL.md 已加 STATUS 标注，不会抢标准 Android 请求。
+- ~~根目录 `tester*.md` 与 `_ext/.../tester*.md` 双源~~ ✅ 已处理：运行期只认根目录；`_ext` 两份加注释标注、保留不删（用户决策：保持标注、不从上游同步时直接删），维护以根目录为准。
+
 ## 目录速览
 
 ```text

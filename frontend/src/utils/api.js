@@ -40,44 +40,19 @@ api.interceptors.request.use(
 
     // 如果有access token
     if (userStore.accessToken) {
-      // 检查token是否即将过期（5分钟内）
+      // 检查token是否即将过期（5分钟内）——但不在拦截器里刷新，避免与 startGeneration 主动刷新冲突导致重复刷新失败
+      // 如果 token 已经过期，放行让后端返回 401，由响应拦截器兜底处理
       if (userStore.isTokenExpiringSoon && !userStore.isTokenExpired) {
-        // 如果没有正在刷新，开始刷新
-        if (!isRefreshing) {
-          isRefreshing = true
-          console.log('Token即将过期，开始刷新...')
-
-          try {
-            const newToken = await userStore.refreshAccessToken()
-            console.log('Token刷新成功')
-            processQueue(null, newToken)
-
-            // 更新当前请求的token
-            config.headers.Authorization = `Bearer ${newToken}`
-          } catch (error) {
-            console.error('Token刷新失败:', error)
-            processQueue(error, null)
-            // 刷新失败会在user store中自动logout
-            return Promise.reject(error)
-          } finally {
-            isRefreshing = false
-          }
-        } else {
-          // 如果正在刷新，将请求加入队列
-          console.log('Token正在刷新，请求加入队列等待...')
-          return new Promise((resolve, reject) => {
-            failedQueue.push({ resolve, reject })
-          }).then(token => {
-            config.headers.Authorization = `Bearer ${token}`
-            return config
-          }).catch(err => {
-            return Promise.reject(err)
-          })
-        }
+        // 不主动刷新，直接放行当前请求
       }
 
       // 使用Bearer token格式
       config.headers.Authorization = `Bearer ${userStore.accessToken}`
+    }
+
+    // FormData（文件上传）：删除硬编码的 application/json，让浏览器自动设置 multipart boundary
+    if (config.data instanceof FormData) {
+      delete config.headers['Content-Type']
     }
 
     return config
@@ -95,6 +70,12 @@ api.interceptors.response.use(
   async (error) => {
     const userStore = useUserStore()
     const originalRequest = error.config
+
+    // 如果正在用例生成流程中（由 startGeneration 设置标记），401 不跳转，直接 reject 让业务层处理
+    if (window.__generation_flow && error.response?.status === 401) {
+      console.warn('[api.js] 用例生成流程中遇到 401，不跳转，交由业务层处理')
+      return Promise.reject(error)
+    }
 
     // 如果是401错误且不是刷新token的请求
     if (error.response?.status === 401 && !originalRequest._retry) {

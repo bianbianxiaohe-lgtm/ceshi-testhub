@@ -1,0 +1,642 @@
+<template>
+  <div class="canvas-board">
+    <div class="page-header">
+      <div class="header-left">
+        <el-button size="small" plain @click="goBack">← 返回任务列表</el-button>
+        <h2>📂 画布任务看板</h2>
+      </div>
+      <div class="header-right">
+        <span v-if="proto" class="proto-title">{{ proto.title || ('原型 #' + protoId) }}</span>
+        <el-button size="small" type="primary" plain @click="goToPipeline">📊 主流水线</el-button>
+        <el-button size="small" type="success" plain @click="goToCaseMerge">🧪 用例集合</el-button>
+        <el-button size="small" @click="loadDetail" :loading="loading">刷新</el-button>
+      </div>
+    </div>
+
+    <el-tabs v-model="activeTab" class="board-tabs">
+      <!-- ============ Tab1：画布任务看板（按画布独立分支） ============ -->
+      <el-tab-pane label="画布任务看板" name="board">
+        <!-- 文件夹筛选 -->
+        <div class="folder-filter-bar" v-if="folderGroups.length">
+          <el-select v-model="folderFilter" placeholder="按文件夹筛选" clearable size="small" style="width: 240px">
+            <el-option label="全部文件夹" value="" />
+            <el-option v-for="fg in folderGroups" :key="fg.path" :label="fg.path || '未分组'" :value="fg.path" />
+          </el-select>
+          <span class="folder-count">共 {{ filteredPages.length }} 个画布 / {{ folderGroups.length }} 个文件夹</span>
+        </div>
+
+        <div v-if="!pages.length" class="empty-tip">
+          <el-empty description="尚无画布数据，请先在主流程运行读取阶段" />
+        </div>
+        <div v-else class="folder-groups">
+          <div v-for="fg in filteredFolderGroups" :key="fg.path || '__ungrouped__'" class="folder-group">
+            <div class="folder-header">
+              <div class="folder-title">
+                <el-checkbox v-model="fg.allSelected" @change="onFolderSelectAll(fg)" :indeterminate="fg.indeterminate">
+                  {{ fg.path || '未分组' }} ({{ fg.pages.length }})
+                </el-checkbox>
+              </div>
+              <div class="folder-actions">
+                <el-button size="mini" type="primary" :disabled="!fg.selectedCount" @click="onFolderBatchAction(fg, 'clarify')">
+                  🔍 澄清 ({{ fg.selectedCount }})
+                </el-button>
+                <el-button size="mini" type="success" :disabled="!fg.selectedCount" @click="onFolderBatchAction(fg, 'design')">
+                  📐 测试设计
+                </el-button>
+                <el-button size="mini" type="warning" :disabled="!fg.selectedCount" @click="onFolderBatchAction(fg, 'generate-cases')">
+                  📋 用例
+                </el-button>
+              </div>
+            </div>
+            <div class="canvas-grid">
+              <el-card v-for="p in fg.pages" :key="p.id" class="canvas-card" shadow="hover"
+                :class="{ 'is-failed': p.stage_status === 'failed', 'is-active': p.stage_status === 'extracting', 'is-selected': p.selected }">
+                <el-image v-if="p.screenshot" class="card-thumb" :src="shotUrl(p.screenshot)"
+                  :preview-src-list="shotPreviewList(p)" :initial-index="0" fit="contain" hide-on-click-modal>
+                  <template #error><div class="thumb-error">截图加载失败</div></template>
+                </el-image>
+                <div class="card-thumb thumb-empty" v-else>
+                  <span>暂无截图</span>
+                </div>
+                <div class="card-head">
+                  <div class="card-title">
+                    <el-checkbox v-model="p.selected" @change="onCanvasSelect(p, fg)" style="margin-right: 8px" />
+                    <span class="page-no">P{{ p.page_no }}</span>
+                    <span class="page-name">{{ p.page_name || '未命名画布' }}</span>
+                  </div>
+                  <el-tag :type="stageMeta(p.current_stage, p.stage_status).type" size="small">
+                    {{ stageMeta(p.current_stage, p.stage_status).label }}
+                  </el-tag>
+                </div>
+                <el-progress class="card-progress" :percentage="Math.round(p.current_stage / 4 * 100)"
+                  :status="p.stage_status === 'failed' ? 'exception' : ''" :stroke-width="8" />
+                <div class="card-meta">
+                  <span>识别摘要：{{ p.recognition_note || '无' }}</span>
+                </div>
+                <div v-if="p.error_message" class="card-error">⚠ {{ p.error_message }}</div>
+                <div class="card-actions">
+                  <el-button type="primary" size="small" @click="openCanvas(p)">进入当前阶段</el-button>
+                  <el-button size="small" @click="openCanvas(p)">查看产物</el-button>
+                </div>
+              </el-card>
+            </div>
+          </div>
+        </div>
+      </el-tab-pane>
+
+      <!-- ============ Tab2：跨画布用例集合 ============ -->
+      <el-tab-pane label="用例集合" name="cases">
+        <div class="cases-toolbar">
+          <el-select v-model="caseFilter" placeholder="按画布筛选" clearable size="small" style="width: 260px">
+            <el-option label="全部画布" value="all" />
+            <el-option v-for="p in pages" :key="p.id" :label="(p.parent_name ? (p.parent_name + ' / ') : '') + (p.page_name || ('P' + p.page_no))"
+              :value="p.id" />
+          </el-select>
+          <span class="cases-count">共 {{ filteredCases.length }} 条正式用例 / {{ filteredSmoke.length }} 条冒烟</span>
+        </div>
+
+        <el-empty v-if="!filteredCases.length && !filteredSmoke.length" description="尚无任何用例产物" />
+        <div v-else class="cases-wrap">
+          <el-collapse v-model="caseGroups" accordion>
+            <el-collapse-item v-for="grp in groupedCases" :key="grp.key" :name="grp.key" :title="grp.title">
+              <el-table :data="grp.items" size="small" border stripe max-height="520">
+                <el-table-column type="index" width="48" />
+                <el-table-column prop="module" label="模块" width="160" />
+                <el-table-column label="用例标题" min-width="220">
+                  <template #default="{ row }">{{ row.title || '未命名用例' }}</template>
+                </el-table-column>
+                <el-table-column prop="precondition" label="前置条件" min-width="160" show-overflow-tooltip />
+                <el-table-column label="步骤数" width="90" align="center">
+                  <template #default="{ row }">{{ row.steps || 0 }}</template>
+                </el-table-column>
+                <el-table-column label="来源画布" width="180" show-overflow-tooltip>
+                  <template #default="{ row }">{{ row.sourceCanvas }}</template>
+                </el-table-column>
+              </el-table>
+            </el-collapse-item>
+          </el-collapse>
+
+          <div v-if="filteredSmoke.length" class="smoke-block">
+            <h4>冒烟用例</h4>
+            <el-table :data="filteredSmoke" size="small" border stripe max-height="360">
+              <el-table-column type="index" width="48" />
+              <el-table-column prop="module" label="模块" width="160" />
+              <el-table-column label="用例标题" min-width="240">
+                <template #default="{ row }">{{ row.title || '未命名用例' }}</template>
+              </el-table-column>
+              <el-table-column label="来源画布" width="200" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.sourceCanvas }}</template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
+
+    <!-- ============ 单画布详情抽屉 ============ -->
+    <el-drawer :title="focused && ((focused.parent_name ? (focused.parent_name + ' / ') : '') + (focused.page_name || ('P' + focused.page_no))) + ' · 单画布流水线'"
+      v-model="drawerVisible" size="62%" direction="rtl" @closed="focused = null">
+      <div v-if="focused" class="canvas-detail">
+        <el-alert type="info" :closable="false" show-icon
+          :title="`当前阶段：${stageMeta(focused.current_stage, focused.stage_status).label}`"
+          :description="`单画布模式：每点击一次下方按钮只会对「${focused.page_name || ('P' + focused.page_no)}」这一个画布生效，不影响其他画布。`" />
+
+        <div class="detail-actions">
+          <el-button size="small" :loading="busy" @click="runCanvasStage('struct', focused)">🔧 结构化</el-button>
+          <el-button size="small" :loading="busy" @click="runCanvasStage('clarify', focused)">🔍 澄清</el-button>
+          <el-button size="small" :loading="busy" @click="runCanvasStage('design', focused)">📐 测试设计</el-button>
+          <el-button size="small" type="primary" :loading="busy" @click="runCanvasStage('generate-cases', focused)">📋 生成用例</el-button>
+        </div>
+
+        <el-steps :active="focused.current_stage" align-center finish-status="success" class="detail-steps">
+          <el-step title="读取" />
+          <el-step title="通读" />
+          <el-step title="澄清/设计" />
+          <el-step title="用例" />
+        </el-steps>
+
+        <div v-if="focused.screenshot || (focused.screenshot_segments && parseArr(focused.screenshot_segments).length)" class="detail-shot">
+          <h5>📷 画布截图</h5>
+          <el-image
+            :src="shotUrl(focused.screenshot)"
+            :preview-src-list="shotPreviewList(focused)"
+            fit="contain"
+            style="width: 100%; max-height: 320px; background: #f5f7fa; border-radius: 6px;"
+            :initial-index="0"
+            hide-on-click-modal
+          />
+          <div v-if="parseArr(focused.screenshot_segments).length > 1" class="shot-segs">
+            <span>该画布被拆分为 {{ parseArr(focused.screenshot_segments).length }} 段，点击图片可逐段查看</span>
+          </div>
+        </div>
+
+        <!-- 画布级产物：查看 / 编辑（保存后自动重算任务级合并视图） -->
+        <CanvasArtifactCard title="需求摘要与模块拆分" icon="📄" kind="text"
+          field="page_summary" :raw="focused.page_summary"
+          :proto-id="protoId" :page-id="focused.id"
+          :class="{ 'stage-current': focused.current_stage === 1 }"
+          @saved="onArtifactSaved" />
+
+        <CanvasArtifactCard title="需求澄清" icon="❓" kind="clarify"
+          field="page_clarification" :raw="focused.page_clarification"
+          :proto-id="protoId" :page-id="focused.id"
+          :class="{ 'stage-current': focused.current_stage === 2 }"
+          @saved="onArtifactSaved" />
+
+        <CanvasArtifactCard title="测试点" icon="🧩" kind="json"
+          field="page_testpoints_json" :raw="focused.page_testpoints_json"
+          :proto-id="protoId" :page-id="focused.id"
+          :class="{ 'stage-current': focused.current_stage === 3 }"
+          @saved="onArtifactSaved" />
+
+        <CanvasArtifactCard title="正式用例" icon="🧪" kind="json"
+          field="page_testcases_json" :raw="focused.page_testcases_json"
+          :proto-id="protoId" :page-id="focused.id"
+          :class="{ 'stage-current': focused.current_stage === 3 }"
+          @saved="onArtifactSaved" />
+
+        <CanvasArtifactCard title="冒烟用例" icon="🔥" kind="json"
+          field="page_smoke_json" :raw="focused.page_smoke_json"
+          :proto-id="protoId" :page-id="focused.id"
+          :class="{ 'stage-current': focused.current_stage === 4 }"
+          @saved="onArtifactSaved" />
+      </div>
+    </el-drawer>
+  </div>
+</template>
+
+<script>
+import request from '@/utils/api'
+import CanvasArtifactCard from './CanvasArtifactCard.vue'
+
+export default {
+  name: 'ModaoCanvasBoard',
+  components: { CanvasArtifactCard },
+  data() {
+    return {
+      protoId: this.$route.params.id,
+      proto: null,
+      pages: [],
+      activeTab: 'board',
+      loading: false,
+      busy: false,
+      drawerVisible: false,
+      focused: null,
+      caseFilter: 'all',
+      caseGroups: '',
+      pollTimer: null,
+      folderFilter: '',
+    }
+  },
+  computed: {
+    filteredCases() {
+      return this.allCases.filter(c => this.caseFilter === 'all' || c.sourceCanvasId === this.caseFilter)
+    },
+    filteredSmoke() {
+      return this.allSmoke.filter(c => this.caseFilter === 'all' || c.sourceCanvasId === this.caseFilter)
+    },
+    groupedCases() {
+      const map = new Map()
+      for (const c of this.filteredCases) {
+        const key = c.module || '未分类'
+        if (!map.has(key)) {
+          map.set(key, {
+            key,
+            title: '📁 ' + key + `（${this.filteredCases.filter(x => (x.module || '未分类') === key).length} 条）`,
+            items: [],
+          })
+        }
+        map.get(key).items.push(c)
+      }
+      return Array.from(map.values())
+    },
+    allCases() {
+      const out = []
+      for (const p of this.pages) {
+        const source = this.canvasLabel(p)
+        for (const tc of this.parseArr(p.page_testcases_json)) {
+          const inner = tc.testcase || tc
+          out.push({
+            module: tc.module || inner.module || '',
+            title: inner.title || inner.name || inner.case_name || '',
+            precondition: inner.precondition || inner.pre_condition || '',
+            steps: Array.isArray(inner.steps) ? inner.steps.length : (inner.steps ? 1 : 0),
+            sourceCanvas: source,
+            sourceCanvasId: p.id,
+          })
+        }
+      }
+      return out
+    },
+    allSmoke() {
+      const out = []
+      for (const p of this.pages) {
+        const source = this.canvasLabel(p)
+        for (const tc of this.parseArr(p.page_smoke_json)) {
+          const inner = tc.testcase || tc
+          out.push({
+            module: tc.module || inner.module || '',
+            title: inner.title || inner.name || inner.case_name || '',
+            sourceCanvas: source,
+            sourceCanvasId: p.id,
+          })
+        }
+      }
+      return out
+    },
+    folderGroups() {
+      const map = new Map()
+      for (const p of this.pages) {
+        const folder = (p.folder || '').trim()
+        if (!map.has(folder)) {
+          map.set(folder, { path: folder, pages: [], allSelected: false, indeterminate: false, selectedCount: 0 })
+        }
+        map.get(folder).pages.push(p)
+      }
+      for (const fg of map.values()) {
+        const selected = fg.pages.filter(p => p.selected).length
+        fg.selectedCount = selected
+        fg.allSelected = selected === fg.pages.length && fg.pages.length > 0
+        fg.indeterminate = selected > 0 && selected < fg.pages.length
+      }
+      return Array.from(map.values()).sort((a, b) => (a.path || '').localeCompare(b.path || ''))
+    },
+    filteredFolderGroups() {
+      if (!this.folderFilter) return this.folderGroups
+      return this.folderGroups.filter(fg => fg.path === this.folderFilter)
+    },
+    filteredPages() {
+      if (!this.folderFilter) return this.pages
+      return this.pages.filter(p => (p.folder || '').trim() === this.folderFilter)
+    },
+  },
+  mounted() {
+    // protoId 必须是数字 pk；非数字（如 'new'）说明入口错误，跳过 loadDetail 避免 404 报错
+    if (this.protoId && !isNaN(Number(this.protoId))) {
+      this.loadDetail()
+    }
+  },
+  beforeDestroy() {
+    this.stopPoll()
+  },
+  methods: {
+    base() {
+      return '/requirement-analysis/api/modao'
+    },
+    shotUrl(rel) {
+      if (!rel) return ''
+      // 已经是 http(s)/data 开头（已拼好）就直接返回；否则按相对 MEDIA_ROOT 路径拼接
+      if (/^(https?:|data:)/i.test(rel)) return rel
+      let path = rel.replace(/^\/+/, '')
+      // 后端模型存的是相对 MEDIA_ROOT 的路径（如 modao/<uuid>/page_1.jpg）
+      if (!path.startsWith('media/')) path = 'media/' + path
+      return '/' + path
+    },
+    shotPreviewList(p) {
+      // 优先使用分段截图（超长画布被拆成多段）；否则仅主图
+      const segs = this.parseArr(p && p.screenshot_segments)
+      if (segs.length) return segs.map(s => this.shotUrl(s))
+      return p && p.screenshot ? [this.shotUrl(p.screenshot)] : []
+    },
+    canvasLabel(p) {
+      return (p.parent_name ? (p.parent_name + ' / ') : '') + (p.page_name || ('P' + p.page_no))
+    },
+    stageMeta(stage, status) {
+      if (status === 'failed') return { label: '失败', type: 'danger' }
+      if (status === 'extracting') return { label: '读取中', type: 'warning' }
+      if (status === 'needs_rerun') return { label: '需重跑', type: 'warning' }
+      const map = {
+        0: { label: '待读取', type: 'info' },
+        1: { label: '已通读', type: 'success' },
+        2: { label: '已澄清', type: 'success' },
+        3: { label: '已设计', type: 'success' },
+        4: { label: '已生成', type: 'success' },
+      }
+      return map[stage] || { label: '阶段' + stage, type: 'info' }
+    },
+    parseArr(s) {
+      if (!s) return []
+      try {
+        const v = JSON.parse(s)
+        return Array.isArray(v) ? v : (v.data && Array.isArray(v.data) ? v.data : [])
+      } catch (e) {
+        return []
+      }
+    },
+    pretty(s) {
+      if (!s) return ''
+      try {
+        return JSON.stringify(JSON.parse(s), null, 2)
+      } catch (e) {
+        return s
+      }
+    },
+    async loadDetail() {
+      this.loading = true
+      try {
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        this.proto = res.data
+        this.pages = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
+        if (this.isRunning) this.startPoll()
+      } catch (e) {
+        this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.loading = false
+      }
+    },
+    openCanvas(p) {
+      this.focused = p
+      this.drawerVisible = true
+    },
+    /** 画布产物保存后：刷新列表并保持抽屉停在同一个画布上（loadDetail 会替换 pages 数组） */
+    async onArtifactSaved() {
+      const id = this.focused && this.focused.id
+      await this.loadDetail()
+      if (id) {
+        const fresh = this.pages.find(x => x.id === id)
+        if (fresh) this.focused = fresh
+      }
+    },
+    onFolderSelectAll(fg) {
+      const selected = fg.allSelected
+      for (const p of fg.pages) {
+        p.selected = selected
+      }
+    },
+    onCanvasSelect(p, fg) {
+      const selected = fg.pages.filter(x => x.selected).length
+      fg.selectedCount = selected
+      fg.allSelected = selected === fg.pages.length && fg.pages.length > 0
+      fg.indeterminate = selected > 0 && selected < fg.pages.length
+    },
+    async onFolderBatchAction(fg, action) {
+      const selectedPages = fg.pages.filter(p => p.selected)
+      if (!selectedPages.length) {
+        this.$message.warning('请先勾选要运行的画布')
+        return
+      }
+      const estimatedTokens = selectedPages.length * 500 * 1.5
+      const actionLabels = { 'clarify': '需求澄清', 'design': '测试设计', 'generate-cases': '生成用例' }
+      const actionLabel = actionLabels[action] || action
+
+      const missingSummary = selectedPages.filter(p => !(p.page_summary || '').trim()).length
+      const summaryWarn = (['design', 'generate-cases'].includes(action) && missingSummary)
+        ? `\n\n⚠️ 其中 ${missingSummary} 个画布还没有①结构化摘要，将用「本画布原文+澄清结论」兜底生成（建议先跑结构化，模块拆分更准）。`
+        : ''
+      try {
+        await this.$confirm(
+          `将为文件夹「${fg.path || '未分组'}」下的 ${selectedPages.length} 个画布运行【${actionLabel}】，预计消耗 token 约 ${Math.round(estimatedTokens)} 个。${summaryWarn}\n\n是否继续？批量执行将按顺序串行排队。\n可随时点页面顶部「刷新」查看进度。`,
+          `${actionLabel} · 批量确认`,
+          {
+            distinguishCancelAndClose: true,
+            confirmButtonText: '继续批量',
+            cancelButtonText: '取消',
+            type: 'info',
+          }
+        )
+        await this.runCanvasStage(action, { id: selectedPages.map(p => p.id) })
+        this.$message.success(`已为文件夹「${fg.path || '未分组'}」的 ${selectedPages.length} 个画布提交【${actionLabel}】，请稍候`)
+      } catch (action) {
+        if (action === 'cancel') {
+          for (const p of selectedPages) {
+            await this.runCanvasStage(action, p)
+          }
+          this.$message.success(`已为文件夹「${fg.path || '未分组'}」的 ${selectedPages.length} 个画布提交【${actionLabel}】，请稍候`)
+        }
+      }
+    },
+    /** 画布级前置校验：③测试设计/④生成用例依赖①结构化摘要，缺失时给出明确提示 */
+    async ensureRequirementReady(page, action) {
+      if (!['design', 'generate-cases'].includes(action)) return true
+      if (Array.isArray(page.id)) return true            // 批量运行：不逐个确认，直接放行
+      if ((page.page_summary || '').trim()) return true  // 已有结构化摘要
+      const hasInput = (page.page_clarification || '').trim()
+      try {
+        await this.$confirm(
+          `画布「${this.canvasLabel(page)}」还没有①结构化摘要（page_summary 为空）。\n\n` +
+          (hasInput
+            ? '继续的话，后端会用「本画布原文 + 已填澄清结论」兜底生成，模块拆分可能不如结构化后准确。'
+            : '该画布也没有可用的原文/澄清内容，后端会直接中止生成（避免凭空编造无关用例）。') +
+          '\n\n建议先点「🔧 结构化」，再生成测试点。仍要继续吗？',
+          '该画布尚未结构化',
+          { type: 'warning', confirmButtonText: '仍然继续', cancelButtonText: '先去结构化' }
+        )
+        return true
+      } catch (e) {
+        return false
+      }
+    },
+    async runCanvasStage(action, page) {
+      if (this.busy) return
+      if (!(await this.ensureRequirementReady(page, action))) {
+        if (!Array.isArray(page.id)) this.$message.info('已取消：请先运行「🔧 结构化」')
+        return
+      }
+      this.busy = true
+      try {
+        const pageIds = Array.isArray(page.id) ? page.id : [page.id]
+        await request({
+          url: `${this.base()}/${this.protoId}/${action}/`,
+          method: 'post',
+          data: { page_ids: pageIds },
+        })
+        if (!Array.isArray(page.id)) {
+          this.$message.success(`已为画布「${this.canvasLabel(page)}」提交${this.stageMeta(page.current_stage, page.stage_status).label}的运行请求`)
+        }
+        this.startPoll()
+      } catch (e) {
+        this.$message.error('提交失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.busy = false
+      }
+    },
+    get isRunning() {
+      return this.proto && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this.proto.status)
+    },
+    startPoll() {
+      this.stopPoll()
+      this.pollTimer = setInterval(() => this.loadDetail(), 3000)
+    },
+    stopPoll() {
+      if (this.pollTimer) {
+        clearInterval(this.pollTimer)
+        this.pollTimer = null
+      }
+    },
+    goBack() {
+      this.$router.push('/ai-generation/modao-skill')
+    },
+    goToPipeline() {
+      this.$router.push(`/ai-generation/modao-pipeline/${this.protoId}`)
+    },
+    goToCaseMerge() {
+      this.$router.push(`/ai-generation/modao-case-merge/${this.protoId}`)
+    },
+  },
+}
+</script>
+
+<style scoped lang="scss">
+.canvas-board {
+  padding: 16px 20px 40px;
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      h2 { margin: 0; font-size: 18px; }
+    }
+    .proto-title { color: #606266; font-size: 13px; }
+  }
+  .canvas-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+    margin-top: 8px;
+  }
+  .canvas-card {
+    &.is-failed { border-color: #f56c6c; }
+    &.is-active { border-color: #e6a23c; }
+    &.is-selected { border-color: #409eff; box-shadow: 0 0 0 2px rgba(64,158,255,.2); }
+    .card-thumb {
+      position: relative;
+      display: block;
+      width: 100%;
+      height: 160px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #f5f7fa;
+      margin-bottom: 10px;
+      cursor: zoom-in;
+      :deep(img) { width: 100%; height: 100%; object-fit: contain; display: block; background: #fff; }
+      .thumb-error {
+        display: flex; align-items: center; justify-content: center;
+        height: 100%; color: #c0c4cc; font-size: 12px;
+      }
+      &.thumb-empty {
+        display: flex; align-items: center; justify-content: center;
+        color: #c0c4cc; font-size: 12px; cursor: default;
+      }
+    }
+    .card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .card-title { display: flex; flex-direction: column; gap: 2px; }
+    .page-no { font-size: 11px; color: #909399; }
+    .page-name { font-weight: 600; font-size: 14px; }
+    .card-progress { margin: 10px 0 6px; }
+    .card-meta { font-size: 12px; color: #909399; }
+    .card-error { font-size: 12px; color: #f56c6c; margin: 6px 0; }
+    .card-actions { display: flex; gap: 8px; margin-top: 8px; }
+  }
+  .cases-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 12px;
+    .cases-count { color: #606266; font-size: 13px; }
+  }
+  .smoke-block { margin-top: 18px; h4 { margin: 0 0 8px; } }
+  .canvas-detail {
+    .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    .detail-steps { margin: 12px 0 18px; }
+    .detail-shot {
+      margin-bottom: 14px;
+      h5 { margin: 6px 0; color: #409eff; }
+      .shot-segs { font-size: 12px; color: #909399; margin-top: 4px; }
+    }
+    .detail-stage { margin-bottom: 14px; &.stage-current { border: 1px solid #409eff; box-shadow: 0 0 8px rgba(64,158,255,.25); }
+      .stage-pre { white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; background: #fafafa; padding: 10px; border-radius: 6px; font-size: 12px; margin: 0; }
+      .sub-block { margin-bottom: 12px; h5 { margin: 6px 0; color: #409eff; } }
+    }
+  }
+  .empty-tip { padding: 40px 0; }
+
+  .folder-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: #f5f7fa;
+    border-radius: 8px;
+    .folder-count { color: #606266; font-size: 13px; }
+  }
+
+  .folder-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .folder-group {
+    border: 1px solid #e4e7ed;
+    border-radius: 8px;
+    padding: 16px;
+    background: #fff;
+  }
+  .folder-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #ebeef5;
+    .folder-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #303133;
+    }
+    .folder-actions {
+      display: flex;
+      gap: 8px;
+    }
+  }
+}
+</style>

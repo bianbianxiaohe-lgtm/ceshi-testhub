@@ -33,6 +33,12 @@ services:
       - testhub-logs:/app/logs
       - ./knowledge-base:/app/knowledge-bases
       - testhub-chroma-data:/app/chroma
+      # Midscene 运行时（Node runtime + @midscene/web Node 服务）。
+      # 它是首次运行期下载的运行产物（约数百 MB），不挂卷的话容器一重建就丢，
+      # 表现为首次执行要重新下载 Node（生产实测几小时）或直接报找不到 Chrome。
+      # 注：Chrome 本身不在这里——引擎已改为复用镜像自带的 playwright chromium，
+      # 见 apps/ui_automation/midscene_web_engine.py::_find_chrome_executable。
+      - testhub-midscene:/root/.midscene
     depends_on:
       mysql:
         condition: service_healthy
@@ -65,3 +71,4 @@ volumes:
   testhub-media:
   testhub-logs:
   testhub-chroma-data:
+  testhub-midscene:

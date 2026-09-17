@@ -2640,10 +2640,12 @@ const loadElementsForSelector = async () => {
     elementSelectorLoading.value = true
     try {
         const params = {
-            page: elementCurrentPage.value,
-            size: elementPageSize.value,
-            element_type: elementFilterType.value,
-            keyword: elementSearchKeyword.value
+            page: Number(elementCurrentPage.value) || 1,
+            page_size: Number(elementPageSize.value) || 10
+        }
+        if (elementFilterType.value) params.element_type = elementFilterType.value
+        if (elementSearchKeyword.value && elementSearchKeyword.value.trim()) {
+            params.search = elementSearchKeyword.value.trim()
         }
         
         const response = await getAppElementList(params)

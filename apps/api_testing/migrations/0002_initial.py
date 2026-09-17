@@ -6,9 +6,10 @@ import django.db.models.deletion
 
 class Migration(migrations.Migration):
 
-    initial = True
+    
 
     dependencies = [
+        ('api_testing', '0001_initial'),
     ]
 
     operations = [

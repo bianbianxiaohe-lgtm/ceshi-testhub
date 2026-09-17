@@ -112,6 +112,61 @@ _UA_HEADERS = {
                    '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'),
 }
 
+# ---------- 单文件 H5 交互原型（自研格式，如 WebShare 分享的单 HTML 只读页）----------
+# 特征：单个 HTML 文件内联 JS 里定义 `const pages = [{id, group, title, states}]` 页面树，
+# 另有「页面 id → HTML 模板字符串」的 JSON 对象（键为页面 id）。文本静态内联，纯 HTTP 即可提取。
+_SINGLEFILE_H5_PAGES_RE = re.compile(r'(?:const|let|var)\s+pages\s*=\s*(\[)')
+_SINGLEFILE_H5_ITEM_RE = re.compile(r'\{([^{}]*)\}')
+_SINGLEFILE_H5_FIELD_RE = re.compile(
+    r"""([A-Za-z_]\w*)\s*:\s*(?:(['"])(.*?)\2|(\[[^\[\]]*\]))""", re.S)
+_SINGLEFILE_H5_TPL_RE = re.compile(r'(?:const|let|var)\s+\w+\s*=\s*(\{)')
+_SCRIPT_RE = re.compile(r'<script[^>]*>(.*?)</script>', re.S)
+
+# ---------- PRD 报告页（自研格式，第 4 种来源，如「Lovin1.2.20-PRD.html」）----------
+# 与单文件 H5 原型的本质区别：**没有内联 pages 页面树**，也没有手机画布。
+# 结构 = 侧边栏目录 + 预览栏（N 张内联截图卡片）+ 正文栏（M 个 requirement-module 需求模块）。
+#   · 真正的需求正文 = `.requirement-module` 区块（含「【说明】●分组 ➢条目」/【操作】/验收标准）
+#   · `.prototype-item` 区块 = 一张截图卡片，只有标题（页名）—— 作为页面清单与视觉证据
+# 注意：这类文件常内联数十张 base64 截图（可达 100MB+），必须先剔除 data URI 再解析，
+# 否则逐字符扫描会退化成分钟级。剔除后纯文本通常仅数十 KB。
+_PRD_MODULE_CLS = 'requirement-module'
+_PRD_ITEM_CLS = 'prototype-item'
+# 内联 base64 图片（data URI）：用于解析前剥离，避免超大字符串拖慢正则
+_DATA_URI_RE = re.compile(r'data:image/[^"\')]{200,}')
+# 页面标题：优先 <h4 class="prototype-title">NN标题</h4>，兜底 img 的 alt/data-title
+_PRD_TITLE_RE = re.compile(
+    r'class="prototype-title"[^>]*>(.*?)</h4>|'
+    r'<img[^>]*\balt="([^"]*)"',
+    re.S | re.I,
+)
+_PRD_BLOCK_SPLIT_MIN = 1  # 至少要有 1 个需求模块才认为是 PRD 报告页
+
+
+def _extract_js_balanced(text: str, start: int, open_ch: str = '[', close_ch: str = ']') -> Optional[str]:
+    """从 text[start] 起（指向 open_ch）用引号感知括号配对，返回完整 [...]/{...} 文本。"""
+    depth = 0
+    in_str = None
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in '"\'':
+            in_str = ch
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
 
 def _axure_resolve(token: str, var_map: Dict[str, str]) -> str:
     token = (token or '').strip()
@@ -173,6 +228,61 @@ class ModaoExtractor:
         self.shot_dir = os.path.join(media_root, 'modao', self.run_id)
         os.makedirs(self.shot_dir, exist_ok=True)
 
+    # ---------- 断点续读检查点 ----------
+    # 背景：Playwright 逐页读取有 1800s 整体超时（见 extract_sync）。旧实现把 pages
+    # 只攒在内存里、循环结束后才落库，因此**中途超时会丢掉已读的全部画布**
+    # （实例：30 页读到第 15 页超时 → status=failed、0 页，前 15 页白读）。
+    # 这里在每一页读完时立刻把结果写入检查点文件（按 data-cid 标识），
+    # 供下次「继续读取」时跳过已完成的画布，只补缺失的部分。
+    @property
+    def _ckpt_path(self) -> str:
+        return os.path.join(self.shot_dir, '_checkpoint.json')
+
+    def _load_checkpoint(self) -> Dict[str, Any]:
+        """读取检查点：{url_key: {'pages': [...], 'done_cids': [...], 'total': int}}"""
+        try:
+            if os.path.exists(self._ckpt_path):
+                with open(self._ckpt_path, 'r', encoding='utf-8') as f:
+                    return json.load(f) or {}
+        except Exception as e:
+            logger.warning(f'读取续读检查点失败（忽略，按全新读取）: {e}')
+        return {}
+
+    def _save_checkpoint(self, url_key: str, pages: List[Dict[str, Any]],
+                         done_cids: List[str], total: int) -> None:
+        """把已完成的画布写入检查点（原子写，避免半截文件）。"""
+        try:
+            data = self._load_checkpoint()
+            # 落盘前剔除不可序列化/体积过大的字段（shot_path 为内部临时字段）
+            slim = []
+            for p in pages:
+                q = {k: v for k, v in p.items() if k != 'shot_path'}
+                slim.append(q)
+            data[url_key] = {
+                'pages': slim,
+                'done_cids': list(done_cids),
+                'total': int(total),
+                'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            tmp = self._ckpt_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._ckpt_path)
+        except Exception as e:
+            logger.warning(f'写入续读检查点失败（不影响本次读取）: {e}')
+
+    def _get_resume_state(self, url_key: str):
+        """返回 (已读画布列表, 已完成 data-cid 集合)；无检查点则 ([], set())。"""
+        ck = self._load_checkpoint().get(url_key) or {}
+        pages = ck.get('pages') or []
+        cids = set(ck.get('done_cids') or [])
+        return pages, cids
+
+    @staticmethod
+    def _ckpt_key(url: str) -> str:
+        """检查点按 URL 归档（去 hash），不同地址互不干扰。"""
+        return (url or '').split('#')[0]
+
     # ---------- 公共入口 ----------
     async def extract(
         self,
@@ -215,7 +325,8 @@ class ModaoExtractor:
                 args=['--no-sandbox', '--disable-dev-shm-usage'],
             )
             context = await browser.new_context(
-                viewport={'width': 1440, 'height': 900},
+                viewport={'width': 1920, 'height': 1200},
+                device_scale_factor=4,
                 user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                             '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'),
             )
@@ -238,31 +349,132 @@ class ModaoExtractor:
                     return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
             await page.wait_for_timeout(2000)
 
+            # [密码墙/未加载检测] 墨刀分享链接可能变为「需密码访问」或登录墙，
+            # 此时 SPA 不渲染画布/页面树，若静默走空提取会误导用户以为"提取成功但无内容"。
+            # 这里主动探测并给出明确 warning，便于前端/用户识别。
+            try:
+                body_text = (await page.evaluate(
+                    "document.body ? document.body.innerText : ''")).strip()
+                if '请输入密码访问项目' in body_text or '密码访问' in body_text:
+                    warnings.append(
+                        '墨刀分享链接已变为「需密码访问」，无法读取原型内容；'
+                        '请在墨刀分享设置中关闭密码，或在调用时提供访问密码后重试')
+                    await browser.close()
+                    return {'run_id': self.run_id, 'url': url,
+                            'pages': pages, 'warnings': warnings,
+                            'blocked_by_password': True}
+                # 通用未加载兜底：body 文本极少且无任何画布/页面节点
+                if len(body_text) < 60 and await page.locator(
+                        ".rn-list-item.page[data-cid]").count() == 0:
+                    warnings.append(
+                        f'原型页面 SPA 未正常渲染（body 仅 {len(body_text)} 字），'
+                        f'可能需登录/密码或链接已失效')
+            except Exception as e:
+                warnings.append(f'密码墙检测异常(已忽略): {e}')
+
             # 枚举页面（多 URL 批量场景由调用方传 enumerate_pages=False，避免重复抓取）
             page_items = await self._enumerate_pages(page, source_type=source_type) if enumerate_pages else []
             if not page_items:
                 warnings.append('未识别到页面树，将把当前单页作为唯一页面提取')
                 page_items = [None]  # 单页模式
 
+            # 提取每个画布所属文件夹路径（用于按文件夹批量勾选）
+            canvas_folders = await self._extract_canvas_folders(page) if page_items else {}
+
             ocr_jobs: List[Dict[str, Any]] = []
             _tlog_path = os.path.join(self.shot_dir, '_timing.log')
             _nav_t0 = time.time()
             _nav_count = 0
+            # ── 断点续读：载入上次检查点，按 data-cid 跳过已完成的画布 ──
+            _ckpt_key = self._ckpt_key(url)
+            _prev_pages, _done_cids = self._get_resume_state(_ckpt_key)
+            _total_pages = len(page_items[:max_pages])
+            if _prev_pages:
+                # 复用上次已读页：先放进 pages，后续对新页 append
+                pages.extend(_prev_pages)
+                # cid 也一并补进 done 集合（老检查点可能没记 cid，用页名兜底）
+                for _pp in _prev_pages:
+                    _c = (_pp.get('item_cid') or '').strip()
+                    if _c:
+                        _done_cids.add(_c)
+                logger.info(f'[续读] 命中检查点：已完成 {len(_prev_pages)}/{_total_pages} 页，'
+                            f'将跳过这些画布继续读取剩余部分')
+                print(f'[EXTRACT_LOOP] 续读模式：已完成 {len(_prev_pages)}/{_total_pages} 页，'
+                      f'跳过已读画布', flush=True)
+                _nav_count += len(_prev_pages)
+            _new_cids: List[str] = []
             for idx, item in enumerate(page_items[:max_pages], start=1):
                 try:
                     _nav_count += 1
+                    _pg_t0 = time.time()
+                    print(f'[EXTRACT_LOOP] ▶ page {idx} START', flush=True)
+                    try:
+                        with open(os.path.join(self.shot_dir, '_stage.log'), 'a') as _sf:
+                            _sf.write(f'[STAGE][{time.strftime("%H:%M:%S")}] page {idx} START\n')
+                    except Exception:
+                        pass
                     extraction_warnings: List[str] = []
                     page_name = f'第{idx}页'
+                    parent_name = ''
+                    _item_cid = ''   # 当前画布的 data-cid（唯一，用于同名画布精确定位）
+                    # [修复] 每轮重新枚举页面树：上一轮 _extract_layer_text 内部会整页
+                    # goto 切换 view_mode，触发墨刀 SPA 重渲染，使循环前持有的 item element
+                    # handle 失效；不重枚举则除首个画布外全部激活失败被跳过（只识别出 1 个画布）。
+                    # 每轮用新鲜 handle 即可对该整页重载免疫。
+                    try:
+                        _fresh_items = await self._enumerate_pages(page, source_type=source_type)
+                        if _fresh_items:
+                            item = _fresh_items[min(idx, len(_fresh_items)) - 1]
+                    except Exception as e:
+                        warnings.append(f'第{idx}页重新枚举页面树失败: {e}')
                     if item is not None:
+                        # data-cid 全局唯一，用于「同名画布」场景精确定位（见 _extract_layer_text）
+                        _item_cid = ''
+                        try:
+                            _item_cid = (await item.get_attribute('data-cid') or '').strip()
+                        except Exception:
+                            _item_cid = ''
+                        # ── 断点续读：该画布上次已读完 → 直接跳过（不再重复取文本/截图/OCR）──
+                        if _item_cid and _item_cid in _done_cids:
+                            print(f'[EXTRACT_LOOP] page {idx} SKIP (已读, cid={_item_cid})',
+                                  flush=True)
+                            try:
+                                with open(os.path.join(self.shot_dir, '_stage.log'), 'a') as _sf:
+                                    _sf.write(f'[STAGE][{time.strftime("%H:%M:%S")}] '
+                                              f'page {idx} SKIP(已读)\n')
+                            except Exception:
+                                pass
+                            continue
                         try:
                             page_name = (await item.inner_text()).strip() or page_name
+                            # [父级留空] 按用户约定不再自动识别/拆分父级分组：
+                            # 画布名直接保留页面树读取的完整原始名（如「引导-身体数据」），
+                            # parent_name 留空，由用户在前端校验界面手动填写（用于区分重名画布）。
+                            parent_name = ''
+                        except Exception as e:
+                            warnings.append(f'第{idx}页读取页名/父级失败: {e}')
+                            parent_name = ''
+                        # 把"其它画布项"一并传入：函数内部重试时会先点其它画布制造
+                        # 状态差再点回目标，解决墨刀「当前已在该画布状态时对相邻/同名项
+                        # 点击不重新渲染」导致的切换粘滞与撞图。
+                        _others = []
+                        try:
+                            _others = [x for x in (_fresh_items or []) if x is not item]
                         except Exception:
-                            pass
-                        switched = await self._activate_page_item(page, item)
+                            _others = []
+                        print(f'[EXTRACT_LOOP] page {idx} activating...', flush=True)
+                        switched = await asyncio.wait_for(
+                            self._activate_page_item(
+                                page, item, other_items=_others, item_cid=_item_cid),
+                            timeout=120)
                         if not switched:
-                            msg = f'第{idx}页"{page_name}"点击后画布未发生变化'
-                            warnings.append(msg)
-                            extraction_warnings.append(msg)
+                            # 点击后画布未变化：可能是纯分组/容器节点，也可能是墨刀渲染延迟
+                            # 导致视口指纹尚未变化。不再直接跳过，而是保留该页并标记警告，
+                            # 后续用截图 SHA256 重复检测来剔除真正重复的画布；
+                            # 这样可以避免把「内容相似的真实画布」误判为分组节点而丢失。
+                            logger.warning(
+                                f'页面项"{page_name}"点击后画布未变化，仍保留并计入重复检测')
+                            extraction_warnings.append('点击后视口指纹未变化，已保留待重复检测')
                     else:
                         # 单页模式：确保回到原型根视图
                         pass
@@ -275,17 +487,66 @@ class ModaoExtractor:
                     except Exception:
                         pass
 
-                    dom_text = await self._extract_visible_text(page, retry=dual_fusion)
-                    annotations = await self._extract_annotations(page, warnings)
+                    print(f'[EXTRACT_LOOP] page {idx} extracting text...', flush=True)
+                    dom_text = await asyncio.wait_for(
+                        self._extract_visible_text(page, retry=dual_fusion), timeout=120)
+                    # [墨刀图层树增强] 第三路来源：inspect 模式读文本图层名（无 OCR 幻觉）。
+                    # 并入 dom_text，使 OCR 跳过判定与 dual_fusion 的 DOM 路都能受益；
+                    # 失败静默回退（OCR 仍兜底）。
+                    print(f'[EXTRACT_LOOP] page {idx} extracting layer text...', flush=True)
+                    layer_text = await asyncio.wait_for(
+                        self._extract_layer_text(
+                            page, item, warnings, source_type=source_type,
+                            page_name=page_name, item_cid=_item_cid),
+                        timeout=120)
+                    if layer_text:
+                        extraction_warnings.append(f'图层树提取到 {len(layer_text)} 字符文本')
+                        dom_text = ((dom_text + '\n[图层树文本]\n' + layer_text).strip()
+                                   if dom_text else layer_text)
+                    print(f'[EXTRACT_LOOP] page {idx} extracting annotations...', flush=True)
+                    annotations = await asyncio.wait_for(
+                        self._extract_annotations(page, warnings), timeout=120)
+                    # [撞图修复] _extract_layer_text 内部用 page.goto 整页重载切回 read_only，
+                    # 重载后画布状态不稳定：可能回落到错误画布（→ 与前一页截图字节相同，
+                    # 表现为「撞图」），也可能主画布 img 尚未渲染（→ ROI 取不到走全页兜底）。
+                    # 因此截图前按 data-cid 精确重新激活目标画布，并等待主画布渲染就绪，
+                    # 确保截到的确实是当前 idx 对应的画布。
+                    if source_type == 'modao' and _item_cid:
+                        try:
+                            _fi = await self._enumerate_pages(page, source_type=source_type)
+                            for f in _fi:
+                                try:
+                                    if (await f.get_attribute('data-cid')) == _item_cid:
+                                        await f.scroll_into_view_if_needed()
+                                        await f.click(force=True, timeout=5000)
+                                        break
+                                except Exception:
+                                    continue
+                            # 等主画布 img 出现，保证 ROI 能取到，避免退化为 full_page 兜底
+                            try:
+                                await page.wait_for_selector(
+                                    '#screens img, [class*="ScreenContainer"] img',
+                                    timeout=8000, state='visible')
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(1200)
+                        except Exception:
+                            pass
                     shot_path = os.path.join(self.shot_dir, f'page_{idx}.jpg')
+                    shot_segments: List[str] = []
                     try:
-                        # 精准截图：裁剪到设备画布(rResCanvas) + 周边缓冲，提升画布内图片/插画 OCR 分辨率
-                        shot_path = await self._screenshot_canvas_roi(page, shot_path)
+                        # 精准截图：裁剪到设备画布(rResCanvas) + 周边缓冲，提升画布内图片/插画 OCR 分辨率；
+                        # 超长/超宽画布自动拆成多段截图，返回 (主图路径, 分段图路径列表，含主图)。
+                        print(f'[EXTRACT_LOOP] page {idx} screenshotting...', flush=True)
+                        shot_path, shot_segments = await asyncio.wait_for(
+                            self._screenshot_canvas_roi(page, shot_path), timeout=180)
                     except Exception as e:
                         try:
-                            await page.screenshot(path=shot_path, full_page=False, type='jpeg', quality=85)
+                            await page.screenshot(path=shot_path, full_page=True, type='jpeg', quality=85)
+                            shot_segments = [shot_path]
                         except Exception:
                             shot_path = ''
+                            shot_segments = []
                             warnings.append(f'第{idx}页截图失败: {e}')
 
                     # 视觉 OCR 补充（按页面情况自动切换）：
@@ -332,11 +593,27 @@ class ModaoExtractor:
                         vision_attempted = True
                         vision_skipped_by_classifier = True
 
+                    print(f'[EXTRACT_LOOP] ✓ page {idx} DONE ({time.time()-_pg_t0:.1f}s)', flush=True)
+                    try:
+                        with open(os.path.join(self.shot_dir, '_stage.log'), 'a') as _sf:
+                            _sf.write(f'[STAGE][{time.strftime("%H:%M:%S")}] page {idx} DONE\n')
+                    except Exception:
+                        pass
+                    print(f'[EXTRACT_LOOP] ✓ page {idx} DONE ({time.time()-_pg_t0:.1f}s)', flush=True)
+                    try:
+                        with open(os.path.join(self.shot_dir, '_stage.log'), 'a') as _sf:
+                            _sf.write(f'[STAGE][{time.strftime("%H:%M:%S")}] page {idx} DONE\n')
+                    except Exception:
+                        pass
                     pages.append({
                         'page_no': idx,
                         'page_name': page_name,
+                        'parent_name': parent_name,
+                        'folder': canvas_folders.get(_item_cid, ''),
+                        'item_cid': _item_cid,   # 续读锚点：data-cid 全局唯一
                         'text': dom_text,
                         'dom_text': dom_text,
+                        'layer_text': layer_text,
                         'vision_text': '',
                         'dom_text_len': len(dom_text or ''),
                         'vision_attempted': vision_attempted,
@@ -344,19 +621,35 @@ class ModaoExtractor:
                         'shot_path': shot_path,
                         'annotations': annotations,
                         'screenshot': os.path.relpath(shot_path, self.media_root) if shot_path else '',
+                        'screenshot_segments': (
+                            [os.path.relpath(sp, self.media_root) for sp in shot_segments]
+                            if shot_segments else []
+                        ),
                         'visual_summary': '',
                         'visual_artifacts': [],
                         'extraction_warnings': extraction_warnings,
                     })
                     if vision_attempted:
                         ocr_jobs.append(pages[-1])
+                    # ── 逐页写检查点：中途超时/OOM/重启时保住已读画布，下次可续读 ──
+                    if _item_cid:
+                        _new_cids.append(_item_cid)
+                    self._save_checkpoint(
+                        _ckpt_key, pages, list(_done_cids) + _new_cids, _total_pages)
                     # 手动终止检查点：用户在前端点「终止」后退出逐页读取
                     _raise_if_terminated(prototype_id)
                 except Exception as e:
                     warnings.append(f'第{idx}页提取异常: {e}')
+                    print(f'[EXTRACT_LOOP] ✓ page {idx} DONE ({time.time()-_pg_t0:.1f}s)', flush=True)
+                    try:
+                        with open(os.path.join(self.shot_dir, '_stage.log'), 'a') as _sf:
+                            _sf.write(f'[STAGE][{time.strftime("%H:%M:%S")}] page {idx} DONE\n')
+                    except Exception:
+                        pass
                     pages.append({
                         'page_no': idx,
                         'page_name': f'第{idx}页',
+                        'parent_name': '',
                         'text': '',
                         'annotations': [],
                         'screenshot': '',
@@ -468,6 +761,22 @@ class ModaoExtractor:
                 if is_axure:
                     source_type = 'webshare'
                     _logger.info('[AUTO-DETECT] -> routing to webshare path')
+                elif self._detect_singlefile_h5(url, kwargs.get('cookies')):
+                    # 非 Axure 目录但内联 pages 数组（单文件 H5 交互原型）→ 也走 webshare 纯 HTTP 路径
+                    source_type = 'webshare'
+                    _logger.info('[AUTO-DETECT] -> routing to singlefile-H5 webshare path')
+                elif self._is_prd_report_url(url, kwargs.get('cookies')):
+                    # 自研 PRD 报告页（requirement-module + prototype-item，无 pages 数组）
+                    # → 同样走 webshare 纯 HTTP 路径，由 extract_webshare_sync 内部再分流
+                    source_type = 'webshare'
+                    _logger.info('[AUTO-DETECT] -> routing to PRD-report webshare path')
+                elif (self._resolve_single_html_in_dir(
+                        url, self._cookie_dict(kwargs.get('cookies')))[0]
+                        or self._guess_dir_file_from_history(url)):
+                    # 目录地址且目录内只有一个单文件 HTML（新版导出常见）→ 走 webshare 纯 HTTP 路径。
+                    # 目录浏览被关闭时用历史记录里的直链兜底判断，避免误落到 Playwright 路径。
+                    source_type = 'webshare'
+                    _logger.info('[AUTO-DETECT] -> routing to dir-single-html webshare path')
             except Exception as detect_err:
                 _logger.warning(f'[AUTO-DETECT] _is_axure_url raised {detect_err}')
         else:
@@ -484,6 +793,7 @@ class ModaoExtractor:
                 vision_config=kwargs.get('vision_config'),
                 dual_fusion=kwargs.get('dual_fusion'),
                 fusion_config=kwargs.get('fusion_config'),
+                target_page_names=kwargs.get('target_page_names'),
             )
         import logging
         logging.getLogger('modao').info(f'[extract_sync] falling through to Playwright path, source_type={source_type}')
@@ -492,7 +802,41 @@ class ModaoExtractor:
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.extract(*args, **kwargs))
+        # Playwright 路径的 extract() 不支持 target_page_names（该参数为 webshare 分支专用，
+        # 单画布重读由工作流在落库阶段按名过滤，无需 extractor 感知），透传会触发 TypeError。
+        kwargs.pop('target_page_names', None)
+        # 超时兜底：浏览器/页面加载卡死时避免整阶段永久 hang（历史 bug：extract 无整体超时，
+        # 卡死后 daemon 线程永久占用资源、拖垮容器，且前端无失败日志）。
+        # ⚠️ 超时**不再直接抛错丢掉全部结果**：逐页读取过程中已把每页写入检查点
+        # （_checkpoint.json），这里把检查点里的已读画布捞回来，按「部分成功」返回，
+        # 让上层能落库已读部分并提示用户「继续读取」补齐剩余画布。
+        # 阈值可用环境变量 MODAO_EXTRACT_TIMEOUT 覆盖（默认 1800s），便于演练/特殊环境调整。
+        try:
+            _timeout = int(os.environ.get('MODAO_EXTRACT_TIMEOUT') or 1800)
+        except Exception:
+            _timeout = 1800
+        _url_for_ck = kwargs.get('url') or ''
+        try:
+            return loop.run_until_complete(
+                asyncio.wait_for(self.extract(*args, **kwargs), timeout=_timeout)
+            )
+        except asyncio.TimeoutError:
+            _partial, _ = self._get_resume_state(self._ckpt_key(_url_for_ck))
+            _n = len(_partial or [])
+            _msg = (f'墨刀原型浏览器读取超时（>{_timeout}s/{_timeout // 60}分钟）。'
+                    f'已保留超时前读取到的 {_n} 个画布，可点击「继续读取」补齐剩余画布。'
+                    f'若反复超时，请检查页面是否卡死或容器资源（/dev/shm、内存）是否不足。')
+            logger.warning(f'[读取超时] {_msg}')
+            if _n:
+                # 有部分结果 → 交给上层按「部分成功」处理（不抛异常，避免进度全丢）
+                return {
+                    'run_id': self.run_id,
+                    'url': _url_for_ck,
+                    'pages': _partial,
+                    'warnings': [_msg],
+                    'partial': True,
+                }
+            raise TimeoutError(_msg)
 
     # ---------- webshare / Axure：纯 HTTP 解析（无需浏览器）----------
     @staticmethod
@@ -517,9 +861,38 @@ class ModaoExtractor:
                 d[k.strip()] = v.strip()
         return d
 
+    def _webshare_fallback_pure_http(self, url: str, cookie_dict, warnings: List[str],
+                                     pages: List[Dict[str, Any]], vision_config=None,
+                                     dual_fusion: bool = False, fusion_config=None,
+                                     target_page_names=None) -> Dict[str, Any]:
+        """非 Axure 目录时的纯 HTTP 回退链：单文件 H5 原型 → PRD 报告页。
+
+        两者都不命中则原样返回空 pages（调用方会走 Playwright 路径或报读取失败）。
+        注意顺序：单文件 H5 判定更严格（必须有内联 pages 数组），放前面不会误吞 PRD 文档。
+        """
+        h5 = self._extract_singlefile_h5(url, cookie_dict, vision_config, dual_fusion,
+                                         fusion_config, target_page_names=target_page_names)
+        if h5.get('pages'):
+            h5['warnings'] = warnings + h5.get('warnings', [])
+            return h5
+        # PRD 报告页（自研文档格式，第 4 种来源）：纯 HTTP、不做视觉 OCR
+        prd = self.extract_prd_report_sync(url, None)
+        if prd.get('pages'):
+            prd['warnings'] = warnings + prd.get('warnings', [])
+            logger.info(f'[webshare回退] 识别为 PRD 报告页，共 {len(prd["pages"])} 页')
+            return prd
+        # 全部纯 HTTP 路径都没读出内容：给一条**说明已尝试过哪些格式**的提示，
+        # 便于用户判断下一步（是改填文件直链、还是内容确实为空）。
+        _tail = url.rstrip('/')
+        warnings.append(
+            '未能识别该地址的内容格式（已依次尝试：Axure 多页目录 / 单文件 H5 交互原型 / '
+            f'PRD 报告页）。请确认 {_tail} 是原型或需求文档地址；'
+            f'若只知道目录，请改为填写目录内具体 HTML 文件的完整地址')
+        return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+
     def extract_webshare_sync(self, url: str, cookies: Optional[str] = None, timeout: int = 30,
                               vision_config=None, dual_fusion: bool = False,
-                              fusion_config=None) -> Dict[str, Any]:
+                              fusion_config=None, target_page_names=None) -> Dict[str, Any]:
         """webshare / Axure 原型读取：解析 data/document.js 拿页面树，逐个 HTTP 抓取页面 HTML 提取文本。
 
         返回结构与 extract() 一致：{'run_id','url','pages':[{page_no,page_name,text,annotations,screenshot,extraction_warnings}],'warnings'}
@@ -538,6 +911,37 @@ class ModaoExtractor:
             else:
                 base = base + '/'
 
+        # ── 目录地址解析：用户粘的常是「目录」，需要找出目录内的单文件 HTML ──
+        # 新版导出不再生成 Axure 的 data/document.js（实测返回 404），
+        # 因此先尝试把目录地址解析成目录内那个唯一的 .html 直链，
+        # 再按「单文件 H5 原型 / PRD 报告页」解析；解析不到才回落到 Axure 流程。
+        _raw_url = url.split('#')[0]
+        _is_dir_like = _raw_url.endswith('/') or '.' not in _raw_url.rsplit('/', 1)[-1]
+        if _is_dir_like:
+            _resolved, _reason = self._resolve_single_html_in_dir(
+                base, cookie_dict, timeout=timeout)
+            if not _resolved:
+                # 兜底 1：从历史成功记录里取同目录下的文件直链
+                _hist = self._guess_dir_file_from_history(base)
+                if _hist:
+                    _resolved, _reason = _hist, ''
+                    warnings.append(f'目录浏览不可用，已复用历史记录中的文件直链：{_hist}')
+            if _resolved:
+                logger.info(f'[目录解析] {base} -> {_resolved}')
+                _fb = self._webshare_fallback_pure_http(
+                    _resolved, cookie_dict, list(warnings), pages, vision_config,
+                    dual_fusion, fusion_config, target_page_names)
+                if _fb.get('pages'):
+                    _fb['warnings'] = [f'已从目录地址定位到单文件：{_resolved}'] + (
+                        _fb.get('warnings') or [])
+                    return _fb
+                warnings.append(
+                    f'目录 {base} 内定位到 {_resolved}，但未能识别其页面结构')
+            elif _reason:
+                # 目录解析失败：给出**准确可操作**的提示，不要落到下面那条
+                # 「data/document.js」的通用兜底文案上（在目录浏览关闭的场景下完全误导）。
+                warnings.append(self._dir_fail_hint(base, _reason))
+
         try:
             doc_url = urljoin(base, _AXURE_DOC_URL)
             resp = requests.get(doc_url, cookies=cookie_dict, timeout=timeout, headers=_UA_HEADERS)
@@ -545,13 +949,21 @@ class ModaoExtractor:
                 resp.encoding = 'utf-8'
             doc_js = resp.text
         except Exception as e:
-            warnings.append(f'获取 {doc_url} 失败: {e}')
-            return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+            # Axure 路径不通（新版导出已无 data/document.js）。这里**不再输出
+            # "请确认链接为 Axure/webshare 原型目录" 这类误导文案**——
+            # 该场景绝大多数是「新版单文件导出」，由下方回退链正常处理即可。
+            logger.info(f'[webshare] 获取 {doc_url} 失败（将回退单文件/PRD 解析）: {e}')
+            return self._webshare_fallback_pure_http(
+                url, cookie_dict, warnings, pages, vision_config, dual_fusion,
+                fusion_config, target_page_names)
 
         axure_pages = parse_axure_document(doc_js)
         if not axure_pages:
-            warnings.append('未能从 data/document.js 解析出页面树，请确认链接为 Axure/webshare 原型目录')
-            return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+            # 同上：不发误导文案，交给回退链（单文件 H5 / PRD 报告页）
+            logger.info('[webshare] data/document.js 无有效页面树，回退单文件/PRD 解析')
+            return self._webshare_fallback_pure_http(
+                url, cookie_dict, warnings, pages, vision_config, dual_fusion,
+                fusion_config, target_page_names)
 
         for idx, ap in enumerate(axure_pages, 1):
             try:
@@ -626,6 +1038,34 @@ class ModaoExtractor:
                     'extraction_warnings': [str(e)],
                 })
 
+        # webshare/Axure：多个页面可能共用同一份导航/页头/页脚，
+        # 这些公共元素无独立信息价值 → 从每个画布文本中剔除。
+        # 策略：统计每行在多少画布出现，出现在绝大多数(>=80% 且 >=2)画布的行视为全局公共资源并删除。
+        if len(pages) >= 3:
+            from collections import Counter
+            line_counter: Counter = Counter()
+            for pg in pages:
+                seen = set()
+                for ln in (pg.get('text') or '').splitlines():
+                    s = ln.strip()
+                    if s:
+                        seen.add(s)
+                for s in seen:
+                    line_counter[s] += 1
+            threshold = max(2, int(0.8 * len(pages)))
+            global_lines = {ln for ln, c in line_counter.items() if c >= threshold}
+            if global_lines:
+                for pg in pages:
+                    kept = [ln for ln in (pg.get('text') or '').splitlines()
+                            if ln.strip() not in global_lines]
+                    pg['text'] = '\n'.join(kept).strip()
+                    kept_dom = [ln for ln in (pg.get('dom_text') or '').splitlines()
+                                if ln.strip() not in global_lines]
+                    pg['dom_text'] = '\n'.join(kept_dom).strip()
+                    pg['dom_text_len'] = len(pg['dom_text'] or '')
+
+
+
         fused_requirements: List[Dict[str, Any]] = []
         if dual_fusion and fusion_config:
             try:
@@ -640,23 +1080,844 @@ class ModaoExtractor:
             result['fused_requirements'] = fused_requirements
         return result
 
-    # ---------- webshare / Axure：纯图片页视觉 OCR 兜底 ----------
-    async def _ocr_webshare_page_async(self, page_url: str, cookie_dict: Dict[str, str],
-                                       vision_config, idx: int) -> Dict[str, Any]:
-        """对 webshare 单个页面用 Playwright 渲染、截图，再调视觉模型 OCR（纯图片/截图/表格页兜底）。
+    # ---------- 单文件 H5 交互原型（自研格式）：纯 HTTP 解析 ----------
+    @staticmethod
+    def _parse_singlefile_h5(html_text: str):
+        """解析单文件 H5 原型的内联 JS，返回 (pages_meta, templates)。
 
-        仅在 extract_webshare_sync 中『文本极少』时调用，纯文本页不会进入此分支。
+        pages_meta: [{id, group, title, states}]（页面树，group 可作父级分组）；
+        templates:  {页面id: HTML模板字符串}。非该格式返回 (None, None)。
         """
-        from playwright.async_api import async_playwright
-        if not vision_config:
-            return {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
-        shot_path = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
+        if not html_text:
+            return None, None
+        pages_meta: List[Dict[str, Any]] = []
+        for script in _SCRIPT_RE.findall(html_text):
+            # 1) pages 数组（含 id/group/title/states 的扁平对象列表）
+            m = _SINGLEFILE_H5_PAGES_RE.search(script)
+            if m:
+                arr_text = _extract_js_balanced(script, m.start(1))
+                if arr_text:
+                    for im in _SINGLEFILE_H5_ITEM_RE.finditer(arr_text):
+                        item = im.group(1)
+                        fields: Dict[str, Any] = {}
+                        for fm in _SINGLEFILE_H5_FIELD_RE.finditer(item):
+                            key = fm.group(1)
+                            if fm.group(3) is not None:
+                                fields[key] = fm.group(3)
+                            elif fm.group(4):
+                                fields[key] = [s.strip().strip('\'"')
+                                               for s in fm.group(4)[1:-1].split(',')]
+                        if fields.get('id'):
+                            pages_meta.append(fields)
+        if not pages_meta:
+            return None, None
+        ids = {m.get('id') for m in pages_meta if m.get('id')}
+
+        # 2) 页面模板 JSON 对象（键=页面 id，值=HTML 字符串）。可能存在多种形态：
+        #    整个 <script> 就是 JSON 对象（无 const 前缀），或 const xxx = {...}。
+        #    逐个候选尝试 json.loads，取「key 命中页面 id 最多」的对象作为模板源，
+        #    避免把 block 里其他数据对象（spec/状态等，如本原型 294 个 key）误当模板。
+        best_obj: Dict[str, Any] = {}
+        best_hit = 0
+        for script in _SCRIPT_RE.findall(html_text):
+            cands = [script.strip().rstrip(';').strip()]
+            for tm in _SINGLEFILE_H5_TPL_RE.finditer(script):
+                obj_text = _extract_js_balanced(script, tm.start(1), '{', '}')
+                if obj_text:
+                    cands.append(obj_text)
+            for cand in cands:
+                try:
+                    obj = json.loads(cand)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or not obj:
+                    continue
+                hit = len(ids & set(obj.keys()))
+                if hit > best_hit:
+                    best_obj, best_hit = obj, hit
+        templates = {k: v for k, v in best_obj.items()
+                     if isinstance(v, str) and k in ids}
+        return pages_meta, templates
+
+    # 单文件 H5 探测器能接受的最大体积：正常交互原型都是百 KB 级。
+    # 超过此值基本是「PRD 报告页」这类内嵌大量 base64 截图的文档，读全文只会白白超时
+    # （实测 124MB 文件会耗尽 15s 超时后返回 False，浪费 7.5s）。
+    SINGLEFILE_H5_MAX_BYTES = 20 * 1024 * 1024
+
+    @staticmethod
+    def _detect_singlefile_h5(url: str, cookies: Optional[str] = None) -> bool:
+        """快速探测 URL 是否为单文件 H5 交互原型（内联 pages 数组且 >=2 页）。
+
+        先看 Content-Length：超大文件直接判定「非单文件 H5 原型」，
+        避免为 100MB+ 文档空等 15s 超时。
+        """
+        import requests
         try:
+            resp = requests.get(url, cookies=ModaoExtractor._cookie_dict(cookies),
+                                timeout=15, headers=_UA_HEADERS, stream=True)
+            if resp.status_code != 200:
+                return False
+            try:
+                length = int(resp.headers.get('Content-Length') or 0)
+            except Exception:
+                length = 0
+            if length > ModaoExtractor.SINGLEFILE_H5_MAX_BYTES:
+                logger.info(
+                    f'[单文件H5探测] 跳过：Content-Length={length} 超过 '
+                    f'{ModaoExtractor.SINGLEFILE_H5_MAX_BYTES} 上限（疑似 PRD 报告页）')
+                return False
+            if not resp.encoding or resp.encoding.lower() in ('iso-8859-1', 'ascii'):
+                resp.encoding = 'utf-8'
+            html_text = resp.text
+            meta, _tpl = ModaoExtractor._parse_singlefile_h5(html_text)
+            return bool(meta and len(meta) >= 2)
+        except Exception:
+            return False
+
+    # ---------- 目录地址 → 目录内单文件 HTML 解析 ----------
+    # WebShare/静态文件服务器（IIS/Apache/nginx autoindex）的「目录地址」会返回一个
+    # 文件列表页。用户习惯粘目录地址（原型导出目录下通常只有一个 .html），
+    # 而 Axure 的 data/document.js 在新版导出里不存在（已改为单文件 HTML），
+    # 因此必须能从目录页里找出那个 .html 并改用其直链。
+    _DIR_INDEX_HREF_RE = re.compile(r'HREF="([^"]+\.html?)"', re.I)
+    _DIR_INDEX_HREF_RE2 = re.compile(r'href="([^"]+\.html?)"')
+
+    @classmethod
+    def _resolve_single_html_in_dir(cls, base_url: str, cookie_dict=None,
+                                    timeout: int = 20):
+        """解析「目录地址」→ 目录内单文件 HTML 直链。
+
+        返回 (直链 or None, 原因码)。原因码用于给用户**准确可操作**的提示：
+          ''            —— 解析成功
+          'not_dir'     —— 传进来的已经是文件直链，无需解析
+          'no_browsing' —— **目录浏览被关闭**：目录 URL 返回 404/403，但这类服务器
+                           通常仍可直接访问具体文件。这是最常见的失败原因
+                           （实测 IIS 关闭 Directory Browsing 时，同目录下
+                            `xxx.html` 直链 200、而目录 URL 稳定 404）。
+          'http_<code>' —— 其它 HTTP 错误（如 401/500）
+          'network'     —— 网络异常
+          'not_index'   —— 拿到了 200 但不是目录索引页（可能是 SPA 首页）
+          'no_html'     —— 索引页里没有 .html 链接
+          'ambiguous'   —— 有多个 html 且无法唯一确定
+
+        判定「是目录索引页」：响应体含 `[To Parent Directory]`（IIS）或 <pre> + 文件链接。
+        """
+        import requests
+        target = base_url
+        # 墨刀分享链接（modao.cc / 带 view_mode/screen 查询串）**天然不是文件目录**，
+        # 直接判 not_dir 返回，避免为墨刀链接多打一次无谓 HTTP 请求。
+        # （墨刀来源走 Playwright 路径，与目录解析无关。）
+        if 'modao.cc' in base_url or 'view_mode=' in base_url:
+            return None, 'not_dir'
+        if not target.endswith('/'):
+            last_seg = target.rsplit('/', 1)[-1]
+            if '.' in last_seg:
+                return None, 'not_dir'  # 已经是具体文件，不需要解析
+            target = target + '/'
+        body = ''
+        last_code = ''
+        # ⚠️ 这类内网文件服务器可能抖动，做有限重试（顺带区分「关闭目录浏览」与「临时故障」）。
+        for attempt in range(3):
+            try:
+                r = requests.get(target, cookies=cookie_dict or {}, timeout=timeout,
+                                 headers=_UA_HEADERS)
+                if r.status_code == 200:
+                    if not r.encoding or r.encoding.lower() in ('iso-8859-1', 'ascii'):
+                        r.encoding = 'utf-8'
+                    body = r.text
+                    break
+                last_code = r.status_code
+                logger.info(f'[目录解析] {target} 第 {attempt + 1} 次返回 HTTP {last_code}，重试')
+            except Exception as e:
+                last_code = 'network'
+                logger.info(f'[目录解析] {target} 第 {attempt + 1} 次异常 {e}，重试')
+            time.sleep(0.6 * (attempt + 1))
+        if not body:
+            # 404/403 → 极可能是「目录浏览被关闭」而非「内容不存在」：
+            # 同目录下的具体文件往往仍能访问，所以给出"改填直链"的可操作提示。
+            if last_code in (403, 404):
+                logger.warning(
+                    f'[目录解析] {target} 返回 HTTP {last_code}，判定为「目录浏览已关闭」'
+                    f'（同目录下的 .html 直链通常仍可访问），建议直接使用文件直链')
+                return None, 'no_browsing'
+            if last_code == 'network':
+                return None, 'network'
+            return None, f'http_{last_code}'
+        # 只在「索引页」上做解析：IIS 有 [To Parent Directory]，其它常见的是 <h1> + <pre>
+        low = body.lower()
+        if '[to parent directory]' not in low and '<pre' not in low:
+            return None, 'not_index'
+        hrefs = cls._DIR_INDEX_HREF_RE.findall(body) or cls._DIR_INDEX_HREF_RE2.findall(body)
+        if not hrefs:
+            return None, 'no_html'
+        # 去重保序，剔除外部链接
+        uniq = []
+        for h in hrefs:
+            if h not in uniq and not h.lower().startswith(('http://', 'https://', '//')):
+                uniq.append(h)
+        if not uniq:
+            return None, 'no_html'
+        if len(uniq) > 1:
+            # 多个 html 时按常见原型/文档命名优先，仍无法唯一确定则不猜
+            prio = ('prototype', 'prd', 'readonly', 'index', 'start')
+            ranked = [h for h in uniq if any(k in h.lower() for k in prio)]
+            if len(ranked) != 1:
+                logger.info(f'[目录解析] {len(uniq)} 个 html，无法唯一确定，放弃：{uniq[:6]}')
+                return None, 'ambiguous'
+            uniq = ranked
+        return urljoin(target, uniq[0]), ''
+
+    @staticmethod
+    def _dir_fail_hint(base_url: str, reason: str) -> str:
+        """把目录解析失败原因翻译成用户可执行的提示。"""
+        base = base_url.rstrip('/')
+        if reason == 'no_browsing':
+            return (f'该地址是**目录**，但服务器关闭了目录浏览（访问目录返回 404，'
+                    f'目录下的具体文件仍可访问）。请改为填写目录内 HTML 文件的完整地址，'
+                    f'形如 {base}/xxx.html')
+        if reason == 'ambiguous':
+            return (f'目录 {base} 下有多个 HTML 文件，无法自动确定用哪一个。'
+                    f'请直接填写目标 HTML 文件的完整地址')
+        if reason == 'no_html':
+            return f'目录 {base} 下未找到 HTML 文件，请确认地址是否正确'
+        if reason == 'not_index':
+            return f'该地址返回的不是文件目录索引，请确认是否为原型/文档地址'
+        if reason == 'network':
+            return f'无法访问 {base}（网络异常），请确认服务器可达'
+        if reason.startswith('http_'):
+            return f'访问目录 {base} 返回 {reason.replace("http_", "HTTP ")}，请确认地址与权限'
+        return f'目录解析失败（{reason}）'
+
+    @staticmethod
+    def _guess_dir_file_from_history(base_url: str) -> Optional[str]:
+        """兜底：从历史成功读取的记录里，找同一目录下的文件直链。
+
+        场景：用户一直粘目录地址，之前能成功（那时 data/document.js 还在），
+        现在失败。若历史 extracted_json 里记录过该目录下用过的文件 URL，直接复用。
+        注意：只做**同目录前缀匹配**，不跨目录猜；查不到返回 None。
+        """
+        try:
+            from apps.requirement_analysis.models import ModaoPrototype
+        except Exception:
+            return None
+        # 墨刀/非目录地址不做历史兜底（避免无谓的 DB 扫描）
+        if 'modao.cc' in base_url or 'view_mode=' in base_url:
+            return None
+        norm = base_url.rstrip('/').lower() + '/'
+        try:
+            qs = (ModaoPrototype.objects
+                  .exclude(extracted_json='')
+                  .order_by('-id')
+                  .values_list('extracted_json', flat=True)[:80])
+        except Exception:
+            return None
+        for ej in qs:
+            try:
+                data = json.loads(ej or '{}')
+            except Exception:
+                continue
+            # 候选来源：urls 列表 / pages 里记录过的文件级 URL / warnings 里的定位结果
+            cands = list(data.get('urls') or [])
+            for w in (data.get('warnings') or []):
+                m = re.search(r'已从目录地址定位到单文件：(\S+)', str(w))
+                if m:
+                    cands.append(m.group(1))
+            for c in cands:
+                c = str(c or '').strip()
+                if not c.lower().startswith(norm):
+                    continue
+                if '.' not in c.rsplit('/', 1)[-1]:
+                    continue  # 仍是目录，不要
+                logger.info(f'[目录解析] 从历史记录兜底命中直链：{c}')
+                return c
+        return None
+
+    # ---------- PRD 报告页（第 4 种来源，纯 HTTP）----------
+    @staticmethod
+    def _is_prd_report_html(html_text: str) -> bool:
+        """判断 HTML 是否为「PRD 报告页」格式。
+
+        特征：有 `.requirement-module`（需求模块）或 ≥2 个 `.prototype-item`（截图卡片），
+        且**没有**内联 pages 页面树（有 pages 的是单文件 H5 原型，走另一条路径）。
+        用字符串计数而非正则扫描，避免在 100MB+ 文档上退化。
+        """
+        if not html_text:
+            return False
+        # 有内联页面树 → 属于单文件 H5 原型，不是 PRD 报告页
+        if _SINGLEFILE_H5_PAGES_RE.search(html_text):
+            return False
+        n_mod = html_text.count(_PRD_MODULE_CLS)
+        n_item = html_text.count(_PRD_ITEM_CLS)
+        return n_mod >= _PRD_BLOCK_SPLIT_MIN or n_item >= 2
+
+    @staticmethod
+    def _html_to_text(fragment: str) -> str:
+        """HTML 片段 → 纯文本。保留段落/列表层级与「●➢」等项目符号。
+
+        仅用于小片段（已剥离 data URI），不做 100MB 级全文处理。
+        """
+        if not fragment:
+            return ''
+        s = _SCRIPT_RE.sub(' ', fragment)
+        s = re.sub(r'<(style|template)[^>]*>.*?</\1>', ' ', s, flags=re.S | re.I)
+        s = re.sub(r'<br\s*/?>', '\n', s, flags=re.I)
+        s = re.sub(r'</(p|div|li|h[1-6]|tr|section|td)>', '\n', s, flags=re.I)
+        s = _TAG_RE.sub('', s)
+        s = html.unescape(s)
+        s = s.replace('\u00a0', ' ')
+        s = re.sub(r'[ \t]+', ' ', s)
+        s = re.sub(r'\n\s*\n+', '\n', s)
+        return s.strip()
+
+    @classmethod
+    def _parse_prd_report(cls, html_text: str):
+        """解析 PRD 报告页，返回 (modules, proto_titles)。
+
+        modules: [{'id','name','owner','summary','text'}] —— 真正的需求正文
+        proto_titles: ['01新用户引导—剧情开始页', ...] —— 截图卡片的页名清单
+        调用前请先剥离 data URI，否则超长字符串会显著拖慢处理。
+        """
+        modules: List[Dict[str, str]] = []
+        # 需求模块：按 class 位置切片（同构、不嵌套），避免逐字符括号配对。
+        # 切片起点回退到所在标签的 '<'，否则首段会混入 `class="..." id="...">` 属性文本。
+        starts = []
+        for m in re.finditer(r'class="%s"' % _PRD_MODULE_CLS, html_text):
+            lt = html_text.rfind('<', max(0, m.start() - 400), m.start())
+            starts.append(lt if lt >= 0 else m.start())
+        if starts:
+            starts.append(len(html_text))
+            for i in range(len(starts) - 1):
+                seg = html_text[starts[i]:starts[i + 1]]
+                text = cls._html_to_text(seg)
+                if not text:
+                    continue
+                hid = ''
+                m_id = re.search(r'id="([^"]+)"', seg[:400])
+                if m_id:
+                    hid = m_id.group(1)
+                # 模块名 = 标题元素文本，兜底取正文首行
+                name = ''
+                m_h = re.search(r'<(h[1-6])[^>]*>(.*?)</\1>', seg, re.S)
+                if m_h:
+                    name = cls._html_to_text(m_h.group(2))
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                if not name and lines:
+                    name = lines[0]
+                # 模块标题行常与「负责人：X」同处一段（如「新用户剧情与首登引导负责人：孙玲」），
+                # 拆开，保证 page_name 干净、owner 单独留证。
+                if '负责人' in name:
+                    name = re.split(r'负责人[:：]', name)[0].strip()
+                owner = ''
+                m_ow = re.search(r'负责人[:：]\s*([^\s\n]+)', text)
+                if m_ow:
+                    owner = m_ow.group(1)
+                summary = ''
+                if lines:
+                    # 概述取「负责人/模块名」行之后、下一个『【/●/➢』标记之前的那一行。
+                    for ln in lines[:6]:
+                        if ('负责人' in ln or ln == name
+                                or ln.startswith(('class=', '<'))):
+                            continue
+                        if ln.startswith(('【', '●', '➢', '·', '-')):
+                            break
+                        summary = ln
+                        break
+                modules.append({
+                    'id': hid or f'module-{i + 1}',
+                    'name': name or f'需求模块{i + 1}',
+                    'owner': owner,
+                    'summary': summary,
+                    'text': text,
+                })
+        # 截图卡片页名清单
+        proto_titles: List[str] = []
+        for m in re.finditer(r'class="%s"' % _PRD_ITEM_CLS, html_text):
+            seg = html_text[m.start():m.start() + 1200]
+            m_t = re.search(r'class="prototype-title"[^>]*>(.*?)</h4>', seg, re.S)
+            if m_t:
+                t = cls._html_to_text(m_t.group(1))
+                if t:
+                    proto_titles.append(re.sub(r'^[0-9０-９]+\s*', '', t))
+                continue
+            m_a = re.search(r'<img[^>]*\balt="([^"]*)"', seg)
+            if m_a and m_a.group(1).strip():
+                proto_titles.append(m_a.group(1).strip())
+        return modules, proto_titles
+
+    @classmethod
+    def _prd_page_specs(cls, modules, proto_titles):
+        """把 (需求模块, 页面标题) 组装成落库页规格。
+
+        关键决策：**需求模块才是信息载体**。每个模块单独成一"页/画布"（携带其正文），
+        截图卡片的页名清单不单独成页，而是并入「需求模块索引」页——
+        因为 38 张卡片本身只有标题没有正文，若各自成页会产出大量空壳画布，
+        反而污染后续结构化与质量门禁（覆盖率/融合都会把它们判为无效内容）。
+        """
+        specs: List[Dict[str, str]] = []
+        for mod in modules:
+            title = mod.get('name') or '需求模块'
+            body = mod.get('text') or ''
+            # 正文已含「负责人：X」（来自原文），不重复补；仅在原文未出现时补一行，
+            # 避免同一信息出现两次干扰后续结构化。
+            if mod.get('owner') and '负责人' not in body:
+                body = f'负责人：{mod["owner"]}\n{body}'
+            specs.append({
+                'page_name': title,
+                'text': body,
+                'group': '',
+            })
+        if proto_titles:
+            lines = [f'{i}. {t}' for i, t in enumerate(proto_titles, 1)]
+            specs.append({
+                'page_name': '原型页面清单',
+                'text': ('本文档附带 %d 张原型截图页面（仅标题，无正文，'
+                         '截图内容见文档内嵌图片）：\n' % len(proto_titles))
+                        + '\n'.join(lines),
+                'group': '',
+            })
+        return specs
+
+    def _is_prd_report_url(self, url: str, cookies: Optional[str] = None) -> bool:
+        """轻量探测 URL 是否为 PRD 报告页（只读流式前若干 KB，避免拉取 100MB+ 全文）。"""
+        import requests
+        try:
+            resp = requests.get(url, cookies=self._cookie_dict(cookies),
+                                timeout=20, headers=_UA_HEADERS, stream=True)
+            if resp.status_code != 200:
+                return False
+            try:
+                length = int(resp.headers.get('Content-Length') or 0)
+            except Exception:
+                length = 0
+            # 超大文件也要扫完才有结论，因此仍读全文，但用 iter_content 提前中断：
+            # 命中 PRD 特征即可返回，避免无谓读完 100MB。
+            buf = []
+            size = 0
+            limit = 8 * 1024 * 1024  # 最多扫 8MB 就够命中特征（模块/卡片通常在文档中前部）
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    break
+                buf.append(chunk)
+                size += len(chunk)
+                joined = b''.join(buf).decode('utf-8', 'ignore')
+                if not ModaoExtractor._is_prd_report_html(joined):
+                    if size >= limit:
+                        return False
+                    continue
+                return True
+            joined = b''.join(buf).decode('utf-8', 'ignore')
+            if length and size < length:
+                # 未读完且特征未命中：降级为一次全文判断（少数模块在文档尾部的情况）
+                return False
+            return ModaoExtractor._is_prd_report_html(joined)
+        except Exception:
+            return False
+
+    def extract_prd_report_sync(self, url: str, cookies: Optional[str] = None,
+                                timeout: int = 120) -> Dict[str, Any]:
+        """PRD 报告页读取（纯 HTTP，不启动浏览器、不做视觉 OCR）。
+
+        适用于「Lovin1.2.20-PRD.html」这类自研 PRD 文档：正文是 requirement-module 需求模块，
+        内嵌截图体积极大（可达 100MB+）但信息量极低 → 解析前先剥离 data URI，
+        处理耗时通常 < 2s。返回结构与 extract_webshare_sync 一致。
+        """
+        import requests
+        warnings: List[str] = []
+        pages: List[Dict[str, Any]] = []
+        # 同 _resolve_single_html_in_dir：内网 IIS 文件服务器存在间歇性 404，
+        # 大文档（100MB+）读取耗时长也更容易被打断，故统一做有限重试。
+        html_text = ''
+        last_err = ''
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, cookies=self._cookie_dict(cookies),
+                                    timeout=timeout, headers=_UA_HEADERS)
+                if resp.status_code == 200:
+                    if not resp.encoding or resp.encoding.lower() in ('iso-8859-1', 'ascii'):
+                        resp.encoding = 'utf-8'
+                    html_text = resp.text
+                    break
+                last_err = f'HTTP {resp.status_code}'
+                logger.info(f'[PRD报告页] 第 {attempt + 1} 次获取返回 {last_err}，重试')
+            except Exception as e:
+                last_err = str(e)
+                logger.info(f'[PRD报告页] 第 {attempt + 1} 次获取异常 {last_err}，重试')
+            time.sleep(0.8 * (attempt + 1))
+        if not html_text:
+            return {'run_id': self.run_id, 'url': url, 'pages': pages,
+                    'warnings': [f'获取失败（已重试 3 次）: {last_err}']}
+
+        raw_len = len(html_text)
+        # 先剥离内联 base64 图片：这类文档 99%+ 的体积是 data URI，剥后可降到数十 KB
+        html_text = _DATA_URI_RE.sub(' [IMG] ', html_text)
+        if raw_len > 8 * 1024 * 1024:
+            warnings.append(
+                f'文档较大（{raw_len // 1024 // 1024}MB，其中绝大部分为内嵌截图），'
+                f'已跳过截图仅提取需求正文')
+
+        if not self._is_prd_report_html(html_text):
+            return {'run_id': self.run_id, 'url': url, 'pages': pages,
+                    'warnings': warnings + ['未识别为 PRD 报告页格式']}
+
+        modules, proto_titles = self._parse_prd_report(html_text)
+        if not modules and not proto_titles:
+            return {'run_id': self.run_id, 'url': url, 'pages': pages,
+                    'warnings': warnings + ['未解析出需求模块或原型页面清单']}
+
+        logger.info(f'[PRD报告页] 解析到 {len(modules)} 个需求模块、'
+                    f'{len(proto_titles)} 个原型页面标题')
+
+        specs = self._prd_page_specs(modules, proto_titles)
+        for idx, sp in enumerate(specs, 1):
+            text = sp.get('text') or ''
+            pages.append({
+                'page_no': idx,
+                'page_name': sp.get('page_name') or f'第{idx}页',
+                'parent_name': sp.get('group') or '',
+                'folder': '',
+                'text': text,
+                'dom_text': text,
+                'layer_text': '',
+                'vision_text': '',
+                'dom_text_len': len(text),
+                # PRD 文档截图未做识别 → 标记为未尝试，避免阶段0「视觉覆盖率不足」误阻断
+                'vision_attempted': False,
+                'vision_success': False,
+                # ⚠️ 本字段只由 PRD 报告页路径设置：告诉工作流的「画布自动过滤」
+                # 这些条目是需求模块（名字可能含「引导/登录」等模板关键词，
+                # 但内容是真实需求），不要按原型模板页的启发式丢弃。
+                # 原型画布（墨刀/webshare/Axure）不带此标记，行为完全不变。
+                'prd_module': True,
+                'annotations': [],
+                'screenshot': '',
+                'screenshot_segments': [],
+                'visual_summary': '',
+                'visual_artifacts': [],
+                'extraction_warnings': [],
+            })
+        warnings.append(
+            f'PRD 报告页解析完成：{len(modules)} 个需求模块'
+            + (f'、{len(proto_titles)} 个原型页面标题' if proto_titles else '')
+            + '（内嵌截图未做识别，如需图片内容请另行提供）')
+        return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+
+    async def _read_singlefile_h5_screen_texts(self, url: str,
+                                               pages_meta: List[Dict[str, Any]]) -> Dict[str, str]:
+        """单文件 H5：单次 Playwright 会话逐页 render(pid)，读取手机界面 .phone/.screen 的 innerText。
+
+        返回 {页面id: 文本}。这类原型「状态按钮」(默认/登录中/登录失败)切换时**纯文本内容不变，
+        变化的只是图片/图标**，因此 DOM 文本只读默认态一次即可，无需逐状态重复读取（避免重复
+        文本叠加，也省 Playwright 交互开销）。每个状态的「图」差异由视觉 OCR 截图层单独保留。
+        """
+        out: Dict[str, str] = {}
+        try:
+            from playwright.async_api import async_playwright
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
                 context = await browser.new_context(
                     viewport={'width': 1440, 'height': 900},
+                    user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                                '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'))
+                page = await context.new_page()
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+
+                async def _read_screen():
+                    return await page.evaluate('''() => {
+                        const el = document.querySelector('.phone') || document.querySelector('.screen');
+                        return el ? (el.innerText || el.textContent || '') : '';
+                    }''')
+
+                for idx, meta in enumerate(pages_meta, 1):
+                    pid = meta.get('id') or f'page{idx}'
+                    try:
+                        # 只读取默认态文本（状态间纯文本不变，逐状态重复读取无意义）
+                        await page.evaluate(f"render('{pid}')")
+                        await page.wait_for_timeout(400)
+                        default_txt = (await _read_screen()).strip()
+                        if default_txt:
+                            out[pid] = default_txt
+                    except Exception:
+                        out[pid] = out.get(pid, '')
+                await browser.close()
+        except Exception as e:
+            logger.warning(f'单文件H5 手机界面文本读取失败: {e}')
+        return out
+
+
+    def _extract_singlefile_h5(self, url: str, cookie_dict: Optional[Dict[str, str]] = None,
+                               vision_config=None, dual_fusion: bool = False,
+                               fusion_config=None, target_page_names=None) -> Dict[str, Any]:
+        """单文件 H5 交互原型：纯 HTTP 抓取 + 解析内联 pages 数组与页面模板。
+
+        返回结构与 extract_webshare_sync 一致：
+        {'run_id','url','pages':[{page_no,page_name,text,dom_text,vision_text,...}],'warnings'}。
+        非该格式返回空 pages + warnings（调用方据此回退其他路径）。
+        """
+        import requests
+        warnings: List[str] = []
+        pages: List[Dict[str, Any]] = []
+        try:
+            resp = requests.get(url, cookies=cookie_dict or {}, timeout=30, headers=_UA_HEADERS)
+            if resp.status_code != 200:
+                return {'run_id': self.run_id, 'url': url, 'pages': pages,
+                        'warnings': [f'获取失败: HTTP {resp.status_code}']}
+            if not resp.encoding or resp.encoding.lower() in ('iso-8859-1', 'ascii'):
+                resp.encoding = 'utf-8'
+            html_text = resp.text
+        except Exception as e:
+            return {'run_id': self.run_id, 'url': url, 'pages': pages,
+                    'warnings': [f'获取失败: {e}']}
+
+        pages_meta, templates = self._parse_singlefile_h5(html_text)
+        if not pages_meta:
+            return {'run_id': self.run_id, 'url': url, 'pages': pages,
+                    'warnings': ['未识别为单文件 H5 原型（缺内联 pages 数组）']}
+
+        # 单文件 H5 左侧全局导航文本：所有 group/title 都会作为目录项重复出现在每个画布；
+        # 单画布重读时 pages 只有 1 张，无法靠频率统计发现公共行，因此用页面树先验知识强制剔除。
+        h5_global_lines = set()
+        for _m in pages_meta:
+            for _k in ('title', 'group'):
+                _v = str(_m.get(_k) or '').strip()
+                if _v:
+                    h5_global_lines.add(_v)
+        if h5_global_lines:
+            h5_global_lines.update({'目录', 'V1 核心版', 'V1 核心版目录'})
+
+
+        # 单画布重读：只处理目标画布（按 page_name 匹配），避免对全部画布逐页 + 逐 state
+        # 调视觉 OCR 导致后台任务长时间卡死。其余画布原样保留（由 workflow 单模式落库分支处理）。
+        _target_set = set()
+        if target_page_names:
+            _target_set = {str(n).strip() for n in target_page_names if str(n).strip()}
+        if _target_set:
+            _named = []
+            _title_set = {(_t.get('title') or '').strip() for _t in pages_meta if (_t.get('title') or '').strip()}
+            # 精确匹配（page_name = group-title 拼接）；命中即收敛到目标画布。
+            for _m in pages_meta:
+                _t = _m.get('title') or ''
+                _g = _m.get('group') or ''
+                _pn = f'{_g}-{_t}' if _g else _t
+                if _pn in _target_set:
+                    _named.append(_m)
+            # 兜底：精确匹配全部失败时，用 title 包含匹配（避免因 group 解析/编码差异
+            # 导致匹配落空而退化全量 OCR 再次卡死）。
+            if not _named:
+                for _m in pages_meta:
+                    _t = (_m.get('title') or '').strip()
+                    if any(_t and _t in _tn for _tn in _target_set) or any(_tn and _tn in _t for _tn in _target_set):
+                        _named.append(_m)
+            # 至少命中一张才收敛；一张都没命中（命名体系完全错位）时退化全量，避免空结果误判
+            if _named:
+                pages_meta = _named
+                logger.info(f'[单文件H5单画布重读] 目标画布收敛为 {len(pages_meta)} 张: {sorted(_target_set)}')
+
+        # 手机界面 DOM 文本（免费）：单次 Playwright 会话逐页 render 读 .phone/.screen innerText，
+        # 与模板「需求说明」互补。state 切换需逐状态点击后再读文案，故逐 state 读取。
+        screen_texts: Dict[str, str] = {}
+        try:
+            screen_texts = asyncio.run(self._read_singlefile_h5_screen_texts(url, pages_meta))
+        except Exception as e:
+            logger.warning(f'单文件H5 手机界面文本读取失败: {e}')
+
+        for idx, meta in enumerate(pages_meta, 1):
+            try:
+                pid = meta.get('id') or f'page{idx}'
+                title = meta.get('title') or f'第{idx}页'
+                group = meta.get('group') or ''
+                page_name = f'{group}-{title}' if group else title
+                tpl_html = templates.get(pid, '')
+                dom_text = ''
+                if isinstance(tpl_html, str):
+                    dom_text = html.unescape(_TAG_RE.sub(' ', tpl_html)).strip()
+                # 合并手机界面 DOM 文本（免费），补上模板「需求说明」未覆盖的界面文案
+                stxt = (screen_texts.get(pid) or '').strip()
+                if stxt:
+                    dom_text = (dom_text + '\n[手机界面] ' + stxt).strip()
+                screenshot_path = ''
+                vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                vision_text = ''
+                vision_attempted = False
+                page_vision_summary = ''
+                page_vision_artifacts = []
+                # 视觉补充（与 webshare 一致）：双路融合 / 纯图片页 / 混合页时触发。
+                # 单文件 H5 所有页面同 URL，靠 render(pageId) 切页。状态按钮切换时**纯文本内容不变，
+                # 变化的是图片/图标**，因此 OCR 文本与 visual_summary 只取默认态一次（逐状态 OCR 会得到
+                # 重复文本，徒增视觉模型调用开销且叠加噪声）。但每个状态的「图」仍需截图保留为视觉证据：
+                # 这里逐状态切换后仅截图、不调 OCR，最后一张状态截图作为画布代表截图。
+                states = meta.get('states') or []
+                if vision_config and (
+                    dual_fusion or len(dom_text.strip()) < 30 or self._html_has_visual(tpl_html)
+                ):
+                    vision_attempted = True
+                    # 默认态截图 OCR（拿文本 + 视觉摘要）
+                    try:
+                        vision_result = asyncio.run(self._ocr_webshare_page_async(
+                            url, cookie_dict or {}, vision_config, idx,
+                            post_js=f"render('{pid}')", shot_name=f'ws_page_{idx}.png'))
+                    except Exception as e:
+                        vision_result = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                        logger.warning(f'单文件H5 页面[{page_name}]默认态视觉OCR失败: {e}')
+                    vision_text = vision_result.get('ocr_text', '')
+                    page_vision_summary = vision_result.get('visual_summary', '')
+                    page_vision_artifacts = vision_result.get('visual_artifacts', []) or []
+                    default_ocr_lines = {ln.strip() for ln in (vision_text or '').splitlines() if ln.strip()}
+                    # 逐状态：切换后截图并做完整 OCR，但只保留相对默认态的文本差异
+                    # （避免状态间公共文案重复；同时保留新增提示/错误文案，如登录失败提示）。
+                    for si, st in enumerate(states, 1):
+                        st = str(st).strip()
+                        if not st:
+                            continue
+                        switched = False
+                        st_result = None
+                        for js in (
+                            f"render('{pid}');setState('{pid}', '{st}')",
+                            f"render('{pid}');setState('{st}')",
+                            f"setState('{st}')",
+                        ):
+                            try:
+                                st_result = asyncio.run(self._ocr_webshare_page_async(
+                                    url, cookie_dict or {}, vision_config, idx,
+                                    post_js=js,
+                                    shot_name=f'ws_page_{idx}_st{si}.png',
+                                    summary_only=False))
+                                switched = True
+                                break
+                            except Exception:
+                                continue
+                        if not switched or not st_result:
+                            continue
+                        if st_result.get('visual_summary'):
+                            page_vision_summary = (page_vision_summary
+                                                   + f'\n[状态:{st}]\n' + st_result['visual_summary']).strip()
+                        # 只保留默认态没有的文本行，防止状态间重复叠加
+                        st_ocr_lines = [ln for ln in (st_result.get('ocr_text') or '').splitlines()
+                                        if ln.strip() and ln.strip() not in default_ocr_lines]
+                        if st_ocr_lines:
+                            page_vision_summary = (page_vision_summary
+                                                   + f'\n[状态:{st} 新增文本]\n' + '\n'.join(st_ocr_lines)).strip()
+                            vision_text = (vision_text
+                                           + f'\n[状态:{st}]\n' + '\n'.join(st_ocr_lines)).strip()
+                        # 最后一张状态截图作为该画布代表截图（视觉证据）
+                        st_shot = os.path.join(self.shot_dir, f'ws_page_{idx}_st{si}.png')
+                        if os.path.exists(st_shot):
+                            screenshot_path = os.path.relpath(st_shot, self.media_root)
+                vision_success = bool(
+                    vision_text
+                    or page_vision_summary
+                    or page_vision_artifacts
+                )
+                text = (dom_text or '')
+                if vision_text:
+                    text = text + '\n[视觉OCR补充]\n' + vision_text
+                rendered_shot = os.path.join(self.shot_dir, f'ws_page_{idx}.png')
+                if os.path.exists(rendered_shot) and not screenshot_path:
+                    screenshot_path = os.path.relpath(rendered_shot, self.media_root)
+                page_vision_text = vision_text or ''
+                if page_vision_summary:
+                    page_vision_text = (page_vision_text + '\n' + page_vision_summary).strip()
+                pages.append({
+                    'page_no': idx,
+                    'page_name': page_name,
+                    'text': text,
+                    'dom_text': dom_text,
+                    'vision_text': page_vision_text,
+                    'dom_text_len': len(dom_text or ''),
+                    'vision_attempted': vision_attempted,
+                    'vision_success': vision_success,
+                    'annotations': [],
+                    'screenshot': screenshot_path,
+                    'visual_summary': page_vision_summary,
+                    'visual_artifacts': page_vision_artifacts,
+                    'states': states,
+                    'extraction_warnings': (
+                        ['视觉识别未返回有效内容']
+                        if vision_attempted and not vision_success else []
+                    ),
+                })
+            except Exception as e:
+                warnings.append(f"页面[{meta.get('title', idx)}]解析失败: {e}")
+                pages.append({
+                    'page_no': idx,
+                    'page_name': meta.get('title') or f'第{idx}页',
+                    'text': '',
+                    'annotations': [],
+                    'screenshot': '',
+                    'visual_summary': '',
+                    'visual_artifacts': [],
+                    'extraction_warnings': [str(e)],
+                })
+
+        # 单文件 H5：所有画布共用同一份左侧全局导航（目录列表），
+        # 而画布本就是按模块拆分的，导航无独立信息价值 → 从每个画布文本中剔除。
+        # 策略1：用页面树已知的 group/title 作为先验导航集合，>=1 页即执行（兼容单画布重读）。
+        # 策略2：统计每行在多少画布出现，>=80% 视为全局公共资源（捕获状态栏/固定水印等）。
+        global_lines = set(h5_global_lines)
+        if len(pages) >= 3:
+            from collections import Counter
+            line_counter: Counter = Counter()
+            for pg in pages:
+                seen = set()
+                for ln in (pg.get('text') or '').splitlines():
+                    s = ln.strip()
+                    if s:
+                        seen.add(s)
+                for s in seen:
+                    line_counter[s] += 1
+            threshold = max(2, int(0.8 * len(pages)))
+            global_lines.update({ln for ln, c in line_counter.items() if c >= threshold})
+        if global_lines:
+            for pg in pages:
+                for key in ('text', 'dom_text', 'vision_text'):
+                    val = (pg.get(key) or '')
+                    kept = [ln for ln in val.splitlines() if ln.strip() not in global_lines]
+                    pg[key] = '\n'.join(kept).strip()
+                pg['dom_text_len'] = len(pg.get('dom_text') or '')
+
+
+        fused_requirements: List[Dict[str, Any]] = []
+        if dual_fusion and fusion_config:
+            try:
+                fused_requirements = asyncio.run(self.dual_fusion_requirements(pages, fusion_config))
+            except Exception as e:
+                logger.warning(f'单文件H5 双路融合失败（已跳过）: {e}')
+                warnings.append(f'双路融合失败（已跳过）: {e}')
+        result: Dict[str, Any] = {
+            'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+        if dual_fusion:
+            result['dual_fusion'] = True
+            result['fused_requirements'] = fused_requirements
+        return result
+
+    # ---------- webshare / Axure：纯图片页视觉 OCR 兜底 ----------
+    async def _ocr_webshare_page_async(self, page_url: str, cookie_dict: Dict[str, str],
+                                       vision_config, idx: int,
+                                       post_js: Optional[str] = None,
+                                       shot_name: Optional[str] = None,
+                                       skip_ocr: bool = False,
+                                       summary_only: bool = False) -> Dict[str, Any]:
+        """对 webshare 单个页面用 Playwright 渲染、截图，再调视觉模型 OCR（纯图片/截图/表格页兜底）。
+
+        仅在 extract_webshare_sync 中『文本极少』时调用，纯文本页不会进入此分支。
+        post_js：可选，goto 后执行的 JS（单文件 H5 需 render('页面id') 切到对应页）。
+        shot_name：可选，自定义截图文件名（单文件 H5 多 state 切换时避免覆盖默认页截图）。
+        skip_ocr：True 时只渲染+截图、不调视觉模型（用于纯保留截图证据场景）。
+        summary_only：True 时仍调视觉模型，但只保留 visual_summary、丢弃 ocr_text/artifacts
+                      （用于单文件 H5 逐状态「只识别图差异」：状态间纯文本相同，仅需模型
+                      描述该状态相对默认态的视觉区别，避免重复合并 OCR 文本）。
+        """
+        from playwright.async_api import async_playwright
+        if not vision_config:
+            return {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+        shot_path = os.path.join(self.shot_dir, shot_name or f'ws_page_{idx}.png')
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                context = await browser.new_context(
+                    viewport={'width': 1920, 'height': 1200},
+                    device_scale_factor=4,
                     user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                                 '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'))
                 if cookie_dict:
@@ -667,10 +1928,24 @@ class ModaoExtractor:
                         pass
                 page = await context.new_page()
                 await page.goto(page_url, wait_until='networkidle', timeout=60000)
+                if post_js:
+                    try:
+                        await page.evaluate(post_js)
+                        await page.wait_for_timeout(500)
+                    except Exception:
+                        pass
                 await page.wait_for_timeout(2000)
                 await page.screenshot(path=shot_path, full_page=True)
                 await browser.close()
-            return await self._ocr_screenshot(vision_config, shot_path)
+            if skip_ocr:
+                # 仅保留截图作为视觉证据，不调视觉模型（省调用）
+                return {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+            ocr_out = await self._ocr_screenshot(vision_config, shot_path)
+            if summary_only:
+                # 只保留状态视觉描述，不合并 OCR 文本（状态间纯文本相同，合并文本无意义）
+                return {'ocr_text': '', 'visual_summary': ocr_out.get('visual_summary', ''),
+                        'visual_artifacts': []}
+            return ocr_out
         except Exception as e:
             logger.warning(f'webshare 页面渲染/截图失败（跳过视觉OCR）: {e}')
             return {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
@@ -685,7 +1960,7 @@ class ModaoExtractor:
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False, args=['--no-sandbox'])
-            context = await browser.new_context(viewport={'width': 1440, 'height': 900})
+            context = await browser.new_context(viewport={'width': 1440, 'height': 900}, device_scale_factor=2)
             page = await context.new_page()
             await page.goto(url, wait_until='domcontentloaded', timeout=60000)
             logger.info(f'请在打开的浏览器中扫码登录墨刀，将在 {wait_seconds}s 后自动导出 cookie…')
@@ -697,8 +1972,19 @@ class ModaoExtractor:
     # ---------- 内部辅助 ----------
     @staticmethod
     def _parse_cookies(cookies: Optional[str]) -> List[Dict[str, Any]]:
+        """解析 cookie 为 Playwright 可用的列表。
+
+        支持三种来源：
+        1) JSON 列表：[{"name": "x", "value": "y", ...}, ...]
+        2) JSON 对象：{"cookies": [{"name":..,"value":..}, ...]}
+        3) 浏览器复制的 raw 字符串："csrftoken=abc; sessionid=xyz; ..."（最常见，
+           用户在开发者工具 Request Headers 里直接复制的那一行）
+        未识别格式返回空列表（调用方据此降级匿名访问）。
+        """
         if not cookies:
             return []
+        cookies = cookies.strip()
+        # 1) / 2) JSON 格式
         try:
             data = json.loads(cookies)
             if isinstance(data, list):
@@ -707,16 +1993,47 @@ class ModaoExtractor:
                 return data['cookies']
         except Exception:
             pass
+        # 3) raw "k=v; k2=v2" 格式
+        try:
+            out = []
+            for part in cookies.split(';'):
+                part = part.strip()
+                if not part or '=' not in part:
+                    continue
+                k, v = part.split('=', 1)
+                k, v = k.strip(), v.strip()
+                if k and v:
+                    out.append({'name': k, 'value': v, 'domain': '.modao.cc', 'path': '/'})
+            if out:
+                return out
+        except Exception:
+            pass
         return []
 
-    async def _enumerate_pages(self, page, source_type: str = None) -> List[Any]:
-        """枚举页面树元素，返回可点击的页面项列表（为空表示未识别）。"""
+    async def _enumerate_pages(self, page, source_type: str = None,
+                               wait_timeout: int = 8000) -> List[Any]:
+        """枚举页面树元素，返回可点击的页面项列表（为空表示未识别）。
+
+        注意：墨刀页面树里顶层画布展开后的「竖版/横版/弹窗」也是各自独立、点击会切换画布的
+        真实画布，必须保留，不能按 DOM 层级过滤（否则会遗漏）。真正要剔除的是「点击后画布
+        不变化」的纯分组/容器节点，那在抓取循环中用视口指纹判定并跳过（见 _run_extract 循环）。
+
+        [稳健化] 墨刀 read_only 分享页的页面树是懒加载/按需渲染的，初始可能尚未把
+        `.rn-list-item` 注入 DOM（脚本探测偶发拿到 0 节点）。因此不再“同步轮询、空即返回”，
+        而是对每个候选选择器先用 wait_for_selector 短暂等待其出现（带超时轮询），命中即返回；
+        全部候选都等不到再返回空，避免把“渲染未就绪”误判为“没有页面”。
+        """
         selectors = list(PAGE_TREE_SELECTORS)
         if source_type == 'webshare':
             # webshare 优先用专门的页面树选择器，再回退通用选择器
             selectors = list(WEBSHARE_PAGE_TREE_SELECTORS) + list(PAGE_TREE_SELECTORS)
         for sel in selectors:
             try:
+                # 先等该选择器出现；超时则换下一个候选（不抛错）
+                try:
+                    await page.wait_for_selector(sel, timeout=wait_timeout, state='attached')
+                except Exception:
+                    continue
                 items = await page.query_selector_all(sel)
                 if items:
                     logger.info(f'页面树命中选择器: {sel}，共 {len(items)} 页')
@@ -724,6 +2041,99 @@ class ModaoExtractor:
             except Exception:
                 continue
         return []
+
+    async def _detect_parent_name(self, item, retries: int = 3,
+                                  wait_timeout: int = 4000) -> str:
+        """[稳健化] 读取画布页 item 的上级分组标题（如「前置付费页」）。
+
+        墨刀分组项是 `.rn-list-item.folder`（**实测真实 class 是 folder，不是 fo**；
+        此前用 `.rn-list-item.fo` 恒匹配不到，导致误判"只读页不渲染分组"、父级永远为空），
+        与画布页（`.rn-list-item.page`）是**兄弟节点**而非祖先，故靠 DOM 顺序中「当前
+        画布页之前、最近的那个分组项」作为上级标题，拼成「父-子」层级名（如 前置付费页-横版）。
+
+        页面树懒加载未就绪时，分组节点可能尚未出现；这里做：① 重试 evaluate 最多 retries 次、
+        每次失败前等待短暂时间；② 若 evaluate 抛错（句柄失效/节点未渲染）则降级返回空串，
+        由调用方决定是否拼前缀。不直接抛错，避免中断整页抓取。
+        """
+        if item is None:
+            return ''
+        last_err = ''
+        for attempt in range(1, retries + 1):
+            try:
+                parent_name = await item.evaluate(
+                    """el => {
+                        try {
+                            // 分组节点真实 class 为 folder（兼容历史 fo 写法）
+                            const folders = Array.from(
+                                document.querySelectorAll('.rn-list-item.folder, .rn-list-item.fo'));
+                            let best = null;
+                            for (const f of folders) {
+                                // f 必须在 el 之前（PRECEDING = f 先于 el）
+                                if (el.compareDocumentPosition(f) & Node.DOCUMENT_POSITION_PRECEDING) {
+                                    // 取"最靠后的前置分组"= 离 el 最近的父分组：
+                                    // 仅当 f 在 best 之后（FOLLOWING = best 先于 f）时才更新 best。
+                                    // （此前误用 PRECEDING 导致取到最靠前的分组，
+                                    //   使所有画布都归属第一个分组，如「通用付费页」下的画布
+                                    //   被错标为「前置付费页」。）
+                                    if (!best || (best.compareDocumentPosition(f) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+                                        best = f;
+                                    }
+                                }
+                            }
+                            if (best) {
+                                const t = (best.innerText || '').trim().split('\\n')[0];
+                                if (t && t !== (el.innerText||'').trim().split('\\n')[0]) return t;
+                            }
+                        } catch (e) {}
+                        return '';
+                    }"""
+                )
+                parent_name = (parent_name or '').strip()
+                if parent_name:
+                    return parent_name
+                # 拿到空：可能是分组节点还没渲染出来，等一会再试
+                if attempt < retries:
+                    await asyncio.sleep(0.4)
+            except Exception as e:  # 句柄失效/节点未就绪
+                last_err = str(e)
+                if attempt < retries:
+                    await asyncio.sleep(0.4)
+        if last_err:
+            logger.warning(f'检测上级分组失败(已降级为空): {last_err}')
+        return ''
+
+    @staticmethod
+    def _split_page_hierarchy(page_name: str) -> tuple:
+        """从页面名本身提取层级前缀作为父级分组（页面树无 folder 节点时的兜底）。
+
+        墨刀部分原型在只读分享页中不渲染 folder 分组节点，但会把层级关系直接
+        编码在页面名里，例如「引导-身体数据」「升级付费-Android」。此时从 DOM
+        读不到父级，需要按常见分隔符拆分，返回 (parent_name, child_page_name)。
+
+        拆分规则：
+          - 分隔符：- / > ： : | （按优先级尝试）
+          - 前缀/后缀都非空，且长度在合理范围
+          - 避免把日期/版本号等纯数字片段当作父级分组
+          - 仅拆一次，保留后缀中可能存在的剩余分隔符
+        """
+        if not page_name:
+            return '', ''
+        delimiters = ['-', '/', '>', '：', ':', '|']
+        for d in delimiters:
+            if d in page_name:
+                parts = page_name.split(d, 1)
+                if len(parts) == 2:
+                    parent = parts[0].strip()
+                    child = parts[1].strip()
+                    if (len(parent) >= 2 and len(parent) <= 40 and
+                            len(child) >= 1 and len(child) <= 100):
+                        # 过滤掉像 "03.15"、"V1.0" 这类非分组前缀
+                        if re.fullmatch(r'\d{1,2}[./]\d{1,2}', parent):
+                            continue
+                        if re.fullmatch(r'[vV]\d+(?:\.\d+)*', parent):
+                            continue
+                        return parent, child
+        return '', page_name
 
     @staticmethod
     async def _viewport_fingerprint(page) -> str:
@@ -734,29 +2144,183 @@ class ModaoExtractor:
         except Exception:
             return ''
 
-    async def _activate_page_item(self, page, item) -> bool:
-        """点击页面树条目，并用视口指纹确认切换；普通点击失败时再强制点击一次。"""
+    _MODAO_ACTIVE_CID_JS = '''() => {
+        const a = document.querySelector('.rn-list-item.active, li.rn-content-item.active');
+        if (!a) return null;
+        const li = a.closest('li') || a;
+        return li.getAttribute('data-cid') || a.getAttribute('data-cid') || null;
+    }'''
+    # 提取每个画布节点所属文件夹路径（按左侧页面树层级拼接）
+    # 只认 data-interactive-target-type=6 的节点，其余 target-type 视为文件夹节点
+    # 文件夹名取 .editable-span 文本，按 '/' 拼接成 一级/二级 路径
+    # 画布节点(target-type=6)自身不计入路径，只取它归属的 folder
+    _MODAO_CANVAS_FOLDERS_JS = '''() => {
+        const rows = [];
+        const ttOf = (li) => {
+            const n = li.querySelector('[data-interactive-target-type]');
+            return n ? n.getAttribute('data-interactive-target-type') : '';
+        };
+        const nameOf = (li) => {
+            const n = li.querySelector('.editable-span');
+            return n ? n.innerText.trim() : '';
+        };
+        for (const li of document.querySelectorAll('li.rn-content-item')) {
+            if (ttOf(li) !== '6') continue;
+            const cid = li.getAttribute('data-cid');
+            if (!cid) continue;
+            const path = [];
+            let cur = li.parentElement;
+            while (cur) {
+                const g = cur.closest('li.rn-content-item');
+                if (!g) break;
+                const tt = ttOf(g);
+                const nm = nameOf(g);
+                if (tt !== '6' && nm) path.unshift(nm);
+                cur = g.parentElement;
+            }
+            rows.push({ cid, folder: path.join('/') });
+        }
+        return rows;
+    }'''
+    async def _extract_canvas_folders(self, page) -> dict:
+        """提取每个画布所属文件夹，返回 {cid: folder} 映射"""
+        try:
+            rows = await page.evaluate(self._MODAO_CANVAS_FOLDERS_JS)
+            return {r['cid']: r.get('folder', '') for r in (rows or []) if isinstance(r, dict)}
+        except Exception as e:
+            logger.warning(f'提取画布文件夹失败: {e}')
+            return {}
+
+
+
+    # 按墨刀内容元素(.widget)提取画布文本，分两组：
+    #   body   = 画布正文文字（按位置 y→x 排序）
+    #   sticky = 便利贴批注（wSticky，按编号升序，无编号排最后）
+    # 相比整页 body.innerText，这样天然不含顶栏/导航/缩放比例等 UI 控件文字，
+    # 且能区分「界面文案」与「批注说明」。
+    _MODAO_EXTRACT_TEXTS_JS = '''() => {
+        const scope = document.querySelector('.mb-screen') || document;
+        const body = [], sticky = [];
+        const seenBody = new Set(), seenSticky = new Set();
+        for (const w of scope.querySelectorAll('.widget')) {
+            const r = w.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) continue;
+            const cls = typeof w.className === 'string' ? w.className : '';
+            const t = (w.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (!t || t.length < 2) continue;
+            // 纯署名/日期（如"墨刀用户 2026.07.24"）无需求内容，跳过
+            const cleaned = t.replace(/\\d{4}[./]\\d{1,2}[./]\\d{1,2}/g, '')
+                             .replace(/墨刀用户/g, '').trim();
+            if (!cleaned) continue;
+            // 手机状态栏时间与纯符号装饰对需求无用
+            if (/^\\d{1,2}:\\d{2}$/.test(t) || /^[…...·•+×✓-]+$/.test(t)) continue;
+            const isSticky = /(^|\\s)wSticky(\\s|$)/.test(cls);
+            const item = {text: t.slice(0, 1500), x: Math.round(r.x), y: Math.round(r.y)};
+            if (isSticky) {
+                const key = t.slice(0, 60);
+                if (seenSticky.has(key)) continue;
+                seenSticky.add(key);
+                sticky.push(item);
+            } else {
+                const key = t.slice(0, 60);
+                if (seenBody.has(key)) continue;
+                seenBody.add(key);
+                body.push(item);
+            }
+        }
+        const byPos = (a, b) => (a.y - b.y) || (a.x - b.x);
+        body.sort(byPos);
+        const stickyNum = (s) => {
+            const m = (s.text || '').match(/^(\\d+)[.、\\s]/);
+            return m ? parseInt(m[1], 10) : 1e9;
+        };
+        sticky.sort((a, b) => (stickyNum(a) - stickyNum(b)) || byPos(a, b));
+        return {body: body.slice(0, 300), sticky: sticky.slice(0, 60)};
+    }'''
+
+    async def _activate_page_item(self, page, item, other_items=None, item_cid: str = '') -> bool:
+        """点击页面树条目，并确认画布确实切换到了目标。
+
+        【校验优先级】active_cid 精确比对 > 视口指纹对比。
+        指纹对比不可靠：相邻/同名画布（如两个「竖版」）内容相近时，即使切换成功
+        视口指纹也可能不变；反之切换失败时指纹却可能因动画而变。用页面上
+        `.active` 项的 data-cid 与目标 cid 直接比对才准确无误（这也是撞图的根治手段）。
+
+        重试策略（单纯重复点击同一 item 对墨刀无效——墨刀判定「当前已在该画布
+        状态」时对同名/相邻项点击不会重新渲染）：
+          1. 首轮：Escape → 点击目标 → 等待 → 校验。
+          2. 重试轮：先点一个**其他**画布制造状态差，等墨刀渲染，**再点回目标**。
+
+        item_cid 为目标画布的 data-cid（调用方从 item 上读取后传入）；为空时
+        退化为仅指纹对比（兼容旧调用）。
+        """
         try:
             await page.keyboard.press('Escape')
             await page.wait_for_timeout(200)
         except Exception:
             pass
-        before = await self._viewport_fingerprint(page)
-        for force in (False, True):
+
+        async def _active_cid() -> str:
             try:
-                await item.scroll_into_view_if_needed()
-                await item.click(force=force, timeout=5000)
-                await page.wait_for_timeout(1500)
-                try:
-                    await page.keyboard.press('Escape')
-                    await page.wait_for_timeout(200)
-                except Exception:
-                    pass
-                after = await self._viewport_fingerprint(page)
-                if before and after and before != after:
-                    return True
+                return (await page.evaluate(self._MODAO_ACTIVE_CID_JS) or '').strip()
             except Exception:
-                continue
+                return ''
+        before = await self._viewport_fingerprint(page)
+
+        async def _emit_click(target, mode: int) -> None:
+            """按 mode 用不同方式触发点击，逐级兜底。
+
+            mode 0: Playwright 常规点击（最贴近真实用户操作）。
+            mode 1: 直接派发 DOM click 事件（绕过遮挡/坐标偏移，
+                    能触发墨刀 React 绑定在节点上的 handler，对分组内
+                    被遮挡或坐标计算偏差的条目更有效）。
+            mode 2: Playwright 强制坐标点击（force=True）。
+            """
+            if mode == 1:
+                await target.evaluate('el => el.click()')
+            elif mode == 2:
+                await target.click(force=True, timeout=5000)
+            else:
+                await target.click(timeout=5000)
+
+        for attempt in range(4):
+            for click_mode in (0, 1, 2):
+                try:
+                    await item.scroll_into_view_if_needed()
+                    # 重试轮：先切到"其他"画布制造状态差，再点回目标，强制墨刀重新渲染
+                    if attempt > 0 and other_items and click_mode == 0:
+                        for oi in other_items:
+                            if oi is item:
+                                continue
+                            try:
+                                await oi.scroll_into_view_if_needed()
+                                await oi.click(force=True, timeout=5000)
+                                await page.wait_for_timeout(1000)
+                                break
+                            except Exception:
+                                continue
+                    await _emit_click(item, click_mode)
+                    await page.wait_for_timeout(1200 + attempt * 600)
+                    try:
+                        await page.keyboard.press('Escape')
+                        await page.wait_for_timeout(200)
+                    except Exception:
+                        pass
+                    # 1) 精确校验：当前 active 项的 cid 是否就是目标 cid
+                    if item_cid:
+                        ac = await _active_cid()
+                        if ac and ac == item_cid:
+                            return True
+                        if ac:
+                            logger.info(f'[切换] 点击后激活了 {ac}，目标为 {item_cid}，继续重试')
+                    # 2) 兜底：视口指纹对比
+                    after = await self._viewport_fingerprint(page)
+                    if before and after and before != after:
+                        return True
+                except Exception:
+                    continue
+        # 确实未变化：很可能是纯分组/容器节点，记录 warning 便于追溯，仍返回 False
+        logger.info('页面项点击后视口指纹未变化，判定为未切换画布（可能为非独立分组节点）')
         return False
 
     def _mark_duplicate_screenshots(self, pages: List[Dict[str, Any]]) -> List[List[int]]:
@@ -785,15 +2349,59 @@ class ModaoExtractor:
                 page_data['duplicate_of_page'] = page_nos[0]
         return duplicates
 
+    async def _extract_widget_text(self, page) -> str:
+        """按墨刀内容元素(.widget)提取画布文本，分「正文 / 便利贴批注」两组。
+
+        相比整页 body.innerText 的优点：天然不含顶栏、导航、缩放比例等 UI 控件
+        文字（它们不是 .widget），无需依赖后置噪声过滤；且保留批注与正文的区分。
+        提取失败或画布无 widget 时返回空串，由调用方回退到 innerText。
+        """
+        try:
+            data = await page.evaluate(self._MODAO_EXTRACT_TEXTS_JS)
+        except Exception:
+            return ''
+        if not data:
+            return ''
+        body = data.get('body') or []
+        sticky = data.get('sticky') or []
+        if not body and not sticky:
+            return ''
+        parts = []
+        if body:
+            parts.append('[画布正文]\n' + '\n'.join(x['text'] for x in body))
+        if sticky:
+            parts.append('[便利贴批注]\n' + '\n'.join(x['text'] for x in sticky))
+        return '\n'.join(parts)
+
     async def _extract_visible_text(self, page, retry: bool = False,
                                     min_chars: int = 60, max_retries: int = 2) -> str:
         """提取页面可见文本。retry=True 时（墨刀 DOM 异步渲染）首抓偏短则等待重试，
-        对抗偶发 0 字符 / 未就绪，返回最终文本。"""
+        对抗偶发 0 字符 / 未就绪，返回最终文本。
+
+        优先走 widget 分组提取（_extract_widget_text，天然无 UI 噪声且区分批注）；
+        该路取不到内容时回退整页 innerText，并用 _strip_ui_noise 剔除
+        「总览/演示/标注/登录/62%」等界面控件文字。
+        """
+        # 1) 优先：按 .widget 分组提取
+        widget_text = await self._extract_widget_text(page)
+        if widget_text and len(widget_text) >= min_chars:
+            return widget_text
+        # widget 路内容偏少时，也重试等待一次（墨刀 DOM 异步渲染）
+        if widget_text and retry:
+            for _ in range(max_retries):
+                await page.wait_for_timeout(1500)
+                _t = await self._extract_widget_text(page)
+                if _t and len(_t) > len(widget_text):
+                    widget_text = _t
+            if len(widget_text) >= min_chars:
+                return widget_text
+
+        # 2) 回退：整页 innerText + UI 噪声过滤
         try:
             text = (await page.evaluate('() => document.body.innerText') or '').strip()
         except Exception as e:
             logger.warning(f'提取可见文本失败: {e}')
-            return ''
+            return widget_text
         tries = 1
         while retry and len(text) < min_chars and tries <= max_retries:
             await page.wait_for_timeout(1500)
@@ -802,7 +2410,209 @@ class ModaoExtractor:
             except Exception:
                 break
             tries += 1
-        return text
+        cleaned = self._strip_ui_noise(text)
+        return cleaned or widget_text
+
+    # 墨刀只读分享页自身的 UI 控件文字（整行精确匹配即剔除）。
+    _UI_NOISE_EXACT = frozenset({
+        '总览', '演示', '标注', '登录', '注册', '分享', '评论', '导出', '预览',
+        '原型', '全屏', '适应屏幕', '回到顶部', '退出全屏', '缩放', '画布',
+        '返回', '更多', '设置', '帮助', '搜索',
+    })
+    # 整行命中的噪声模式：缩放比例（62% / 100.0%）、纯页码/标尺数字。
+    _UI_NOISE_PATTERNS = (
+        r'^\s*\d+(?:\.\d+)?\s*%\s*$',
+        r'^\s*[+\-]?\d+(?:\.\d+)?\s*(?:px|pt)?\s*$',
+    )
+
+    @classmethod
+    def _strip_ui_noise(cls, text: str) -> str:
+        """剔除墨刀 UI 控件噪声行，保留业务文本（含画布批注/便签）。
+
+        同时用于 DOM 文本路（_extract_visible_text）与视觉 OCR 路（_parse_vision_payload），
+        保证两路输入到 LLM 的文本都不含「总览/演示/标注/登录/62%」这类界面控件文字。
+        """
+        if not text:
+            return ''
+        kept = []
+        for line in text.split('\n'):
+            s = line.strip()
+            if not s:
+                continue
+            if s in cls._UI_NOISE_EXACT:
+                continue
+            if any(re.match(p, s) for p in cls._UI_NOISE_PATTERNS):
+                continue
+            kept.append(s)
+        return '\n'.join(kept)
+
+    # 形状/图标/装饰类图层名关键词（无业务文本，应跳过）
+    _NON_TEXT_LAYER_HINTS = (
+        '矩形', '圆形', '椭圆', '线条', '箭头', '图片', '图像', '图标', '底栏', '状态栏',
+        '背景', '遮罩', '按钮', 'md-', 'shape', 'rect', 'icon', 'image', 'bg',
+        'group', '分组', '画板', 'frame',
+    )
+
+    async def _extract_layer_text(self, page, item, warnings: List[str],
+                                  source_type: str = 'modao',
+                                  page_name: str = '', item_cid: str = '') -> str:
+        """[墨刀图层树增强] 在 inspect 模式下读取图层面板的文本图层名（100% 命中 DOM 文本，
+        无 OCR 幻觉），与 DOM innerText + 视觉 OCR 形成第三路来源。
+
+        流程：切 inspect → 点「图层」tab → 逐个展开分组(JS 标记 dataset.__exp + 数量信号
+              防 expander toggle 横跳) → 取文本图层名
+              → 切回 read_only 并重新激活当前画布（保证后续截图/OCR 仍在 read_only 下进行）。
+
+        仅对墨刀 source 启用；失败静默回退（OCR 仍兜底），不影响主流程。
+        """
+        if source_type != 'modao':
+            return ''
+        try:
+            # 1) 切换到 inspect 模式（墨刀 sharing 已开放 view_mode=inspect）
+            #    注：墨刀分享页有长轮询心跳，networkidle 永不触发，必须用 domcontentloaded。
+            current = page.url
+            if 'view_mode=inspect' not in current:
+                base = current.split('?')[0]
+                await page.goto(base + '?view_mode=inspect',
+                                wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(1500)
+
+            # 2) 点「图层」tab（如存在）
+            try:
+                layer_tab = page.locator('text=图层').first
+                if await layer_tab.is_visible(timeout=2000):
+                    await layer_tab.click()
+                    await page.wait_for_timeout(400)
+            except Exception:
+                pass
+
+            # 3) 逐个展开所有分组。墨刀分享态的 expander 是同一 DOM 节点的 toggle，
+            #    点击已展开节点会折叠，且展开后不添加 expanded 类（无法用 :not() 排除），
+            #    直接循环点第一个会反复横跳。这里用 JS 给已点 expander 打 dataset.__exp
+            #    标记避免重复点击，并以 layer-item 总数是否增长作为展开成功信号；若某轮
+            #    点击后总数不增（误触已展开节点的折叠），立即再点恢复并停止，防止死循环。
+            for _ in range(4):
+                before = await page.locator(".rn-list-item.layer-item").count()
+                clicked = await page.evaluate(
+                    """() => {
+                        const exps = Array.from(
+                            document.querySelectorAll('.rn-list-item.layer-item .expander'));
+                        let n = 0;
+                        for (const e of exps) {
+                            if (e.dataset.__exp) continue;
+                            e.dataset.__exp = '1';
+                            e.click();
+                            n++;
+                        }
+                        return n;
+                    }"""
+                )
+                await page.wait_for_timeout(500)
+                after = await page.locator(".rn-list-item.layer-item").count()
+                if not clicked:
+                    break
+                if after <= before:
+                    # 误折叠已展开节点：撤销点击恢复展开，并停止（无新分组可展开）
+                    await page.evaluate(
+                        """() => {
+                            const exps = Array.from(
+                                document.querySelectorAll('.rn-list-item.layer-item .expander'));
+                            for (const e of exps) {
+                                if (e.dataset.__exp) { e.click(); delete e.dataset.__exp; }
+                            }
+                        }"""
+                    )
+                    await page.wait_for_timeout(500)
+                    break
+            await page.wait_for_timeout(300)
+
+            # 4) 收集文本图层名（去形状/图标/空名；兼容编辑态 T 前缀）
+            texts: List[str] = []
+            # 墨刀分享态真实 class 为 .rn-list-item.layer-item；其余为兼容其他版本兜底
+            layer_items = page.locator(
+                ".rn-list-item.layer-item, div[class*='layer-item'], "
+                "[class*='layer-tree'] [class*='item'], [class*='tree-item']")
+            n = await layer_items.count()
+            for i in range(n):
+                try:
+                    raw = (await layer_items.nth(i).inner_text()).strip()
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+                # inner_text 可能含子节点名（如「365天会员 / 文本」），取第一段
+                name = raw.split('\n')[0].strip()
+                low = name.lower()
+                if any(k in low for k in self._NON_TEXT_LAYER_HINTS):
+                    continue
+                if re.fullmatch(r'[\d\s\-_/]+', name):
+                    continue
+                if name.startswith('T '):
+                    name = name[2:].strip()
+                if name:
+                    texts.append(name)
+            layer_text = '\n'.join(texts)
+
+            # 5) 切回 read_only 并重新激活当前画布（保证后续截图在 read_only 下进行）
+            if 'view_mode=inspect' in page.url:
+                base = page.url.split('?')[0]
+                await page.goto(base + '?view_mode=read_only',
+                                wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(800)
+            # 5) 切回 read_only 并重新激活当前画布（保证后续截图在 read_only 下进行）
+            #    注意：上面的 goto 已整页重载，主循环传入的 item handle 此时已失效，
+            #    直接点击会无效→画布停在默认视图→后续截图与上一画布重复。
+            #    因此这里重新枚举页面树，按 page_name 匹配新鲜 handle 再激活。
+            if 'view_mode=inspect' in page.url:
+                base = page.url.split('?')[0]
+                await page.goto(base + '?view_mode=read_only',
+                                wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(800)
+            reactivated = False
+            try:
+                fresh_items = await self._enumerate_pages(page, source_type=source_type)
+                target_cid = (item_cid or '').strip()
+                target = (page_name or '').strip()
+                # [关键] 优先按 data-cid 匹配：页面树常存在同名画布（如两个「竖版」），
+                # 仅按 page_name 匹配会命中第一个同名项，导致后续页被激活成前一同名
+                # 画布 → 截图与前一页字节相同（表现为「撞图 / 切换失败」的假象）。
+                # data-cid 全局唯一，可精确还原到切换前的那个画布。
+                matched = None
+                if target_cid:
+                    for fi in fresh_items:
+                        try:
+                            if (await fi.get_attribute('data-cid')) == target_cid:
+                                matched = fi
+                                break
+                        except Exception:
+                            continue
+                if matched is None and target:
+                    for fi in fresh_items:
+                        try:
+                            fi_name = (await fi.inner_text()).strip().replace('\n', '/')
+                        except Exception:
+                            fi_name = ''
+                        if target and (target in fi_name or fi_name in target):
+                            matched = fi
+                            break
+                if matched is None and item is not None:
+                    matched = item
+                if matched is not None:
+                    await matched.scroll_into_view_if_needed()
+                    await matched.click(force=True, timeout=5000)
+                    await page.wait_for_timeout(1500)
+                    reactivated = True
+            except Exception as e:
+                warnings.append(f'图层提取后重新激活画布失败: {e}')
+            try:
+                await page.keyboard.press('Escape')
+                await page.wait_for_timeout(200)
+            except Exception:
+                pass
+            return layer_text
+        except Exception as e:
+            warnings.append(f'图层树文本提取失败（已回退OCR）: {e}')
+            return ''
 
     async def _extract_annotations(self, page, warnings: List[str]) -> List[str]:
         """尽力提取注释/标注文本。"""
@@ -832,55 +2642,536 @@ class ModaoExtractor:
             warnings.append(f'展开评论面板失败（可忽略）: {e}')
         return results
 
-    async def _screenshot_canvas_roi(self, page, shot_path: str) -> str:
-        """裁剪到设备画布(rResCanvas <img>) + 周边缓冲后截图，提升画布内图片/插画 OCR 分辨率。
+    # ---------- 墨刀截图：UI 隐藏 / 缩放归一化 / 内容包围盒 ----------
+    # 移植自参考实现（经实测验证）。核心解决「画布被墨刀 CSS 缩放导致截图模糊」：
+    # 墨刀用 .zoom-area 的 transform: scale(0.46) 之类把画布缩小显示，直接截图得到
+    # 的就是缩小后的画面（文字糊）。归一化即反向补偿回 scale(1)，配合高倍采样
+    # 可得到原始尺寸的清晰截图。
 
-        墨刀 read_only 视图把原型画布渲染为 class 含 'rResCanvas' 的 <img> 元素；整 viewport
-        截图时该画布仅占很小比例（常 <20% 宽），导致画布内卡通/插画等图片内容经视觉 OCR 返回空。
-        裁剪到画布矩形 + 缓冲（含周围便签）后，画布在截图中的占比大幅提升，OCR 才能识别。
-        找不到画布元素或矩形异常时，回退整 viewport 截图（由调用方兜底）。
-        """
-        import math
-        BUF = 140
-        box = await page.evaluate("""() => {
-            // 一个画布页面可能存在多个 rResCanvas（主屏 + 缩略图/隐藏副本），
-            // 取面积最大的可见元素，避免命中 0 尺寸的隐藏副本导致裁剪失效。
-            const els = Array.from(document.querySelectorAll('[class*="rResCanvas"]'));
-            let best = null, bestArea = 0;
-            for (const el of els) {
-                const r = el.getBoundingClientRect();
-                if (!r || r.width < 5 || r.height < 5) continue;
-                const area = r.width * r.height;
-                if (area > bestArea) { bestArea = area; best = [r.x, r.y, r.width, r.height]; }
+    _MODAO_HIDE_UI_JS = '''() => {
+        const selectors = [
+            '#fixed-area, .fixed_area, [class*="StyledSignUpPrompt"]',
+            '.ruler, .rulerH, .rulerV, #mb-ruler, [class*="Ruler"], [class*="StyledRulerContainer"]',
+            '[class*="ToolBar"], [class*="toolbar-left"], [class*="toolbar"], [class*="StyledToolbar"]',
+            '[class*="comment"], [class*="annotation"], [class*="note-panel"], [class*="right-panel"]',
+            '[class*="thumbnail"], [class*="status-bar"], [class*="bottom-bar"]',
+            '[class*="LeftSidePanel"], [class*="left-panel"], [class*="LeftPane"], [class*="CanvasListPanel"], [class*="ScreenList"], .canvas-scroll-list, .toggleable-zone',
+        ];
+        const saved = window.__modaoHiddenUI || [];
+        document.querySelectorAll(selectors.join(',')).forEach(el => {
+            if (el.style.display !== 'none') {
+                saved.push({el, display: el.style.display});
+                el.style.display = 'none';
             }
-            return best;
-        }""")
-        if not box:
-            await page.screenshot(path=shot_path, full_page=False, type='jpeg', quality=85)
-            return shot_path
-        x, y, w, h = box
-        vw, vh = 1440, 900
+        });
+        window.__modaoHiddenUI = saved;
+        return saved.length;
+    }'''
+
+    _MODAO_RESTORE_UI_JS = '''() => {
+        const saved = window.__modaoHiddenUI || [];
+        for (const item of saved) { item.el.style.display = item.display; }
+        window.__modaoHiddenUI = [];
+        return saved.length;
+    }'''
+
+    # 把画布缩放反向补偿回 100%（向上查找 transform scale / CSS zoom 的来源节点）
+    _MODAO_NORMALIZE_ZOOM_JS = '''() => {
+        const findZoomSource = (el) => {
+            let node = el;
+            while (node && node !== document.body) {
+                const cs = getComputedStyle(node);
+                const m = cs.transform.match(/^matrix\\(([^)]+)\\)$/);
+                if (m) {
+                    const p = m[1].split(',').map(Number);
+                    const sx = Math.hypot(p[0], p[1]);
+                    if (sx > 0.05 && Math.abs(sx - 1) > 0.02) return {el: node, scale: sx};
+                }
+                const z = parseFloat(cs.zoom);
+                if (Number.isFinite(z) && z > 0.05 && Math.abs(z - 1) > 0.02) return {el: node, scale: z, isZoom: true};
+                node = node.parentElement;
+            }
+            return null;
+        };
+        const sample = document.querySelectorAll('.widget, [id^="text-dom-"], .wImage');
+        let source = null;
+        for (const w of Array.from(sample).slice(0, 20)) {
+            source = findZoomSource(w);
+            if (source) break;
+        }
+        if (!source || source.scale >= 0.9) {
+            return {scale: source ? source.scale : 1, normalized: false};
+        }
+        try {
+            if (source.isZoom) {
+                window.__modaoZoomState = {el: source.el, isZoom: true, originalZoom: source.el.style.zoom};
+                source.el.style.zoom = String(1 / source.scale);
+            } else {
+                window.__modaoZoomState = {el: source.el, isZoom: false, originalTransform: source.el.style.transform};
+                const cur = getComputedStyle(source.el).transform;
+                source.el.style.transform = (cur && cur !== 'none' ? cur + ' ' : '') +
+                    'scale(' + (1 / source.scale).toFixed(6) + ')';
+            }
+            return {scale: source.scale, normalized: true};
+        } catch (e) {
+            return {scale: source.scale, normalized: false};
+        }
+    }'''
+
+    _MODAO_REVERT_ZOOM_JS = '''() => {
+        const st = window.__modaoZoomState;
+        if (!st) return false;
+        if (st.isZoom) st.el.style.zoom = st.originalZoom;
+        else st.el.style.transform = st.originalTransform;
+        delete window.__modaoZoomState;
+        return true;
+    }'''
+
+    # 取画布真实内容元素（.widget 等）的包围盒，而非 img/canvas 猜测
+    _MODAO_BOUNDS_JS = '''() => {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, count = 0;
+        const vw = window.innerWidth;
+        // 归属判断优先用 #screens 主画布容器（探针实测：横向多列页面全部被它包含，
+        // 页面树/右侧批注面板元素不在其中）；容器缺失时退回视口比例判断。
+        const screens = document.querySelector('#screens');
+        document.querySelectorAll('.widget, [id^="text-dom-"], .wImage').forEach(w => {
+            const b = w.getBoundingClientRect();
+            if (b.width <= 0 || b.height <= 0) return;
+            if (screens) {
+                if (!screens.contains(w)) return;   // 非画布内元素（页面树/批注面板）跳过
+            } else if (b.left > vw * 0.85) {
+                return;   // 兜底：跳过疑似右侧面板内的元素
+            }
+            count++;
+            minX = Math.min(minX, b.left);  minY = Math.min(minY, b.top);
+            maxX = Math.max(maxX, b.right); maxY = Math.max(maxY, b.bottom);
+        });
+        if (count === 0) return null;
+        return {x: minX, y: minY, w: maxX - minX, h: maxY - minY, count};
+    }'''
+
+    # 归一化后画布可能落到负坐标/超出视口，重定位到 (pad,pad) 并按 fit 等比适配
+    _MODAO_REPOSITION_JS = '''(arg) => {
+        const {fit, padX, padY} = arg;
+        const za = document.querySelector('.zoom-area');
+        if (!za) return false;
+        const cur = getComputedStyle(za).transform;
+        za.style.transform = (cur && cur !== 'none' ? cur + ' ' : '') + 'scale(' + fit + ')';
+        const b = document.querySelector('.mb-screen, .zoom-area');
+        if (!b) return false;
+        const r = b.getBoundingClientRect();
+        const dx = padX - r.left, dy = padY - r.top;
+        za.style.transform = (cur && cur !== 'none' ? cur + ' ' : '') +
+            'scale(' + fit + ') translate(' + dx + 'px,' + dy + 'px)';
+        return true;
+    }'''
+
+    # 截图输出上限：模型单图总像素上限（按总像素而非长边，避免正方形大图超限）
+    _SHOT_MAX_PIXELS = 16_000_000
+    _SHOT_MAX_EDGE = 25_000
+    # 与 new_context 的 device_scale_factor 保持一致（4x 采样提升清晰度）
+    _SHOT_SCALE = 4
+
+    @staticmethod
+    async def _safe_restore_ui(page) -> None:
+        """恢复被隐藏的墨刀 UI（左侧页面树等），不恢复会导致后续点击画布失效。"""
         try:
-            vp = await page.viewport_size()
-            if vp:
-                vw, vh = int(vp.get('width', 1440)), int(vp.get('height', 900))
+            await page.evaluate(ModaoExtractor._MODAO_RESTORE_UI_JS)
         except Exception:
             pass
-        cx = max(0, math.floor(float(x) - BUF))
-        cy = max(0, math.floor(float(y) - BUF))
-        right = min(vw, math.ceil(float(x) + float(w) + BUF))
-        bottom = min(vh, math.ceil(float(y) + float(h) + BUF))
-        cw = right - cx
-        ch = bottom - cy
-        if cw < 10 or ch < 10:
-            await page.screenshot(path=shot_path, full_page=False, type='jpeg', quality=85)
-            return shot_path
-        await page.screenshot(
-            path=shot_path,
-            clip={'x': cx, 'y': cy, 'width': cw, 'height': ch},
-            type='jpeg', quality=85,
-        )
-        return shot_path
+
+    @staticmethod
+    async def _safe_revert_zoom(page) -> None:
+        """回退截图时对画布做的缩放归一化。"""
+        try:
+            await page.evaluate(ModaoExtractor._MODAO_REVERT_ZOOM_JS)
+        except Exception:
+            pass
+
+    def _postprocess_shot(self, shot_bytes: bytes, out_path: str) -> bool:
+        """PIL 后处理：内存保护 → 背景裁剪去白边 → 降采样 → 高质量 JPEG。
+
+        返回 True 表示成功写出文件。
+        """
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(shot_bytes))
+            # 内存保护：原始像素超上限时先等比压到上限
+            if max(img.size) > self._SHOT_MAX_EDGE:
+                ratio = self._SHOT_MAX_EDGE / max(img.size)
+                img = img.resize(
+                    (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                    Image.LANCZOS)
+
+            # 背景裁剪：四角采样背景色，向内收敛去掉大片空白边
+            try:
+                gray = img.convert('L')
+                arr = gray.load()
+                pw, ph = img.size
+                corners = []
+                for cxp, cyp in [(5, 5), (pw - 6, 5), (5, ph - 6), (pw - 6, ph - 6)]:
+                    sample = [arr[cxp + dx, cyp + dy]
+                              for dx in (-2, 0, 2) for dy in (-2, 0, 2)]
+                    sample.sort()
+                    corners.append(sample[len(sample) // 2])
+                bg_level = sum(corners) // len(corners)
+                threshold = min(bg_level + 10, 252)
+
+                def is_bg(px, py):
+                    return arr[px, py] >= threshold
+
+                top = 0
+                while top < ph and all(is_bg(px, top) for px in range(pw)):
+                    top += 1
+                bottom = ph - 1
+                while bottom > top and all(is_bg(px, bottom) for px in range(pw)):
+                    bottom -= 1
+                left = 0
+                while left < pw and all(is_bg(left, py) for py in range(top, bottom + 1)):
+                    left += 1
+                right = pw - 1
+                while right > left and all(is_bg(right, py) for py in range(top, bottom + 1)):
+                    right -= 1
+                crop_pad = 5
+                crop = (max(0, left - crop_pad), max(0, top - crop_pad),
+                        min(pw, right + 1 + crop_pad), min(ph, bottom + 1 + crop_pad))
+                if crop[0] > 0 or crop[1] > 0 or crop[2] < pw or crop[3] < ph:
+                    img = img.crop(crop)
+            except Exception:
+                pass
+
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            # 按总像素等比缩放（≤1600 万），避免超出模型单图限制
+            img_pixels = img.width * img.height
+            if img_pixels > self._SHOT_MAX_PIXELS:
+                ratio = (self._SHOT_MAX_PIXELS / img_pixels) ** 0.5
+                img = img.resize(
+                    (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                    Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=92, subsampling=0)
+            with open(out_path, 'wb') as f:
+                f.write(buf.getvalue())
+            logger.info(f'[截图] 输出: {img.width}×{img.height}, {len(buf.getvalue()) / 1024:.0f}KB')
+            return True
+        except Exception as e:
+            logger.warning(f'[截图] PIL 后处理失败，保留原图: {e}')
+            try:
+                with open(out_path, 'wb') as f:
+                    f.write(shot_bytes)
+                return True
+            except Exception:
+                return False
+
+    async def _screenshot_canvas_roi(self, page, shot_path: str) -> tuple:
+        """清理浮层 + 主画布区域并集截图，保证『一个画布 = 一张完整图』。
+
+        【DOM 事实（探针核实）】墨刀 read_only 视图中：
+        - 主画布渲染在 `#screens` / `.styles__StyledScreenContainer-*` 容器内，是页面主体区域；
+        - class 含 `rResCanvas` 的节点其实是**页面树里的缩略图预览**（约 114x246），并非主画布；
+          父画布下挂多个子视图时，页面树会并排显示多个 rResCanvas 缩略图，但它们都只是小预览。
+        - 顶部 `#fixed-area`（"欢迎来到墨刀 登录后可使用标注…"）登录提示条、右侧 240px 批注/
+          评论面板会挤压主画布，且进入截图后成为污染浮层。
+
+        旧逻辑误把每个 rResCanvas 缩略图当主画布逐个截图，产出一堆带浮层的小图、且主画布被截断，
+        与用户实际打开看到的（page_4/page_5 有浮层、截断）一致。
+
+        新逻辑：
+        1. 先 `_clean_overlays()` 隐藏登录条 / 批注面板 / 模态遮罩等浮层，并 Esc 收起展开态；
+        2. 在**主区域**（排除左侧页面树、右侧批注面板）内收集所有可见画布节点（rResCanvas 缩略图、
+           原生 canvas、#screens 主画布 img）的**并集外接框**；
+        3. 单段可容纳（高 ≤ SEG_H 且宽 ≤ MAX_VIEWPORT）则输出**一张**完整主画布截图；
+           仅在并集真正超高/超宽时才纵向切片（_segN 后缀），恢复直观的「一画布一图」体验。
+
+        clip 使用页面坐标（非视口坐标），纵向切片无需滚动/重载页面；
+        截图前把视口临时放大到能容纳并集框 + 缓冲，避免固定 900px 视口截断。
+
+        返回 (main_path, segments_list)，main_path 为首段（向后兼容），
+        segments_list 含全部分段（含主图）。
+        """
+        import math
+        BUF = 60
+        MAX_VIEWPORT = 6500   # 单段宽/高安全上限，避免生成巨型截图
+        SEG_H = 4500          # 并集框最大高度；超过此值才纵向切片
+
+        def _clean_overlays():
+            return """() => {
+                const hide = (el) => { if (el) { el.style.display = 'none'; } };
+                // 顶部登录提示条
+                hide(document.querySelector('#fixed-area'));
+                hide(document.querySelector('.fixed_area'));
+                // 登录/注册引导浮层
+                document.querySelectorAll('[class*="SignUpPrompt"], [class*="signup"], [class*="LoginPrompt"], [class*="login-prompt"]')
+                    .forEach(hide);
+                // 右侧批注/评论面板（约 240px 宽，含关键字）
+                const panels = Array.from(document.querySelectorAll('div, aside, section'));
+                for (const p of panels) {
+                    const w = p.getBoundingClientRect().width;
+                    const t = (p.textContent || '').slice(0, 40);
+                    if (w >= 180 && w <= 280 &&
+                        (/批注|评论|展开全部|收起|留言|comment|note/i.test(t))) {
+                        hide(p);
+                    }
+                }
+                // 模态遮罩 / 全局弹层
+                document.querySelectorAll('[class*="ModalMask"], [class*="modal-mask"], [class*="Overlay"], [class*="overlay"]')
+                    .forEach(hide);
+                return true;
+            }"""
+
+        def _pick_main_box():
+            return """() => {
+                const W = window.innerWidth;
+                // 优先取墨刀主画布容器 #screens / StyledScreenContainer 的 bbox：
+                // 它天然不包含左侧页面树和右侧固定批注面板，又能把画布周围悬浮的
+                // 批注便签包含进来（这些便签是需求来源，不能当"浮层"截掉）。
+                const mainContainers = [
+                    document.querySelector('#screens'),
+                    document.querySelector('[class*="StyledScreenContainer"]'),
+                    document.querySelector('[class*="ScreenContainer"]'),
+                ].filter(Boolean);
+                for (const el of mainContainers) {
+                    const st = getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r && r.width >= 300 && r.height >= 300) {
+                        return [r.x, r.y, r.width, r.height];
+                    }
+                }
+                // 退化：取主区域内可见画布节点的并集（保留批注便签，只硬切左右极端）
+                const leftCut = Math.min(260, W * 0.18);   // 只排除左侧页面树
+                const rightCut = W - 40;                    // 保留右侧悬浮便签，只留 40px 边距
+                const candidates = [];
+                const consider = (sel, minSize) => {
+                    const els = Array.from(document.querySelectorAll(sel));
+                    for (const el of els) {
+                        const r = el.getBoundingClientRect();
+                        if (!r || r.width < minSize || r.height < minSize) continue;
+                        const st = getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') continue;
+                        const cx = r.x + r.width / 2;
+                        // 只保留主区域内部的画布节点
+                        if (r.x < leftCut || cx > rightCut) continue;
+                        candidates.push([r.x, r.y, r.width, r.height]);
+                    }
+                };
+                // 【关键】阈值必须够高以过滤「页面树缩略图」：
+                // 墨刀 rResCanvas / 小 canvas 常是页面树里的预览缩略图（约 114x246），
+                // 它不随画布切换而变化；若被并进 ROI，不同画布会裁出相同区域 →
+                // 多张截图 sha 完全相同（表现为「撞图 / 切换失败」的假象）。
+                consider('[class*="rResCanvas"]', 400);
+                consider('canvas', 400);
+                consider('#screens img', 200);
+                consider('.styles__StyledScreenContainer img', 200);
+                consider('[class*="ScreenContainer"] img', 200);
+                if (candidates.length === 0) return null;
+                // 取并集外接框
+                let minX = Infinity, minY = Infinity, maxR = -Infinity, maxB = -Infinity;
+                for (const [x, y, w, h] of candidates) {
+                    minX = Math.min(minX, x); minY = Math.min(minY, y);
+                    maxR = Math.max(maxR, x + w); maxB = Math.max(maxB, y + h);
+                }
+                return [minX, minY, maxR - minX, maxB - minY];
+            }"""
+
+        # 1) 隐藏墨刀 UI（顶栏/标尺/工具栏/缩略图/面板…），截图后必须恢复
+        try:
+            await page.evaluate(self._MODAO_HIDE_UI_JS)
+        except Exception:
+            pass
+        try:
+            await page.keyboard.press('Escape')
+        except Exception:
+            pass
+        await page.wait_for_timeout(300)
+
+        # 2) 【关键】把画布缩放归一化回 100%
+        #    墨刀用 .zoom-area 的 transform: scale(0.46x) 缩小画布显示，直接截图得到
+        #    的就是缩小后的画面（文字糊、多图看不清）。反向补偿后按原始尺寸截图。
+        zoom_probe = None
+        try:
+            zoom_probe = await page.evaluate(self._MODAO_NORMALIZE_ZOOM_JS)
+            if zoom_probe and zoom_probe.get('normalized'):
+                await page.wait_for_timeout(600)
+                logger.info(f"[截图] 画布缩放已归一化到100%: 原scale={zoom_probe['scale']:.3f}")
+        except Exception as e:
+            logger.warning(f'[截图] 缩放归一化失败，按原缩放截图: {e}')
+            zoom_probe = None
+
+        # 3) 取画布真实内容(.widget)包围盒；取不到再退回旧的 img/canvas 并集
+        bounds = None
+        try:
+            bounds = await page.evaluate(self._MODAO_BOUNDS_JS)
+        except Exception:
+            bounds = None
+        if bounds and bounds.get('w', 0) > 0 and bounds.get('h', 0) > 0:
+            x, y, w, h = bounds['x'], bounds['y'], bounds['w'], bounds['h']
+        else:
+            box = await page.evaluate(_pick_main_box())
+            if not box:
+                await page.screenshot(path=shot_path, full_page=True, type='jpeg', quality=85)
+                await self._safe_restore_ui(page)
+                return shot_path, [shot_path]
+            x, y, w, h = box
+
+        # 4) 视口扩展：包围盒超出视口时扩大视口，避免只截到视口内部分
+        vs = page.viewport_size or {}
+        if w > vs.get('width', 1440) - 40 or h > vs.get('height', 900) - 40:
+            try:
+                new_w = min(max(int(w) + 80, 1280), MAX_VIEWPORT)
+                new_h = min(max(int(h) + 80, 900), MAX_VIEWPORT)
+                if new_w != vs.get('width') or new_h != vs.get('height'):
+                    await page.set_viewport_size({'width': new_w, 'height': new_h})
+                    await page.wait_for_timeout(500)
+                    vs = page.viewport_size or {}
+                    _b = await page.evaluate(self._MODAO_BOUNDS_JS)
+                    if _b:
+                        x, y, w, h = _b['x'], _b['y'], _b['w'], _b['h']
+            except Exception as e:
+                logger.warning(f'[截图] 视口扩展失败: {e}')
+
+        # 5) 重定位：归一化后画布可能落在负坐标或超出视口（clip 超出会被静默裁掉）
+        vs = page.viewport_size or {}
+        vw_cur, vh_cur = vs.get('width', 1440), vs.get('height', 900)
+        if (x < 0 or y < 0 or x + w + 20 > vw_cur or y + h + 20 > vh_cur):
+            try:
+                pad_align = 10
+                fit = min(1.0,
+                          (vw_cur - pad_align * 2 - 4) / max(w, 1),
+                          (vh_cur - pad_align * 2 - 4) / max(h, 1))
+                fit = max(fit, 0.01)
+                if await page.evaluate(self._MODAO_REPOSITION_JS,
+                                       {'fit': fit, 'padX': pad_align, 'padY': pad_align}):
+                    await page.wait_for_timeout(300)
+                    _b = await page.evaluate(self._MODAO_BOUNDS_JS)
+                    if _b:
+                        x, y, w, h = _b['x'], _b['y'], _b['w'], _b['h']
+            except Exception as e:
+                logger.warning(f'[截图] 画布重定位失败: {e}')
+
+        # 6) 仍超出视口：回退原缩放，避免截取部分内容
+        vs = page.viewport_size or {}
+        if (w > vs.get('width', 1440) + 5 or h > vs.get('height', 900) + 5
+                or x < -0.5 or y < -0.5):
+            try:
+                await page.evaluate(self._MODAO_REVERT_ZOOM_JS)
+                await page.wait_for_timeout(400)
+                _b = await page.evaluate(self._MODAO_BOUNDS_JS)
+                if _b:
+                    x, y, w, h = _b['x'], _b['y'], _b['w'], _b['h']
+                logger.warning('[截图] 画布超出视口上限，已回退原缩放截图')
+            except Exception:
+                pass
+
+        # 7) 等字体加载完成，避免 fallback 字体导致模糊/缺字
+        try:
+            await page.evaluate(
+                'document.fonts ? Promise.race([document.fonts.ready, '
+                'new Promise(r => setTimeout(r, 2000))]) : true'
+            )
+        except Exception:
+            pass
+
+        # 8) 截图（PNG 无损；超大图走 CDP 避免 Chrome 普通截图失败）
+        pad = 10
+        clip_region = {
+            'x': max(0, math.floor(x) - pad),
+            'y': max(0, math.floor(y) - pad),
+            'width': min(math.ceil(w) + pad * 2, 12000),
+            'height': min(math.ceil(h) + pad * 2, 12000),
+        }
+
+        async def _capture_region(cx, cy, cw, ch):
+            """对页面坐标区域截图，返回 PNG bytes；长边超采样上限时走 CDP。"""
+            _clip = {
+                'x': max(0, math.floor(cx)),
+                'y': max(0, math.floor(cy)),
+                'width': min(math.ceil(cw), 12000),
+                'height': min(math.ceil(ch), 12000),
+            }
+            if _clip['width'] < 10 or _clip['height'] < 10:
+                return None
+            try:
+                if max(_clip['width'], _clip['height']) * self._SHOT_SCALE > 8192:
+                    cdp = await page.context.new_cdp_session(page)
+                    import base64 as _b64
+                    _r = await cdp.send('Page.captureScreenshot', {
+                        'format': 'png',
+                        'clip': {'x': _clip['x'], 'y': _clip['y'],
+                                 'width': _clip['width'], 'height': _clip['height'],
+                                 'scale': 1},
+                        'captureBeyondViewport': False,
+                    })
+                    return _b64.b64decode(_r['data'])
+                return await page.screenshot(clip=_clip, type='png')
+            except Exception:
+                try:
+                    return await page.screenshot(clip=_clip, type='png')
+                except Exception:
+                    return None
+
+        if clip_region['width'] < 10 or clip_region['height'] < 10:
+            await page.screenshot(path=shot_path, full_page=True, type='jpeg', quality=85)
+            await self._safe_restore_ui(page)
+            await self._safe_revert_zoom(page)
+            return shot_path, [shot_path]
+
+        # 9) 超宽/超高画布按段截图（横向/纵向都要切），每段独立后处理再喂视觉模型，
+        #     避免把整幅大图降采样后细节丢失（这就是"改了包围盒还有截断"的根源）。
+        SEG_W, SEG_H = 2000, 2000   # 单段 CSS 边长上限（4x 采样 ≈ 8000 物理像素，低于 CDP 8192 上限）
+        OVERLAP = 60                # 相邻段重叠，避免切缝丢失内容
+        _step_w = SEG_W - OVERLAP
+        _step_h = SEG_H - OVERLAP
+        _n_cols = max(1, math.ceil(clip_region['width'] / _step_w))
+        _n_rows = max(1, math.ceil(clip_region['height'] / _step_h))
+        _need_slice = _n_cols > 1 or _n_rows > 1
+
+        # 主图始终截取（前端展示 screenshot 字段用），后处理降采样到模型可接受尺寸
+        _main_bytes = await _capture_region(clip_region['x'], clip_region['y'],
+                                            clip_region['width'], clip_region['height'])
+        if _main_bytes:
+            self._postprocess_shot(_main_bytes, shot_path)
+
+        segments_paths: List[str] = []
+        if _need_slice:
+            _stem = os.path.splitext(os.path.basename(shot_path))[0]
+            _seg_no = 1
+            for _r in range(_n_rows):
+                for _c in range(_n_cols):
+                    _sx = clip_region['x'] + _c * _step_w
+                    _sy = clip_region['y'] + _r * _step_h
+                    _sw = min(SEG_W, clip_region['x'] + clip_region['width'] - _sx)
+                    _sh = min(SEG_H, clip_region['y'] + clip_region['height'] - _sy)
+                    if _sw < 10 or _sh < 10:
+                        continue
+                    _seg_bytes = await _capture_region(_sx, _sy, _sw, _sh)
+                    if not _seg_bytes:
+                        continue
+                    _seg_path = os.path.join(self.shot_dir, f'{_stem}_seg{_seg_no}.jpg')
+                    if self._postprocess_shot(_seg_bytes, _seg_path):
+                        segments_paths.append(_seg_path)
+                    _seg_no += 1
+            if segments_paths:
+                logger.info(f'[截图] 超宽/超高画布 {w:.0f}×{h:.0f} 切片为 {len(segments_paths)} 段'
+                            f'（网格 {_n_cols}×{_n_rows}）')
+                await self._safe_restore_ui(page)
+                await self._safe_revert_zoom(page)
+                # 主图仅用于前端展示；OCR 逐段识别各段，避免重复识别整幅压缩图
+                return shot_path, segments_paths
+
+        # 10) 单段（画布未超限或切片失败）：主图后处理已完成，直接返回
+        if _main_bytes:
+            await self._safe_restore_ui(page)
+            await self._safe_revert_zoom(page)
+            return shot_path, [shot_path]
+
+        # 兜底：整页截图
+        await page.screenshot(path=shot_path, full_page=True, type='jpeg', quality=85)
+        await self._safe_restore_ui(page)
+        await self._safe_revert_zoom(page)
+        return shot_path, [shot_path]
 
     async def _page_has_visual(self, page) -> bool:
         """检测当前页面是否含实质图片或表格元素（用于判定『混合页』是否需要视觉补充）。
@@ -1238,7 +3529,9 @@ class ModaoExtractor:
             artifact['validation'] = cls._validate_visual_artifact(artifact)
             artifacts.append(artifact)
         return {
-            'ocr_text': str(payload.get('ocr_text') or '').strip(),
+            # OCR 路同样剔除墨刀界面控件文字（总览/演示/标注/登录/62% 等），
+            # 否则截图里的这些元素会被视觉模型忠实识别出来污染需求文本。
+            'ocr_text': cls._strip_ui_noise(str(payload.get('ocr_text') or '')),
             'visual_summary': str(payload.get('visual_summary') or '').strip(),
             'visual_artifacts': artifacts,
         }
@@ -1312,7 +3605,7 @@ class ModaoExtractor:
             payload = self._parse_visual_payload(raw)
             if not payload:
                 logger.warning('视觉模型未返回有效JSON，降级为普通OCR文本')
-                payload = {'ocr_text': raw, 'visual_artifacts': []}
+                payload = {'ocr_text': self._strip_ui_noise(raw), 'visual_artifacts': []}
             artifacts = payload.get('visual_artifacts') or []
             has_decision_table = any(
                 isinstance(item, dict) and item.get('artifact_type') == 'decision_table'
@@ -1429,26 +3722,48 @@ class ModaoExtractor:
             with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df: _df.write(_dbg0)
             _raise_if_terminated(prototype_id)
             async with sem:
-                try:
-                    vr = await self._ocr_screenshot(vision_config, p.get('shot_path'))
-                    logger.info(f'[OCR_BATCH] page[{p.get("page_name")}] OK ocr_len={len(vr.get("ocr_text","") or "")} '
-                                f'summary_len={len(vr.get("visual_summary","") or "")}')
-                    _dbg = f'[OCR_ONE] {p.get("page_name")} OK\n'
-                except Exception as e:
-                    logger.warning(f"页面[{p.get('page_name')}] 视觉OCR失败（跳过）: {e}")
-                    vr = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
-                    _dbg = f'[OCR_ONE] {p.get("page_name")} FAIL: {e}\n'
+                # 超长画布分段截图后，逐段 OCR 再合并：segments 为相对 media_root 的路径列表（含主图）；
+                # 无分段时回退单张 shot_path。任何一段失败都不影响其他段。
+                seg_rel = p.get('screenshot_segments') or []
+                if seg_rel and isinstance(seg_rel, list):
+                    seg_abs_list = [os.path.join(self.media_root, s) for s in seg_rel]
+                elif p.get('shot_path'):
+                    seg_abs_list = [p.get('shot_path')]
+                else:
+                    seg_abs_list = []
+                ocr_parts: List[str] = []
+                summary_parts: List[str] = []
+                artifacts_all: List[Dict[str, Any]] = []
+                seg_ok = 0
+                for seg_abs in seg_abs_list:
+                    if not seg_abs or not os.path.exists(seg_abs):
+                        continue
+                    try:
+                        _vr = await self._ocr_screenshot(vision_config, seg_abs)
+                        seg_ok += 1
+                    except Exception as e:
+                        logger.warning(f"页面[{p.get('page_name')}] 分段图[{os.path.basename(seg_abs)}] OCR失败（跳过）: {e}")
+                        _vr = {'ocr_text': '', 'visual_summary': '', 'visual_artifacts': []}
+                    if _vr.get('ocr_text'):
+                        ocr_parts.append(_vr['ocr_text'])
+                    if _vr.get('visual_summary'):
+                        summary_parts.append(_vr['visual_summary'])
+                    artifacts_all.extend(_vr.get('visual_artifacts') or [])
+                if seg_ok:
+                    _dbg = f'[OCR_ONE] {p.get("page_name")} OK segs={seg_ok}/{len(seg_abs_list)} ocr_len={sum(len(x) for x in ocr_parts)}\n'
+                else:
+                    _dbg = f'[OCR_ONE] {p.get("page_name")} FAIL(no segment OCRed)\n'
                 print(_dbg, flush=True)
                 with open(os.path.join(self.shot_dir, '_ocr_debug.log'), 'a') as _df: _df.write(_dbg)
-            ocr_text = vr.get('ocr_text', '') or ''
+            ocr_text = '\n'.join(ocr_parts)
+            summary_text = '\n'.join(summary_parts)
             vision_text = ocr_text
-            if vr.get('visual_summary'):
-                vision_text = (vision_text + '\n' + vr['visual_summary']).strip()
+            if summary_text:
+                vision_text = (vision_text + '\n' + summary_text).strip()
             p['vision_text'] = vision_text
-            p['visual_summary'] = vr.get('visual_summary', '')
-            p['visual_artifacts'] = vr.get('visual_artifacts', [])
-            p['vision_success'] = bool(
-                ocr_text or vr.get('visual_summary') or vr.get('visual_artifacts'))
+            p['visual_summary'] = summary_text
+            p['visual_artifacts'] = artifacts_all
+            p['vision_success'] = bool(ocr_text or summary_text or artifacts_all)
             if not p['vision_success']:
                 p.setdefault('extraction_warnings', []).append('视觉识别未返回有效内容')
             # 兼容字段 text = DOM 文本 + 视觉 OCR 补充，维持 run_struct 既有消费方式

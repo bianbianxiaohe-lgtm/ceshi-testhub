@@ -1,0 +1,777 @@
+﻿<template>
+  <div class="case-merge-view">
+    <div class="page-header">
+      <div class="header-left">
+        <el-button size="small" plain @click="goBack">← 返回画布看板</el-button>
+        <h2>📋 用例合并采纳</h2>
+      </div>
+      <div class="header-right">
+        <span v-if="proto" class="proto-title">{{ proto.title || ('任务 #' + protoId) }}</span>
+        <el-button size="small" :loading="loading" @click="loadDetail">刷新</el-button>
+      </div>
+    </div>
+
+    <!-- 筛选器 -->
+    <div class="filter-bar">
+      <el-select v-model="folderFilter" placeholder="按文件夹筛选" clearable size="small" style="width: 200px">
+        <el-option label="全部文件夹" value="" />
+        <el-option v-for="fg in folderGroups" :key="fg.path" :label="fg.path || '未分组'" :value="fg.path" />
+      </el-select>
+      <el-select v-model="moduleFilter" placeholder="按模块筛选" clearable size="small" style="width: 180px">
+        <el-option label="全部模块" value="" />
+        <el-option v-for="m in moduleList" :key="m" :label="m" :value="m" />
+      </el-select>
+      <el-select v-model="priorityFilter" placeholder="按优先级筛选" clearable size="small" style="width: 140px">
+        <el-option label="全部优先级" value="" />
+        <el-option label="P0" value="P0" />
+        <el-option label="P1" value="P1" />
+        <el-option label="P2" value="P2" />
+        <el-option label="P3" value="P3" />
+      </el-select>
+      <el-input v-model="keywordFilter" placeholder="搜索用例标题..." clearable size="small" style="width: 200px" />
+      <div class="filter-stats">
+        共 {{ filteredCases.length }} 条 / 已选 {{ selectedCases.length }} 条 / 已采纳 {{ adoptedCount }} 条
+      </div>
+    </div>
+
+    <!-- 批量操作 -->
+    <div class="batch-actions">
+      <el-checkbox v-model="selectAll" @change="onSelectAll">全选</el-checkbox>
+      <el-button size="small" type="primary" :loading="adopting" :disabled="!selectedCases.length" @click="onAdoptSelected">
+         采纳选中用例 ({{ selectedCases.length }})
+      </el-button>
+      <el-button size="small" type="success" :loading="adoptingAll" @click="onAdoptAll">
+         采纳全部用例
+      </el-button>
+      <span class="batch-hint">
+        已采纳/已编辑的用例会以最新内容入库；若某条已被采纳，再次提交将自动跳过（幂等）。
+      </span>
+    </div>
+
+    <!-- 用例列表 -->
+    <el-table ref="table" :data="filteredCases" size="small" border stripe max-height="600" @selection-change="onSelectionChange">
+      <el-table-column type="selection" width="50" :selectable="isRowSelectable" />
+      <el-table-column type="index" width="50" />
+      <el-table-column prop="module" label="模块" width="140" show-overflow-tooltip />
+      <el-table-column label="用例标题" min-width="220">
+        <template #default="{ row }">
+          <span :class="{ 'row-adopted': adoptedKeys[row._key] }">{{ row.title || '（未命名）' }}</span>
+          <el-tag v-if="editedKeys[row._key]" size="mini" type="warning" class="row-tag">已编辑</el-tag>
+          <el-tag v-if="adoptedKeys[row._key]" size="mini" type="success" class="row-tag">已采纳</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="priority" label="优先级" width="80" align="center">
+        <template #default="{ row }">
+          <el-tag :type="priorityType(row.priority)" size="mini">{{ row.priority || '-' }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="type" label="类型" width="80" align="center" />
+      <el-table-column label="步骤数" width="80" align="center">
+        <template #default="{ row }">{{ row.stepsList.length }}</template>
+      </el-table-column>
+      <el-table-column label="来源画布" width="160" show-overflow-tooltip>
+        <template #default="{ row }">{{ row.sourceCanvas }}</template>
+      </el-table-column>
+      <el-table-column label="来源文件夹" width="140" show-overflow-tooltip>
+        <template #default="{ row }">{{ row.sourceFolder || '未分组' }}</template>
+      </el-table-column>
+      <el-table-column label="操作" width="210" align="center">
+        <template #default="{ row }">
+          <el-button size="mini" @click="openDetail(row, 'view')">详情</el-button>
+          <el-button size="mini" type="warning" plain @click="openDetail(row, 'edit')">编辑</el-button>
+          <el-button
+            size="mini"
+            type="success"
+            :loading="!!adoptingKeys[row._key]"
+            :disabled="!!adoptedKeys[row._key]"
+            @click="onAdoptSingle(row)"
+          >{{ adoptedKeys[row._key] ? '已采纳' : '采纳' }}</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <!-- 冒烟用例 -->
+    <div v-if="filteredSmoke.length" class="smoke-section">
+      <h4>冒烟用例 ({{ filteredSmoke.length }})</h4>
+      <el-table ref="smokeTable" :data="filteredSmoke" size="small" border stripe max-height="400">
+        <el-table-column type="index" width="50" />
+        <el-table-column prop="module" label="模块" width="140" show-overflow-tooltip />
+        <el-table-column label="用例标题" min-width="240">
+          <template #default="{ row }">
+            <span :class="{ 'row-adopted': adoptedKeys[row._key] }">{{ row.title || '（未命名）' }}</span>
+            <el-tag v-if="editedKeys[row._key]" size="mini" type="warning" class="row-tag">已编辑</el-tag>
+            <el-tag v-if="adoptedKeys[row._key]" size="mini" type="success" class="row-tag">已采纳</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="优先级" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag :type="priorityType(row.priority)" size="mini">{{ row.priority || '-' }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="步骤数" width="80" align="center">
+          <template #default="{ row }">{{ row.stepsList.length }}</template>
+        </el-table-column>
+        <el-table-column label="来源画布" width="160" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.sourceCanvas }}</template>
+        </el-table-column>
+        <el-table-column label="来源文件夹" width="140" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.sourceFolder || '未分组' }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="210" align="center">
+          <template #default="{ row }">
+            <el-button size="mini" @click="openDetail(row, 'view')">详情</el-button>
+            <el-button size="mini" type="warning" plain @click="openDetail(row, 'edit')">编辑</el-button>
+            <el-button
+              size="mini"
+              type="success"
+              :loading="!!adoptingKeys[row._key]"
+              :disabled="!!adoptedKeys[row._key]"
+              @click="onAdoptSingle(row)"
+            >{{ adoptedKeys[row._key] ? '已采纳' : '采纳' }}</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <!-- 详情 / 编辑弹窗 -->
+    <el-dialog
+      v-model="detailVisible"
+      :title="detailMode === 'edit' ? '✏️ 编辑用例（可修改后直接采纳）' : '📄 用例详情（可直接修改后采纳）'"
+      width="860px"
+      top="5vh"
+      :close-on-click-modal="false"
+    >
+      <div v-if="current" class="detail-source">
+        <span>来源画布：<b>{{ current.sourceCanvas }}</b></span>
+        <span>来源文件夹：<b>{{ current.sourceFolder || '未分组' }}</b></span>
+        <span v-if="current.caseId">用例 ID：<b>{{ current.caseId }}</b></span>
+        <span v-if="current._isSmoke">类型：<b>冒烟用例</b></span>
+      </div>
+
+      <el-form label-width="90px" size="small" class="detail-form">
+        <el-row :gutter="12">
+          <el-col :span="12">
+            <el-form-item label="所属模块">
+              <el-select
+                v-model="form.module"
+                filterable
+                allow-create
+                default-first-option
+                placeholder="选择或输入模块名"
+                size="small"
+                style="width: 100%"
+              >
+                <el-option v-for="m in moduleOptions" :key="m" :label="m" :value="m" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="优先级">
+              <el-select v-model="form.priority" size="small" style="width: 100%">
+                <el-option label="P0" value="P0" />
+                <el-option label="P1" value="P1" />
+                <el-option label="P2" value="P2" />
+                <el-option label="P3" value="P3" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="用例类型" label-width="80px">
+              <el-select v-model="form.type" filterable allow-create size="small" style="width: 100%">
+                <el-option v-for="t in typeOptions" :key="t" :label="t" :value="t" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-form-item label="用例标题">
+          <el-input v-model="form.title" size="small" placeholder="[验证点] + [操作] + [结果]" />
+        </el-form-item>
+
+        <el-form-item label="前置条件">
+          <el-input v-model="form.precondition" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" placeholder="账号状态、APP 状态、网络环境、数据准备…" />
+        </el-form-item>
+
+        <el-form-item label="操作步骤">
+          <div class="steps-editor">
+            <div v-for="(s, i) in form.steps" :key="i" class="step-row">
+              <span class="step-no">{{ i + 1 }}</span>
+              <el-input
+                v-model="form.steps[i]"
+                type="textarea"
+                :autosize="{ minRows: 1, maxRows: 4 }"
+                size="small"
+                class="step-input"
+              />
+              <div class="step-ops">
+                <el-button text size="small" :disabled="i === 0" @click="moveStep(i, -1)">↑</el-button>
+                <el-button text size="small" :disabled="i === form.steps.length - 1" @click="moveStep(i, 1)">↓</el-button>
+                <el-button text size="small" type="danger" @click="removeStep(i)">✕</el-button>
+              </div>
+            </div>
+            <el-button size="small" plain class="add-step" @click="addStep">+ 添加步骤</el-button>
+          </div>
+        </el-form-item>
+
+        <el-form-item label="预期结果">
+          <el-input v-model="form.expected" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }" placeholder="界面变化、数据变化、提示信息…" />
+        </el-form-item>
+
+        <el-form-item label="备注">
+          <el-input v-model="form.notes" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" placeholder="测试要点、常见问题…" />
+        </el-form-item>
+      </el-form>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <span class="footer-hint">「保存并采纳」会按当前内容写入用例库（同项目+同模块+同标题去重）</span>
+          <div>
+            <el-button size="small" @click="detailVisible = false">取消</el-button>
+            <el-button size="small" :loading="saving" @click="saveEdit">保存</el-button>
+            <el-button
+              size="small"
+              type="primary"
+              :loading="savingAdopt"
+              :disabled="!!adoptedKeys[currentKey]"
+              @click="saveAndAdopt"
+            >{{ adoptedKeys[currentKey] ? '已采纳' : '保存并采纳' }}</el-button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script>
+import request from '@/utils/api'
+
+const TYPE_OPTIONS = ['功能', '边界', '异常', 'UI', '兼容']
+
+export default {
+  name: 'CaseMergeView',
+  data() {
+    return {
+      protoId: this.$route.params.id,
+      proto: null,
+      pages: [],
+      loading: false,
+      adopting: false,
+      adoptingAll: false,
+      folderFilter: '',
+      moduleFilter: '',
+      priorityFilter: '',
+      keywordFilter: '',
+      selectAll: false,
+      selectedCases: [],
+      // 详情 / 编辑
+      detailVisible: false,
+      detailMode: 'view',
+      current: null,
+      form: { module: '', title: '', priority: 'P2', type: '功能', precondition: '', steps: [], expected: '', notes: '' },
+      saving: false,
+      savingAdopt: false,
+      // 行状态：key = `${pageId}#${index}`（冒烟加 smoke# 前缀）
+      adoptedKeys: {},
+      editedKeys: {},
+      adoptingKeys: {},
+      typeOptions: TYPE_OPTIONS,
+    }
+  },
+  computed: {
+    folderGroups() {
+      const map = new Map()
+      for (const p of this.pages) {
+        const folder = (p.folder || '').trim()
+        if (!map.has(folder)) {
+          map.set(folder, { path: folder, count: 0 })
+        }
+        map.get(folder).count++
+      }
+      return Array.from(map.values()).sort((a, b) => (a.path || '').localeCompare(b.path || ''))
+    },
+    allCases() {
+      const out = []
+      for (const p of this.pages) {
+        const source = p.page_name || `P${p.page_no}`
+        const folder = (p.folder || '').trim()
+        this.parseArr(p.page_testcases_json).forEach((tc, idx) => {
+          const inner = tc.testcase || tc
+          out.push(this.normalizeCase(inner, tc, {
+            key: `${p.id}#${idx}`,
+            pageId: p.id,
+            pageIndex: idx,
+            sourceCanvas: source,
+            sourceFolder: folder,
+            isSmoke: false,
+          }))
+        })
+      }
+      return out
+    },
+    allSmoke() {
+      const out = []
+      for (const p of this.pages) {
+        const source = p.page_name || `P${p.page_no}`
+        const folder = (p.folder || '').trim()
+        this.parseSmoke(p.page_smoke_json).forEach((sc, idx) => {
+          const inner = sc.testcase || sc
+          out.push(this.normalizeCase(inner, sc, {
+            key: `smoke#${p.id}#${idx}`,
+            pageId: p.id,
+            pageIndex: idx,
+            sourceCanvas: source,
+            sourceFolder: folder,
+            isSmoke: true,
+          }))
+        })
+      }
+      return out
+    },
+    moduleList() {
+      const set = new Set()
+      for (const c of this.allCases) {
+        if (c.module) set.add(c.module)
+      }
+      return Array.from(set).sort()
+    },
+    moduleOptions() {
+      const set = new Set(this.moduleList)
+      if (this.form.module) set.add(this.form.module)
+      return Array.from(set).sort()
+    },
+    filteredCases() {
+      return this.allCases.filter(c => {
+        if (this.folderFilter && c.sourceFolder !== this.folderFilter) return false
+        if (this.moduleFilter && c.module !== this.moduleFilter) return false
+        if (this.priorityFilter && c.priority !== this.priorityFilter) return false
+        if (this.keywordFilter && !c.title.toLowerCase().includes(this.keywordFilter.toLowerCase())) return false
+        return true
+      })
+    },
+    filteredSmoke() {
+      return this.allSmoke.filter(c => {
+        if (this.folderFilter && c.sourceFolder !== this.folderFilter) return false
+        if (this.moduleFilter && c.module !== this.moduleFilter) return false
+        return true
+      })
+    },
+    adoptedCount() {
+      return Object.keys(this.adoptedKeys).length
+    },
+    currentKey() {
+      return this.current ? this.current._key : ''
+    },
+  },
+  mounted() {
+    this.loadDetail()
+  },
+  methods: {
+    base() {
+      return '/requirement-analysis/api/modao'
+    },
+    priorityType(p) {
+      const map = { 'P0': 'danger', 'P1': 'warning', 'P2': '', 'P3': 'info' }
+      return map[p] || ''
+    },
+    parseArr(s) {
+      if (!s) return []
+      try {
+        const v = JSON.parse(s)
+        if (Array.isArray(v)) return v
+        return Array.isArray(v.data) ? v.data : []
+      } catch (e) {
+        return []
+      }
+    },
+    /** 冒烟 JSON 顶层是对象（{smoke_testcases: [...]}），需单独解析 */
+    parseSmoke(s) {
+      if (!s) return []
+      try {
+        const v = JSON.parse(s)
+        if (Array.isArray(v)) return v
+        if (v && typeof v === 'object') {
+          for (const k of ['smoke_testcases', 'smoke_cases', 'smoke_list', 'testcases']) {
+            if (Array.isArray(v[k])) return v[k]
+          }
+        }
+        return []
+      } catch (e) {
+        return []
+      }
+    },
+    toStepsList(steps) {
+      if (typeof steps === 'string') {
+        return steps.split(/\r?\n/).map(x => x.replace(/^\s*\d+[.、)]\s*/, '').trim()).filter(Boolean)
+      }
+      if (!Array.isArray(steps)) return []
+      return steps.map(s => {
+        if (s && typeof s === 'object') return String(s.content || s.action || s.step || '').trim()
+        return String(s == null ? '' : s).trim()
+      }).filter(Boolean)
+    },
+    normalizeCase(inner, wrapper, meta) {
+      const d = (inner && typeof inner === 'object') ? inner : { title: String(inner || '') }
+      const w = (wrapper && typeof wrapper === 'object') ? wrapper : {}
+      return {
+        _key: meta.key,
+        _pageId: meta.pageId,
+        _pageIndex: meta.pageIndex,
+        _isSmoke: meta.isSmoke,
+        caseId: d.id || w.id || '',
+        module: w.module || d.module || d.feature_module || '未分组',
+        title: d.title || d.name || d.case_name || '',
+        priority: d.priority || w.priority || 'P2',
+        type: d.type || w.type || '功能',
+        precondition: d.precondition || d.preconditions || d.pre_condition || '',
+        stepsList: this.toStepsList(d.steps || d.test_steps || d.testSteps),
+        expected: d.expected || d.pass_criteria || d.expected_result || '',
+        notes: d.notes || d.requirement_ref || '',
+        requirementRef: d.requirement_ref || '',
+        sourceCanvas: meta.sourceCanvas,
+        sourceFolder: meta.sourceFolder,
+        sourcePageId: meta.pageId,
+      }
+    },
+    async loadDetail() {
+      this.loading = true
+      try {
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        this.proto = res.data
+        this.pages = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
+      } catch (e) {
+        this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.loading = false
+      }
+    },
+    onSelectionChange(selection) {
+      this.selectedCases = selection
+      this.selectAll = selection.length === this.filteredCases.length && this.filteredCases.length > 0
+    },
+    onSelectAll() {
+      // 全选/取消全选通过表格的 toggleAllSelection 实现
+      this.$refs.table && this.$refs.table.toggleAllSelection()
+    },
+    isRowSelectable(row) {
+      return !this.adoptedKeys[row._key]
+    },
+    // ---------- 详情 / 编辑 ----------
+    openDetail(row, mode) {
+      this.current = row
+      this.detailMode = mode || 'view'
+      const edited = this.editedKeys[row._key]
+      const src = edited || {
+        module: row.module,
+        title: row.title,
+        priority: row.priority,
+        type: row.type,
+        precondition: row.precondition,
+        steps: [...row.stepsList],
+        expected: row.expected,
+        notes: row.notes,
+      }
+      this.form = {
+        module: src.module || '',
+        title: src.title || '',
+        priority: src.priority || 'P2',
+        type: src.type || '功能',
+        precondition: src.precondition || '',
+        steps: (src.steps || []).length ? [...src.steps] : [''],
+        expected: src.expected || '',
+        notes: src.notes || '',
+      }
+      this.detailVisible = true
+    },
+    addStep() {
+      this.form.steps.push('')
+    },
+    removeStep(i) {
+      this.form.steps.splice(i, 1)
+      if (!this.form.steps.length) this.form.steps.push('')
+    },
+    moveStep(i, delta) {
+      const j = i + delta
+      if (j < 0 || j >= this.form.steps.length) return
+      const arr = this.form.steps
+      const tmp = arr[i]
+      arr[i] = arr[j]
+      arr[j] = tmp
+    },
+    /** 收集弹窗表单内容（过滤空步骤） */
+    collectForm() {
+      const steps = this.form.steps.map(s => String(s || '').trim()).filter(Boolean)
+      return {
+        module: (this.form.module || '').trim() || '未分组',
+        title: (this.form.title || '').trim(),
+        priority: this.form.priority || 'P2',
+        type: this.form.type || '功能',
+        precondition: this.form.precondition || '',
+        steps,
+        expected: this.form.expected || '',
+        notes: this.form.notes || '',
+      }
+    },
+    saveEdit() {
+      if (!this.current) return
+      const payload = this.collectForm()
+      if (!payload.title) {
+        this.$message.warning('用例标题不能为空')
+        return
+      }
+      this.editedKeys = { ...this.editedKeys, [this.current._key]: payload }
+      this.$message.success('已保存修改（尚未采纳）')
+    },
+    async saveAndAdopt() {
+      if (!this.current || !this.collectForm().title) {
+        this.$message.warning('用例标题不能为空')
+        return
+      }
+      const key = this.current._key
+      this.savingAdopt = true
+      this.editedKeys = { ...this.editedKeys, [key]: this.collectForm() }
+      try {
+        const row = this.current
+        await this.postAdoptSingle(row)
+        this.detailVisible = false
+      } finally {
+        this.savingAdopt = false
+      }
+    },
+    // ---------- 采纳 ----------
+    /** 提交用 payload：
+     *  - 普通用例未编辑 → 返回 null，后端按 {page_id, page_index} 从原始 JSON 取，避免字段丢失
+     *  - 已编辑 or 冒烟用例（冒烟不在普通用例索引里，无法用 ref 定位）→ 返回完整内容
+     */
+    payloadForSubmit(row) {
+      const e = this.editedKeys[row._key]
+      if (!e && !row._isSmoke) return null
+      const src = e || {
+        module: row.module,
+        title: row.title,
+        priority: row.priority,
+        type: row.type,
+        precondition: row.precondition,
+        steps: [...row.stepsList],
+        expected: row.expected,
+        notes: row.notes,
+      }
+      return {
+        id: row.caseId,
+        module: src.module,
+        title: src.title,
+        priority: src.priority,
+        type: src.type,
+        precondition: src.precondition,
+        steps: src.steps,
+        expected: src.expected,
+        notes: src.notes,
+        requirement_ref: row.requirementRef || '',
+        is_smoke: !!row._isSmoke,
+      }
+    },
+    caseRefOf(row) {
+      // 冒烟用例不在普通用例索引中，不做 ref 定位（否则会错误命中同页普通用例）
+      if (row._isSmoke) return null
+      return { page_id: row._pageId, page_index: row._pageIndex }
+    },
+    async postAdoptSingle(row) {
+      const payload = this.payloadForSubmit(row)
+      const body = { is_smoke: !!row._isSmoke }
+      const ref = this.caseRefOf(row)
+      if (ref) body.case_ref = ref
+      if (payload) body.case = payload
+      this.adoptingKeys = { ...this.adoptingKeys, [row._key]: true }
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/adopt-single/`,
+          method: 'post',
+          data: body,
+        })
+        const d = res.data || {}
+        this.adoptedKeys = { ...this.adoptedKeys, [row._key]: true }
+        this.$message.success(d.detail || `已采纳「${row.title}」`)
+        return true
+      } catch (e) {
+        this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
+        return false
+      } finally {
+        const m = { ...this.adoptingKeys }
+        delete m[row._key]
+        this.adoptingKeys = m
+      }
+    },
+    async onAdoptSingle(row) {
+      if (this.adoptedKeys[row._key]) {
+        this.$message.info('该用例已采纳，无需重复采纳')
+        return
+      }
+      const ok = await this.postAdoptSingle(row)
+      if (ok) this.selectedCases = this.selectedCases.filter(c => c._key !== row._key)
+    },
+    async onAdoptSelected() {
+      if (!this.selectedCases.length) {
+        this.$message.warning('请至少选择一个用例')
+        return
+      }
+      this.adopting = true
+      try {
+        const cases = []
+        const refs = []
+        for (const row of this.selectedCases) {
+          const payload = this.payloadForSubmit(row)
+          if (payload) {
+            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined })
+          } else {
+            refs.push(this.caseRefOf(row))
+          }
+        }
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/adopt/`,
+          method: 'post',
+          data: { cases, case_refs: refs },
+        })
+        const d = res.data || {}
+        for (const row of this.selectedCases) {
+          this.adoptedKeys = { ...this.adoptedKeys, [row._key]: true }
+        }
+        let msg = `已采纳 ${d.testcases || 0} 条用例`
+        if (d.skipped) msg += `，跳过已存在 ${d.skipped} 条`
+        if (d.failed) msg += `，失败 ${d.failed} 条`
+        if (d.modules) msg += `，新建模块 ${d.modules} 个`
+        this.$message.success(msg)
+        this.selectedCases = []
+        this.selectAll = false
+      } catch (e) {
+        this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.adopting = false
+      }
+    },
+    async onAdoptAll() {
+      this.adoptingAll = true
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/adopt/`,
+          method: 'post',
+          data: { adopt_all: true },
+        })
+        const d = res.data || {}
+        let msg = `已采纳 ${d.testcases || 0} 条用例`
+        if (d.skipped) msg += `，跳过已存在 ${d.skipped} 条`
+        if (d.modules) msg += `，新建模块 ${d.modules} 个`
+        this.$message.success(msg)
+        const keys = {}
+        for (const row of [...this.allCases, ...this.allSmoke]) keys[row._key] = true
+        this.adoptedKeys = { ...this.adoptedKeys, ...keys }
+      } catch (e) {
+        this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.adoptingAll = false
+      }
+    },
+    goBack() {
+      this.$router.push(`/ai-generation/modao-board/${this.protoId}`)
+    },
+  },
+}
+</script>
+
+<style scoped lang="scss">
+.case-merge-view {
+  padding: 16px 20px 40px;
+
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      h2 { margin: 0; font-size: 18px; }
+    }
+    .proto-title { color: #606266; font-size: 13px; }
+  }
+
+  .filter-bar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: #f5f7fa;
+    border-radius: 8px;
+    flex-wrap: wrap;
+    .filter-stats { margin-left: auto; color: #606266; font-size: 13px; }
+  }
+
+  .batch-actions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    .batch-hint { color: #909399; font-size: 12px; }
+  }
+
+  .row-adopted { color: #909399; text-decoration: line-through; }
+  .row-tag { margin-left: 6px; }
+
+  .smoke-section {
+    margin-top: 24px;
+    h4 { margin: 0 0 12px; color: #303133; }
+  }
+
+  .detail-source {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+    padding: 8px 12px;
+    background: #f5f7fa;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #606266;
+    b { color: #303133; }
+  }
+
+  .detail-form {
+    :deep(.el-form-item) { margin-bottom: 14px; }
+  }
+
+  .steps-editor {
+    width: 100%;
+    .step-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      margin-bottom: 6px;
+      .step-no {
+        width: 22px;
+        line-height: 28px;
+        text-align: right;
+        color: #909399;
+        font-size: 12px;
+        flex: none;
+      }
+      .step-input { flex: 1; }
+      .step-ops {
+        flex: none;
+        display: flex;
+        align-items: center;
+        :deep(.el-button) { padding: 4px; margin-left: 0; }
+      }
+    }
+    .add-step { margin-left: 28px; }
+  }
+
+  .dialog-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    .footer-hint { color: #909399; font-size: 12px; text-align: left; }
+  }
+}
+</style>

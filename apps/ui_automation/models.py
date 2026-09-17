@@ -609,26 +609,32 @@ class TestCase(models.Model):
 class TestCaseStep(models.Model):
     """测试用例步骤模型"""
     ACTION_TYPE_CHOICES = [
-        ('click', '点击'),
-        ('tap', '轻触'),
-        ('double_tap', '双击'),
-        ('long_press', '长按'),
-        ('fill', '输入文本'),
-        ('input', '输入'),
-        ('clear', '清空'),
-        ('getText', '获取文本'),
-        ('waitFor', '等待元素'),
-        ('hover', '悬停'),
-        ('scroll', '滚动'),
-        ('swipe', '滑动'),
-        ('screenshot', '截图'),
-        ('assert', '断言'),
-        ('wait', '等待'),
-        ('switchTab', '切换标签页'),
-        ('launch_app', '启动应用'),
-        ('close_app', '关闭应用'),
-        ('back', '返回'),
-        ('home', '主页'),
+       ('click', '点击'),
+       ('tap', '轻触'),
+       ('double_tap', '双击'),
+       ('long_press', '长按'),
+       ('fill', '输入文本'),
+       ('input', '输入'),
+       ('clear', '清空'),
+       ('getText', '获取文本'),
+       ('waitFor', '等待元素'),
+       ('hover', '悬停'),
+       ('scroll', '滚动'),
+       ('swipe', '滑动'),
+       ('screenshot', '截图'),
+       ('assert', '断言'),
+       ('wait', '等待'),
+       ('switchTab', '切换标签页'),
+       ('launch_app', '启动应用'),
+       ('close_app', '关闭应用'),
+       ('back', '返回'),
+       ('home', '主页'),
+       ('aiAct', 'AI操作(Midscene)'),
+       ('aiTap', 'AI点击(Midscene)'),
+       ('aiInput', 'AI输入(Midscene)'),
+       ('aiQuery', 'AI查询(Midscene)'),
+       ('aiAssert', 'AI断言(Midscene)'),
+       ('navigate', '导航(Midscene)'),
     ]
 
     ASSERT_TYPE_CHOICES = [
@@ -1045,6 +1051,8 @@ class AppDevice(models.Model):
     udid = models.CharField(max_length=200, unique=True, verbose_name='设备唯一标识')
     appium_server_url = models.CharField(max_length=500, default='http://localhost:4723', verbose_name='Appium Server地址')
     adb_host = models.CharField(max_length=50, null=True, blank=True, default='', verbose_name='ADB主机', help_text='手机USB所在电脑的 IP:PORT（如 192.168.8.71:5037），后端通过该电脑的ADB服务控制此设备')
+    wda_host = models.CharField(max_length=50, blank=True, default='', verbose_name='WDA主机', help_text='iOS 设备专用：手机USB所在电脑的 IP（如 192.168.8.71），该电脑需已跑通 WDA 并转发 8100 端口')
+    wda_port = models.PositiveIntegerField(default=8100, verbose_name='WDA端口', help_text='iOS 设备专用：WDA 服务端口，默认 8100')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='offline', verbose_name='设备状态')
     resolution = models.CharField(max_length=50, blank=True, verbose_name='屏幕分辨率')
     capabilities = models.JSONField(default=dict, blank=True, verbose_name='额外配置', help_text='额外的Appium Capabilities')
@@ -1098,11 +1106,53 @@ class AppConfig(models.Model):
 
 
 class AICase(models.Model):
-    """AI测试用例"""
+    """AI测试用例
+
+    支持两种执行模式：
+    - text: 原 browser-use 文本模式（沿用 task_description 自然语言）
+    - midscene: 基于 Midscene + 真机的 APP UI 自动化，使用结构化 steps
+    """
+    EXECUTION_MODE_CHOICES = [
+        ('text', '文本模式(browser-use)'),
+        ('midscene', 'Midscene APP 自动化'),
+        ('midscene_web', 'Midscene Web 自动化'),
+    ]
+
     project = models.ForeignKey(UiProject, on_delete=models.CASCADE, null=True, blank=True, verbose_name='所属项目')
     name = models.CharField(max_length=200, verbose_name='用例名称')
     description = models.TextField(blank=True, null=True, verbose_name='描述')
-    task_description = models.TextField(verbose_name='任务描述', help_text='自然语言任务描述')
+    task_description = models.TextField(blank=True, null=True, verbose_name='任务描述', help_text='自然语言任务描述（text 模式使用）')
+    execution_mode = models.CharField(
+        max_length=20, choices=EXECUTION_MODE_CHOICES, default='text',
+        verbose_name='执行模式', help_text='text=浏览器文本模式；midscene=Midscene 真机 APP 自动化'
+    )
+    # Midscene 模式的结构化步骤（业务无关，每步可 extract 任意业务数据存入上下文，后续步骤用 ${{key}} 引用）
+    steps = models.JSONField(
+        default=list, blank=True, verbose_name='步骤',
+        help_text='Midscene 模式的结构化步骤列表，元素含 action/prompt/value/extract/assert 等字段'
+    )
+    # Midscene 模式关联被测应用与设备
+    app_config = models.ForeignKey(
+        AppConfig, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ai_cases', verbose_name='应用配置'
+    )
+    device = models.ForeignKey(
+        AppDevice, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ai_cases', verbose_name='执行设备'
+    )
+    # 弹窗（权限请求/隐私协议/开屏广告……）是随机出现的，挡路就会让步骤失败。
+    # 默认自动关掉；专门验证弹窗本身的用例可以取消勾选。
+    auto_dismiss_popup = models.BooleanField(
+        default=True, verbose_name='自动处理弹窗',
+        help_text='执行时遇到权限请求/协议/广告等弹窗自动关闭并重试该步骤'
+    )
+    # 第一次用自然语言跑通后，每一步「点在哪里」都已经知道了，把这些坐标写回
+    # steps 并打上时间戳，之后回放就只按坐标操作、不再调用视觉模型。
+    # 为空 = 还没固化（走 AI 探索模式）。
+    steps_frozen_at = models.DateTimeField(
+        null=True, blank=True, verbose_name='步骤固化时间',
+        help_text='非空表示 steps 里已带坐标，执行时走纯坐标回放（不调用视觉模型）'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, verbose_name='创建者')
@@ -1130,7 +1180,7 @@ class AIExecutionRecord(models.Model):
     ai_case = models.ForeignKey(AICase, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='关联AI用例')
     case_name = models.CharField(max_length=200, verbose_name='用例名称快照')
     task_description = models.TextField(blank=True, default='', verbose_name='任务描述', help_text='用户输入的原始任务描述')
-    execution_mode = models.CharField(max_length=20, choices=[('text', '文本模式')], default='text', verbose_name='执行模式')
+    execution_mode = models.CharField(max_length=20, choices=[('text', '文本模式'), ('midscene', 'Midscene APP 自动化'), ('midscene_web', 'Midscene Web 自动化')], default='text', verbose_name='执行模式')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='执行状态')
     start_time = models.DateTimeField(auto_now_add=True, verbose_name='开始时间')
     end_time = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
@@ -1141,6 +1191,23 @@ class AIExecutionRecord(models.Model):
     executed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, verbose_name='执行人')
     gif_path = models.CharField(max_length=500, null=True, blank=True, verbose_name='GIF录制路径')
     screenshots_sequence = models.JSONField(default=list, verbose_name='截图序列')
+    error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
+
+    # ---- 模型消耗统计 ----
+    # 回放模式的目标是"零模型"，所以必须能量化每次执行到底花掉多少，
+    # 否则无法判断固化到底有没有收益。数字优先取 LLM 代理返回的真实 usage，
+    # 代理不可用时退化为按截图尺寸估算（见 llm_usage.py）。
+    model_calls = models.IntegerField(default=0, verbose_name='模型调用次数')
+    prompt_tokens = models.IntegerField(default=0, verbose_name='输入 token')
+    completion_tokens = models.IntegerField(default=0, verbose_name='输出 token')
+    tokens_estimated = models.BooleanField(
+        default=False, verbose_name='token 为估算值',
+        help_text='True 表示没有拿到接口返回的真实 usage，数字是按截图尺寸估算的'
+    )
+    replay_mode = models.BooleanField(
+        default=False, verbose_name='纯坐标回放',
+        help_text='True 表示本次执行走的是固化回放，理论上不调用视觉模型'
+    )
 
     class Meta:
         db_table = 'ui_ai_execution_records'
@@ -1150,4 +1217,129 @@ class AIExecutionRecord(models.Model):
 
     def __str__(self):
         return f"{self.case_name} - {self.get_status_display()}"
+
+
+# ==================== App 自动化流水线运行记录 ====================
+
+class AppPipelineRun(models.Model):
+    """App 自动化流水线运行记录
+
+    把「capture(抓快照) → gen_pytest(生成用例) → run_pytest(执行测试) → allure(生成报告)」
+    封装成可参数化的一次运行。支持从历史记录一键重跑。
+    """
+    STAGE_CHOICES = [
+        ('capture', '抓取快照'),
+        ('gen_pytest', '生成用例'),
+        ('run_pytest', '执行测试'),
+        ('allure', '生成报告'),
+    ]
+
+    STATUS_CHOICES = [
+        ('pending', '待执行'),
+        ('running', '执行中'),
+        ('success', '成功'),
+        ('failed', '失败'),
+    ]
+
+    app_config = models.ForeignKey(
+        AppConfig, on_delete=models.CASCADE, related_name='pipeline_runs', verbose_name='应用配置'
+    )
+    device = models.ForeignKey(
+        AppDevice, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='pipeline_runs', verbose_name='设备'
+    )
+    stages = models.JSONField(
+        default=list, verbose_name='执行阶段',
+        help_text='选中的阶段列表, 如 ["capture","gen_pytest","run_pytest","allure"]'
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态'
+    )
+    log = models.TextField(blank=True, verbose_name='执行日志')
+    result_summary = models.TextField(blank=True, verbose_name='结果摘要')
+    snapshot_path = models.CharField(max_length=500, blank=True, verbose_name='快照路径')
+    report_url = models.CharField(max_length=500, blank=True, verbose_name='报告地址')
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, verbose_name='创建人'
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+    duration = models.FloatField(default=0, verbose_name='耗时(秒)')
+
+    class Meta:
+        db_table = 'app_pipeline_runs'
+        verbose_name = 'App流水线运行记录'
+        verbose_name_plural = 'App流水线运行记录'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Pipeline #{self.id} - {self.app_config.name} - {self.get_status_display()}"
+
+
+# ==================== 业务动作库（Prompt 与代码分离） ====================
+
+class BusinessAction(models.Model):
+    """业务动作（一个动作 = 一个明确的自然语言业务操作）。
+
+    Prompt 与代码分离：每个动作对应一条「经过 Playground 真机验证」的语义 prompt，
+    由 Playground 一键生成，也可在业务动作库管理页手工编辑。
+    正式用例 AICase.steps 中可用 {ref: 动作名} 引用，避免把 prompt 内联写死在用例里。
+    """
+    ACTION_CHOICES = [
+        ('aiAct', 'aiAct（自然语言执行）'),
+        ('aiTap', 'aiTap（点击）'),
+        ('aiInput', 'aiInput（输入）'),
+        ('aiQuery', 'aiQuery（提取）'),
+        ('assert', 'assert（断言）'),
+    ]
+
+    CATEGORY_CHOICES = [
+        ('precondition', '前置准备'),
+        ('business', '业务操作'),
+        ('extract', '数据提取'),
+        ('teardown', '收尾清理'),
+        ('other', '其他'),
+    ]
+
+    name = models.CharField(max_length=100, unique=True, verbose_name='动作名', help_text='唯一标识，如 login / select-product')
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='business',
+                                verbose_name='分类',
+                                help_text='前置准备=登录/切账号等；业务操作=下单/搜索等；收尾清理=退出登录')
+    description = models.CharField(max_length=200, blank=True, verbose_name='描述')
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES, default='aiAct', verbose_name='动作类型')
+    prompt = models.TextField(verbose_name='语义指令', help_text='自然语言操作指令，禁止写坐标，跨机型可复用')
+    selector_hint = models.CharField(max_length=300, blank=True, verbose_name='定位提示', help_text='可选，aiTap/aiInput 优先用此定位')
+    value = models.CharField(max_length=300, blank=True, verbose_name='输入值', help_text='aiInput 使用，支持 ${{key}} 上下文变量')
+    wait_ms = models.IntegerField(default=0, verbose_name='等待毫秒')
+    extract = models.JSONField(default=list, blank=True, verbose_name='提取配置', help_text='[{key,prompt,type,required}]，aiQuery 提取业务数据写入上下文')
+    assert_config = models.JSONField(default=dict, blank=True, verbose_name='断言配置', help_text='{prompt, expect}')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='创建人')
+
+    class Meta:
+        db_table = 'ui_business_actions'
+        verbose_name = '业务动作'
+        verbose_name_plural = '业务动作'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+    def to_step(self) -> dict:
+        """展开为 midscene 引擎可直接执行的 step dict。"""
+        step = {
+            'name': self.name,
+            'action': self.action,
+            'prompt': self.prompt,
+            'selector_hint': self.selector_hint or '',
+            'value': self.value or '',
+            'wait_ms': self.wait_ms or 0,
+        }
+        if self.extract:
+            step['extract'] = self.extract
+        if self.assert_config:
+            step['assert'] = self.assert_config
+        return step
 

@@ -19,7 +19,7 @@ _INPUT_KEYS = {
     'module_context', 'all_test_points_yaml', 'test_points_json',
     'risk_extended_testpoints', 'pci_blocked_scenarios', 'draft_testpoints',
     'generated_testcases_json', 'smoke_testcases_json', 'final_testpoints_json', 'stage2_issues',
-    'expected_module_list', 'module_skeleton', 'focus_instruction',
+    'converged_conclusions', 'expected_module_list', 'module_skeleton', 'focus_instruction',
     'c3_precheck',
 }
 

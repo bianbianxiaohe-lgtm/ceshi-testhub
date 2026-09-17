@@ -2,10 +2,16 @@
   <div class="project-management">
     <div class="header">
       <h2>项目管理</h2>
-      <el-button type="primary" @click="showCreateDialog = true">
-        <el-icon><Plus /></el-icon>
-        新建项目
-      </el-button>
+      <div style="display:flex;gap:10px">
+        <el-button type="success" @click="showImportDialog = true">
+          <el-icon><Upload /></el-icon>
+          导入OpenAPI文档
+        </el-button>
+        <el-button type="primary" @click="showCreateDialog = true">
+          <el-icon><Plus /></el-icon>
+          新建项目
+        </el-button>
+      </div>
     </div>
     
 
@@ -201,13 +207,60 @@
         <el-button type="primary" @click="editProject(viewedProject)">编辑</el-button>
       </template>
     </el-dialog>
+
+    <!-- 导入 OpenAPI 文档对话框 -->
+    <el-dialog
+      v-model="showImportDialog"
+      title="导入 OpenAPI 文档"
+      width="550px"
+      :close-on-click-modal="false"
+      @close="resetImportForm"
+    >
+      <el-form :model="importForm" label-width="100px">
+        <el-form-item label="所属项目" required>
+          <el-select v-model="importForm.project" placeholder="请选择项目" filterable style="width:100%">
+            <el-option
+              v-for="p in projects"
+              :key="p.id"
+              :label="p.name"
+              :value="p.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="文档名称" required>
+          <el-input v-model="importForm.name" placeholder="如：订单服务 v1.0" />
+        </el-form-item>
+        <el-form-item label="版本号" required>
+          <el-input v-model="importForm.version" placeholder="如：1.0.0" />
+        </el-form-item>
+        <el-form-item label="文档内容" required>
+          <el-input
+            v-model="importForm.spec_content"
+            type="textarea"
+            :rows="12"
+            placeholder='粘贴 OpenAPI JSON 内容，或拖拽文件到此处'
+            @drop.prevent="handleFileDrop"
+            @dragover.prevent
+          />
+          <div style="margin-top:8px;font-size:12px;color:#909399">
+            支持 OpenAPI 3.x / Swagger 2.0 格式的 JSON 内容
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showImportDialog = false">取消</el-button>
+        <el-button type="success" @click="handleImport" :loading="importing">
+          <el-icon><Upload /></el-icon> 导入
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox, ElDescriptions, ElDescriptionsItem } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { Plus, Upload } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 
@@ -219,6 +272,8 @@ const pageSize = ref(20)
 const total = ref(0)
 const showCreateDialog = ref(false)
 const showViewDialog = ref(false)
+const showImportDialog = ref(false)
+const importing = ref(false)
 const editingProject = ref(null)
 const viewedProject = ref(null)
 const submitting = ref(false)
@@ -266,6 +321,73 @@ const getStatusText = (status) => {
     'COMPLETED': '已结束'
   }
   return textMap[status] || status
+}
+
+// ── 导入 OpenAPI ──
+const importForm = reactive({
+  project: '',
+  name: '',
+  version: '1.0.0',
+  spec_content: ''
+})
+
+const handleFileDrop = (e) => {
+  const file = e.dataTransfer.files[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = (ev) => {
+    try {
+      const json = JSON.parse(ev.target.result)
+      importForm.spec_content = JSON.stringify(json, null, 2)
+      if (!importForm.name) importForm.name = json.info?.title || file.name.replace(/\.[^.]+$/, '')
+      if (importForm.version === '1.0.0' && json.info?.version) importForm.version = json.info.version
+    } catch {
+      ElMessage.error('文件不是有效的 JSON 格式')
+    }
+  }
+  reader.readAsText(file)
+}
+
+const handleImport = async () => {
+  if (!importForm.project) { ElMessage.warning('请选择项目'); return }
+  if (!importForm.name) { ElMessage.warning('请输入文档名称'); return }
+  if (!importForm.version) { ElMessage.warning('请输入版本号'); return }
+  if (!importForm.spec_content.trim()) { ElMessage.warning('请粘贴文档内容或拖入文件'); return }
+
+  let specJson
+  try {
+    specJson = JSON.parse(importForm.spec_content)
+  } catch {
+    ElMessage.error('文档内容不是有效的 JSON')
+    return
+  }
+
+  importing.value = true
+  try {
+    const res = await api.post('/agent/specs/', {
+      project: importForm.project,
+      name: importForm.name,
+      version: importForm.version,
+      spec_content: JSON.stringify(specJson),
+    })
+    ElMessage.success(
+      `导入成功！${res.data.endpoint_count} 个接口，` +
+      `自动创建 ${res.data.auto_created ?? 0} 个测试用例`
+    )
+    showImportDialog.value = false
+    resetImportForm()
+  } catch (e) {
+    ElMessage.error('导入失败: ' + (e.response?.data?.error || e.message))
+  } finally {
+    importing.value = false
+  }
+}
+
+const resetImportForm = () => {
+  importForm.project = ''
+  importForm.name = ''
+  importForm.version = '1.0.0'
+  importForm.spec_content = ''
 }
 
 const formatDate = (dateString) => {

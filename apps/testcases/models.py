@@ -7,6 +7,12 @@ from apps.feature_modules.models import FeatureModule, TestPoint
 
 class TestCase(models.Model):
     """测试用例模型"""
+    SOURCE_CHOICES = [
+        ('ai', 'AI生成'),
+        ('manual', '人工编写'),
+        ('unknown', '未标记'),
+    ]
+
     PRIORITY_CHOICES = [
         ('low', '低'),
         ('medium', '中'),
@@ -41,6 +47,14 @@ class TestCase(models.Model):
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='medium', verbose_name='优先级')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft', verbose_name='状态')
     test_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='functional', verbose_name='测试类型')
+    source = models.CharField(
+        max_length=20,
+        choices=SOURCE_CHOICES,
+        default='unknown',
+        db_index=True,
+        verbose_name='来源',
+        help_text='标识用例是 AI 生成还是人工编写，用于统计采纳率/真实覆盖率',
+    )
     tags = models.JSONField(default=list, verbose_name='标签')
     sort_order = models.PositiveIntegerField(default=0, verbose_name='排序序号', db_index=True)
     author = models.ForeignKey(User, on_delete=models.CASCADE, related_name='authored_testcases', verbose_name='作者')

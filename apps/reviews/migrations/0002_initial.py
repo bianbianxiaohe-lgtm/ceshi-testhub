@@ -6,9 +6,10 @@ import django.utils.timezone
 
 class Migration(migrations.Migration):
 
-    initial = True
+    
 
     dependencies = [
+        ('reviews', '0001_initial'),
     ]
 
     operations = [

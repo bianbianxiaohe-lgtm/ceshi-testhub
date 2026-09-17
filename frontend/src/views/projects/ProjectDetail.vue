@@ -13,6 +13,9 @@
         <!-- 项目信息 -->
         <el-tab-pane label="项目信息" name="info">
           <div v-if="project">
+            <div style="margin-bottom:12px;text-align:right;">
+              <el-button type="primary" :icon="Edit" @click="openProjectEditDialog">编辑项目</el-button>
+            </div>
             <el-descriptions :column="2" border>
               <el-descriptions-item label="项目名称">{{ project.name }}</el-descriptions-item>
               <el-descriptions-item label="项目状态">
@@ -69,52 +72,21 @@
           </div>
         </el-tab-pane>
 
-        <!-- 📚 知识库 (文件树模式) -->
+        <!-- 📚 知识库 (文件树 + DB 条目) -->
         <el-tab-pane label="📚 知识库" name="knowledge">
-          <!-- 未配置知识库目录提示 -->
+          <el-tabs v-model="kbSubTab" @tab-change="onKbSubTabChange" style="margin-top: -8px;">
+            <el-tab-pane label="📂 文件知识库" name="kb-fs">
+          <!-- 未配置文件型知识库时的提示（仅当确实没配置时才显示） -->
           <div v-if="!project?.knowledge_base_path" class="kb-not-configured">
             <el-result icon="info" title="尚未配置文件型知识库" sub-title="在项目信息中设置「知识库文件目录」后，此处将展示 Markdown 文件树。AI 生成测试用例时会自动读取所有 .md 文件内容注入提示词。">
               <template #extra>
                 <el-button type="primary" @click="activeTab = 'info'">去配置</el-button>
               </template>
             </el-result>
-
-            <!-- 回退：数据库知识库条目 -->
-            <el-divider />
-            <div class="kb-db-fallback">
-              <div class="kb-toolbar">
-                <el-select v-model="knowledgeFilter" placeholder="全部分类" clearable style="width:140px" @change="fetchKnowledge">
-                  <el-option label="全部分类" value="" />
-                  <el-option label="业务背景" value="background" />
-                  <el-option label="关键术语" value="terminology" />
-                  <el-option label="测试重点" value="test_focus" />
-                  <el-option label="约束条件" value="constraints" />
-                  <el-option label="注意事项" value="notes" />
-                </el-select>
-                <div style="display:flex;gap:8px;">
-                  <el-button type="success" size="small" plain @click="openKbGenerator">🤖 AI 生成知识库</el-button>
-                  <el-button type="primary" size="small" :icon="Plus" @click="openKnowledgeDialog()">新增条目</el-button>
-                </div>
-              </div>
-              <div v-if="knowledgeLoading" style="padding:20px"><el-skeleton :rows="3" animated /></div>
-              <div v-else-if="knowledgeList.length === 0" style="padding:30px;text-align:center;color:#c0c4cc">暂无条目</div>
-              <div v-else class="kb-db-list">
-                <div v-for="item in knowledgeList" :key="item.id" class="kb-db-card" :class="{ 'is-disabled': !item.is_active }">
-                  <div class="kb-db-card-hd">
-                    <el-tag :type="getCategoryTagType(item.category)" size="small">{{ item.category_display }}</el-tag>
-                    <span class="kb-db-title">{{ item.title }}</span>
-                    <el-switch v-model="item.is_active" size="small" @change="toggleKnowledge(item)" />
-                    <el-button size="small" link @click="openKnowledgeDialog(item)">编辑</el-button>
-                    <el-button size="small" type="danger" link @click="deleteKnowledge(item)">删除</el-button>
-                  </div>
-                  <div class="kb-db-content">{{ item.content }}</div>
-                </div>
-              </div>
-            </div>
           </div>
 
-          <!-- 已配置知识库目录：文件树 + Markdown 阅读器 -->
-          <div v-else class="kb-fs-layout">
+<!-- 已配置知识库目录：文件树 + Markdown 阅读器 -->
+          <div v-if="project?.knowledge_base_path" class="kb-fs-layout">
             <!-- 左侧：文件树 -->
             <div class="kb-fs-tree">
               <div class="kb-fs-tree-header">
@@ -189,9 +161,123 @@
               </template>
             </div>
           </div>
+            </el-tab-pane>
+            <el-tab-pane label="🗄️ DB 条目" name="kb-db">
+              <div class="kb-db-fallback">
+                <div class="kb-toolbar">
+                  <el-select v-model="knowledgeFilter" placeholder="全部分类" clearable style="width:140px" @change="fetchKnowledge">
+                    <el-option label="全部分类" value="" />
+                    <el-option label="业务背景" value="background" />
+                    <el-option label="关键术语" value="terminology" />
+                    <el-option label="测试重点" value="test_focus" />
+                    <el-option label="约束条件" value="constraints" />
+                    <el-option label="注意事项" value="notes" />
+                  </el-select>
+                  <div style="display:flex;gap:8px;">
+                    <el-button type="success" size="small" plain @click="openKbGenerator">🤖 AI 生成知识库</el-button>
+                    <el-button type="primary" size="small" :icon="Plus" @click="openKnowledgeDialog()">新增条目</el-button>
+                  </div>
+                </div>
+                <div v-if="knowledgeLoading" style="padding:20px"><el-skeleton :rows="3" animated /></div>
+                <div v-else-if="knowledgeList.length === 0" style="padding:30px;text-align:center;color:#c0c4cc">暂无条目</div>
+                <div v-else class="kb-db-list">
+                  <div v-for="item in (knowledgeList || [])" :key="item && item.id" class="kb-db-card" :class="{ 'is-disabled': !item?.is_active, 'is-pending': item?.needs_review }">
+                    <div class="kb-db-card-hd">
+                      <el-tag :type="getCategoryTagType(item.category)" size="small">{{ item.category_display }}</el-tag>
+                      <el-tag v-if="item?.source === 'zentao_coverage'" type="info" size="small" effect="plain">自动沉淀</el-tag>
+                      <el-tag v-if="item?.needs_review" type="warning" size="small">待复核</el-tag>
+                      <span class="kb-db-title">{{ item.title }}</span>
+                      <el-switch v-model="item.is_active" size="small" @change="toggleKnowledge(item)" />
+                      <el-button v-if="item?.needs_review" size="small" type="success" link @click="confirmKnowledge(item)">确认</el-button>
+                      <el-button size="small" link @click="openKnowledgeDialog(item)">编辑</el-button>
+                      <el-button size="small" type="danger" link @click="deleteKnowledge(item)">删除</el-button>
+                    </div>
+                    <div class="kb-db-content">{{ item.content }}</div>
+                  </div>
+                </div>
+              </div>
+            </el-tab-pane>
+          </el-tabs>
+        </el-tab-pane>
+
+        <!-- 📝 用例文档 -->
+        <el-tab-pane label="📝 用例文档" name="cases">
+          <div style="margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
+            <el-select v-model="selectedCaseFile" placeholder="选择用例文档" clearable style="width:300px" @change="loadCaseFile">
+              <el-option v-for="f in caseFiles" :key="f" :label="f" :value="f" />
+            </el-select>
+            <div style="display:flex;gap:8px;">
+              <el-button size="small" type="success" :icon="Plus" @click="showNewCaseDialog = true">新建文档</el-button>
+              <el-button v-if="selectedCaseFile" size="small" type="danger" @click="deleteCaseFile">删除文档</el-button>
+            </div>
+          </div>
+          <div v-if="!selectedCaseFile" style="padding:40px;text-align:center;color:#c0c4cc;">
+            <el-empty description="选择或新建用例文档" :image-size="80" />
+          </div>
+          <div v-else>
+            <div style="margin-bottom:8px;display:flex;justify-content:flex-end;gap:8px;">
+              <el-button v-if="!caseEditing" size="small" type="primary" :icon="Edit" @click="startCaseEdit">编辑</el-button>
+              <template v-else>
+                <el-button size="small" type="primary" :loading="caseSaving" :icon="Check" @click="saveCaseFile">保存</el-button>
+                <el-button size="small" :icon="Close" @click="cancelCaseEdit">取消</el-button>
+              </template>
+            </div>
+            <textarea
+              v-if="caseEditing"
+              v-model="caseEditContent"
+              class="kb-fs-edit-textarea"
+              style="min-height:400px;border:1px solid #e4e7ed;border-radius:6px;padding:12px;"
+              spellcheck="false"
+            />
+            <div v-else class="markdown-body" style="border:1px solid #e4e7ed;border-radius:6px;padding:16px;min-height:200px;" v-html="caseRenderedMd" />
+          </div>
         </el-tab-pane>
       </el-tabs>
     </div>
+
+    <!-- 新建用例文档弹窗 -->
+    <el-dialog v-model="showNewCaseDialog" title="📄 新建用例文档" width="480px" destroy-on-close>
+      <el-form label-width="80px">
+        <el-form-item label="文件名">
+          <el-input v-model="newCaseFileName" placeholder="如：万年历_核心流程.md" />
+        </el-form-item>
+        <el-form-item label="初始内容">
+          <el-input v-model="newCaseContent" type="textarea" :rows="8" placeholder="# 用例标题&#10;&#10;**步骤**：&#10;1. ...&#10;2. ..." />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showNewCaseDialog = false">取消</el-button>
+        <el-button type="primary" @click="createCaseFile">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 编辑项目弹窗 -->
+    <el-dialog v-model="showProjectEditDialog" title="✏️ 编辑项目" width="560px" destroy-on-close>
+      <el-form :model="projectEditForm" :rules="projectEditRules" ref="projectEditFormRef" label-width="100px">
+        <el-form-item label="项目名称" prop="name">
+          <el-input v-model="projectEditForm.name" placeholder="项目名称" maxlength="200" show-word-limit />
+        </el-form-item>
+        <el-form-item label="项目描述">
+          <el-input v-model="projectEditForm.description" type="textarea" :rows="3" placeholder="项目描述" />
+        </el-form-item>
+        <el-form-item label="项目状态">
+          <el-select v-model="projectEditForm.status">
+            <el-option label="进行中" value="active" />
+            <el-option label="已暂停" value="paused" />
+            <el-option label="已完成" value="completed" />
+            <el-option label="已归档" value="archived" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="知识库目录">
+          <el-input v-model="projectEditForm.knowledge_base_path" placeholder="如 /app/knowledge-bases/项目名/" />
+          <small style="color:#909399">服务器上知识库 markdown 文件的绝对路径，留空则不启用文件型知识库</small>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showProjectEditDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveProject">保存</el-button>
+      </template>
+    </el-dialog>
 
     <!-- FS 新建文件弹窗 -->
     <el-dialog v-model="showNewFileDialog" title="📄 新建知识库文件" width="500px" destroy-on-close>
@@ -374,7 +460,19 @@
 
     <!-- DB 知识库弹窗 -->
     <el-dialog v-model="showKnowledgeDialog" :title="editingKnowledge ? '编辑知识库条目' : '新增知识库条目'" width="600px" destroy-on-close>
-      <el-form :model="knowledgeForm" label-width="90px" :rules="knowledgeRules" ref="knowledgeFormRef">
+      <el-alert type="info" :closable="false" show-icon title="录入提示（提升 AI 按需精准召回）">
+        <template #default>
+          <div style="line-height:1.7;">
+            <p style="margin:0 0 4px;">AI 生成时会结合具体需求判断功能异同，但同名条目过多会被召回上限（8 条）挤出视野。建议：</p>
+            <ul style="margin:0;padding-left:18px;">
+              <li>标题带 <code>【功能 / 版本】</code> 前缀，如 <code>【引导 / v1.6.1】</code>（辅助区分，非强制）</li>
+              <li>内容开头点明适用功能/版本，并写<b>具体业务场景</b>（含「快手渠道」「H5 落地页」等区分词）——这是区分度的根本</li>
+              <li>一条只讲一个功能/约束；避免「需要充分测试」等泛化废话污染召回</li>
+            </ul>
+          </div>
+        </template>
+      </el-alert>
+      <el-form :model="knowledgeForm" label-width="90px" :rules="knowledgeRules" ref="knowledgeFormRef" style="margin-top:12px;">
         <el-form-item label="分类" prop="category">
           <el-select v-model="knowledgeForm.category" style="width:100%">
             <el-option label="业务背景" value="background" />
@@ -385,10 +483,10 @@
           </el-select>
         </el-form-item>
         <el-form-item label="标题" prop="title">
-          <el-input v-model="knowledgeForm.title" placeholder="请输入标题" maxlength="200" show-word-limit />
+          <el-input v-model="knowledgeForm.title" placeholder="建议带【功能 / 版本】前缀，如【引导 / v1.6.1】新增快手渠道引导" maxlength="200" show-word-limit />
         </el-form-item>
         <el-form-item label="内容" prop="content">
-          <el-input v-model="knowledgeForm.content" type="textarea" :rows="6" placeholder="请输入业务知识内容" />
+          <el-input v-model="knowledgeForm.content" type="textarea" :rows="6" placeholder="开头点明适用功能/版本，并写具体业务场景（含「快手渠道」「H5 落地页」等区分词），便于 AI 按需精准召回" />
         </el-form-item>
         <el-form-item label="排序权重">
           <el-input-number v-model="knowledgeForm.sort_order" :min="0" :max="999" />
@@ -418,6 +516,36 @@ import { marked } from 'marked'
 const route = useRoute()
 const project = ref(null)
 const activeTab = ref('info')
+const kbSubTab = ref('kb-fs')
+const showProjectEditDialog = ref(false)
+const projectEditForm = ref({ name: '', description: '', status: 'active', knowledge_base_path: '' })
+const projectEditFormRef = ref(null)
+const projectEditRules = {
+  name: [{ required: true, message: '请输入项目名称', trigger: 'blur' }],
+}
+
+const openProjectEditDialog = () => {
+  projectEditForm.value = {
+    name: project.value?.name || '',
+    description: project.value?.description || '',
+    status: project.value?.status || 'active',
+    knowledge_base_path: project.value?.knowledge_base_path || '',
+  }
+  showProjectEditDialog.value = true
+}
+
+const saveProject = async () => {
+  const valid = await projectEditFormRef.value?.validate().catch(() => false)
+  if (!valid) return
+  try {
+    await api.patch(`/projects/${route.params.id}/`, projectEditForm.value)
+    ElMessage.success('项目已更新')
+    showProjectEditDialog.value = false
+    fetchProject()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '更新失败')
+  }
+}
 const showAddMemberDialog = ref(false)
 const showAddEnvDialog = ref(false)
 
@@ -694,7 +822,7 @@ const fetchKnowledge = async () => {
     const params = {}
     if (knowledgeFilter.value) params.category = knowledgeFilter.value
     const res = await api.get(`/projects/${route.params.id}/knowledge/`, { params })
-    knowledgeList.value = res.data
+    knowledgeList.value = res.data.results || res.data || []
   } catch {
     ElMessage.error('获取知识库失败')
   } finally {
@@ -743,6 +871,40 @@ const toggleKnowledge = async (item) => {
   }
 }
 
+const confirmKnowledge = async (item) => {
+  // 确认前先做语义去重预检：若知识库已有高度相似（>=0.90）条目，提示人工判断
+  try {
+    const dupRes = await api.post(`/projects/${route.params.id}/knowledge/check-duplicate/`, {
+      entry_id: item.id,
+    })
+    const dups = (dupRes.data && dupRes.data.duplicates) || []
+    if (dupRes.data && dupRes.data.has_duplicate && dups.length) {
+      const top = dups[0]
+      const list = dups
+        .map((d) => `• ${(d.title || '未命名')}（相似度 ${(d.similarity * 100).toFixed(1)}%）`)
+        .join('\n')
+      try {
+        await ElMessageBox.confirm(
+          `该条目与知识库中以下内容高度相似，确认后仍会重复沉淀：\n\n${list}\n\n是否仍然确认纳入？`,
+          `疑似重复（${(top.similarity * 100).toFixed(1)}%）`,
+          { type: 'warning', confirmButtonText: '仍然确认', cancelButtonText: '取消' }
+        )
+      } catch {
+        return // 用户取消，不确认
+      }
+    }
+  } catch {
+    // 去重预检失败则放行，不阻断确认
+  }
+  try {
+    await api.patch(`/projects/${route.params.id}/knowledge/${item.id}/`, { needs_review: false })
+    item.needs_review = false
+    ElMessage.success('已确认，知识条目已纳入生成召回')
+  } catch {
+    ElMessage.error('确认失败')
+  }
+}
+
 const deleteKnowledge = async (item) => {
   try {
     await ElMessageBox.confirm(`确定删除「${item.title}」吗？`, '提示', { type: 'warning' })
@@ -760,6 +922,17 @@ const onTabChange = (name) => {
     if (project.value?.knowledge_base_path) {
       fetchFsTree()
     }
+    // 默认加载 DB 知识
+    if (kbSubTab.value === 'kb-db') {
+      fetchKnowledge()
+    }
+  }
+}
+
+const onKbSubTabChange = (name) => {
+  if (name === 'kb-fs' && project.value?.knowledge_base_path) {
+    fetchFsTree()
+  } else if (name === 'kb-db') {
     fetchKnowledge()
   }
 }
@@ -1006,9 +1179,116 @@ const removeMember = async (member) => {
   }
 }
 
+// ============================================================
+// 用例文档 (Markdown cases)
+// ============================================================
+const caseFiles = ref([])
+const selectedCaseFile = ref('')
+const caseEditing = ref(false)
+const caseEditContent = ref('')
+const caseSaving = ref(false)
+const showNewCaseDialog = ref(false)
+const newCaseFileName = ref('')
+const newCaseContent = ref('')
+
+const caseRenderedMd = computed(() => {
+  try { return marked(caseEditContent.value) } catch { return '' }
+})
+
+const fetchCaseFiles = async () => {
+  try {
+    // 列出 appium_workspace/cases/ 目录下的 .md 文件
+    const res = await api.get(`/projects/${route.params.id}/knowledge/fs/tree/`, {
+      params: { dir: 'appium_workspace/cases' }
+    })
+    const flatten = (nodes) => {
+      const out = []
+      for (const n of nodes || []) {
+        if (n.type === 'file' && n.name.endsWith('.md')) {
+          out.push(n.name)
+        } else if (n.type === 'directory' && n.children) {
+          out.push(...flatten(n.children))
+        }
+      }
+      return out
+    }
+    caseFiles.value = flatten(res.data.files)
+  } catch {
+    caseFiles.value = []
+  }
+}
+
+const loadCaseFile = async () => {
+  if (!selectedCaseFile.value) return
+  caseEditing.value = false
+  try {
+    const res = await api.get(`/projects/${route.params.id}/knowledge/fs/file/${encodeURIComponent('appium_workspace/cases/' + selectedCaseFile.value)}/`)
+    caseEditContent.value = res.data.content || ''
+  } catch {
+    ElMessage.error('读取文件失败')
+  }
+}
+
+const startCaseEdit = () => { caseEditing.value = true }
+const cancelCaseEdit = () => {
+  caseEditing.value = false
+  loadCaseFile()
+}
+
+const saveCaseFile = async () => {
+  caseSaving.value = true
+  try {
+    await api.put(`/projects/${route.params.id}/knowledge/fs/file/${encodeURIComponent('appium_workspace/cases/' + selectedCaseFile.value)}/`, {
+      content: caseEditContent.value
+    })
+    ElMessage.success('保存成功')
+    caseEditing.value = false
+  } catch {
+    ElMessage.error('保存失败')
+  } finally {
+    caseSaving.value = false
+  }
+}
+
+const createCaseFile = async () => {
+  const fname = newCaseFileName.value.trim()
+  if (!fname) { ElMessage.warning('请输入文件名'); return }
+  if (!fname.endsWith('.md')) { ElMessage.warning('文件名必须以 .md 结尾'); return }
+  try {
+    const targetPath = 'appium_workspace/cases/' + fname
+    await api.post(`/projects/${route.params.id}/knowledge/fs/create/`, {
+      path: targetPath,
+      content: newCaseContent.value || '# 新用例\n\n**步骤**：\n1. \n2. \n'
+    })
+    ElMessage.success('创建成功')
+    showNewCaseDialog.value = false
+    newCaseFileName.value = ''
+    newCaseContent.value = ''
+    await fetchCaseFiles()
+    selectedCaseFile.value = fname
+    await loadCaseFile()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.error || '创建失败')
+  }
+}
+
+const deleteCaseFile = async () => {
+  try {
+    await ElMessageBox.confirm(`确定删除「${selectedCaseFile.value}」吗？`, '提示', { type: 'warning' })
+    await api.delete(`/projects/${route.params.id}/knowledge/fs/file/${encodeURIComponent('appium_workspace/cases/' + selectedCaseFile.value)}/`)
+    ElMessage.success('删除成功')
+    selectedCaseFile.value = ''
+    caseEditContent.value = ''
+    await fetchCaseFiles()
+  } catch (error) {
+    if (error !== 'cancel') ElMessage.error('删除失败')
+  }
+}
+
 onMounted(() => {
   fetchProject()
   fetchUsers()
+  fetchCaseFiles()
   document.addEventListener('paste', onKbGenPaste)
 })
 
@@ -1035,6 +1315,7 @@ onUnmounted(() => {
     border: 1px solid #e4e7ed; border-radius: 6px; padding: 10px 14px;
     background: #fff;
     &.is-disabled { opacity: 0.5; background: #f9f9f9; }
+    &.is-pending { border-color: #e6a23c; background: #fdf6ec; }
     .kb-db-card-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
     .kb-db-title { font-weight: 600; color: #303133; flex: 1; }
     .kb-db-content { font-size: 13px; color: #606266; white-space: pre-wrap; }

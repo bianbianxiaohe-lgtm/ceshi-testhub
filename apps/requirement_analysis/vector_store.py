@@ -139,14 +139,20 @@ def query_kb(collection, vector: list, top_k: int = 8) -> list:
     res = collection.query(
         query_embeddings=[vector],
         n_results=min(top_k, n),
-        include=['documents', 'metadatas'],
+        include=['distances', 'metadatas', 'documents'],
     )
+    ids = (res.get('ids') or [[]])[0]
     documents = (res.get('documents') or [[]])[0]
     metadatas = (res.get('metadatas') or [[]])[0]
+    distances = (res.get('distances') or [[]])[0]
     out = []
     for i, doc in enumerate(documents):
+        distance = distances[i] if i < len(distances) else 1.0
         out.append({
+            'id': ids[i] if i < len(ids) else '',
             'text': doc,
             'meta': metadatas[i] if i < len(metadatas) else {},
+            'distance': distance,
+            'similarity': 1.0 - distance,
         })
     return out

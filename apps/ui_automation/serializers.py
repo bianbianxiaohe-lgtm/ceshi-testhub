@@ -7,7 +7,8 @@ from .models import (
     TestCase, TestCaseStep, TestCaseExecution, OperationRecord,
     UiScheduledTask, UiNotificationLog, UiTaskNotificationSetting,
     AICase, AIExecutionRecord,
-    AppDevice, AppConfig
+    AppDevice, AppConfig,
+    AppPipelineRun, BusinessAction
 )
 from django.contrib.auth import get_user_model
 
@@ -568,8 +569,8 @@ class TestCaseSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-class TestCaseExecutionSerializer(serializers.ModelSerializer):
-    """测试用例执行记录序列化器"""
+class TestCaseExecutionListSerializer(serializers.ModelSerializer):
+    """测试用例执行记录列表序列化器（轻量，不含日志/截图等大数据字段）"""
     test_case_name = serializers.CharField(source='test_case.name', read_only=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
     test_suite_name = serializers.SerializerMethodField()
@@ -580,7 +581,36 @@ class TestCaseExecutionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'test_case', 'test_case_name', 'project', 'project_name',
             'test_suite', 'test_suite_name', 'execution_source', 'status',
-            'engine', 'browser', 'headless',             'execution_logs', 'step_results', 'error_message',
+            'engine', 'browser', 'headless', 'error_message',
+            'execution_time', 'started_at', 'finished_at',
+            'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['created_by']
+
+    def get_test_suite_name(self, obj):
+        return obj.test_suite.name if obj.test_suite else None
+
+    def get_created_by_name(self, obj):
+        return obj.created_by.username if obj.created_by else '-'
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class TestCaseExecutionSerializer(serializers.ModelSerializer):
+    """测试用例执行记录详情序列化器（含日志、截图、步骤结果等完整数据）"""
+    test_case_name = serializers.CharField(source='test_case.name', read_only=True)
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    test_suite_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TestCaseExecution
+        fields = [
+            'id', 'test_case', 'test_case_name', 'project', 'project_name',
+            'test_suite', 'test_suite_name', 'execution_source', 'status',
+            'engine', 'browser', 'headless', 'execution_logs', 'step_results', 'error_message',
             'screenshots', 'execution_time', 'started_at', 'finished_at',
             'created_by', 'created_by_name', 'created_at'
         ]
@@ -814,6 +844,27 @@ class AICaseSerializer(serializers.ModelSerializer):
     project = UiProjectSerializer(read_only=True)
     created_by = UserSerializer(read_only=True)
     project_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    # 设备在编辑用例时选定，执行时不再询问。用例列表需要直接展示"这条用例会
+    # 跑在哪台设备上"，所以额外带一份只读的设备详情。
+    # 用 SerializerMethodField 而不是直接嵌套 AppDeviceSerializer：后者定义在
+    # 本文件更靠后的位置，直接引用会是 NameError。
+    device_detail = serializers.SerializerMethodField()
+
+    def get_device_detail(self, obj):
+        if not obj.device_id:
+            return None
+        d = obj.device
+        return {
+            'id': d.id,
+            'name': d.name,
+            'platform': d.platform,
+            'platform_version': d.platform_version,
+            'udid': d.udid,
+            'status': d.status,
+            'status_display': d.get_status_display(),
+            'wda_host': d.wda_host,
+            'wda_port': d.wda_port,
+        }
 
     class Meta:
         model = AICase
@@ -961,6 +1012,7 @@ class AppDeviceSerializer(serializers.ModelSerializer):
             'id', 'name', 'platform', 'platform_display', 'platform_version',
             'device_type', 'device_type_display', 'udid', 'appium_server_url',
             'adb_host',
+            'wda_host', 'wda_port',
             'status', 'status_display', 'resolution', 'capabilities',
             'last_heartbeat', 'notes', 'created_at', 'updated_at'
         ]
@@ -991,4 +1043,80 @@ class AppConfigSerializer(serializers.ModelSerializer):
         if obj.ai_project:
             return obj.ai_project.name
         return None
+
+
+class AppPipelineRunSerializer(serializers.ModelSerializer):
+    """App 自动化流水线运行记录序列化器"""
+    app_config_name = serializers.CharField(source='app_config.name', read_only=True)
+    device_name = serializers.CharField(source='device.name', read_only=True, allow_null=True)
+    device_udid = serializers.CharField(source='device.udid', read_only=True, allow_null=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True, allow_null=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = AppPipelineRun
+        fields = [
+            'id', 'app_config', 'app_config_name', 'device', 'device_name', 'device_udid',
+            'stages', 'status', 'status_display', 'log', 'result_summary',
+            'snapshot_path', 'report_url', 'created_by', 'created_by_name',
+            'created_at', 'started_at', 'finished_at', 'duration'
+        ]
+        read_only_fields = [
+            'id', 'status', 'status_display', 'log', 'result_summary',
+            'snapshot_path', 'report_url', 'created_at', 'started_at', 'finished_at', 'duration'
+        ]
+
+
+class BusinessActionSerializer(serializers.ModelSerializer):
+    """业务动作序列化器（Prompt 与代码分离）"""
+    action_display = serializers.CharField(source='get_action_display', read_only=True)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True, allow_null=True)
+    # 被多少条用例引用（写进 step 的 {ref: 名字}），前端用于展示影响面
+    used_by_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BusinessAction
+        fields = [
+            'id', 'name', 'category', 'category_display', 'description',
+            'action', 'action_display', 'prompt',
+            'selector_hint', 'value', 'wait_ms', 'extract', 'assert_config',
+            'used_by_count',
+            'created_by', 'created_by_name', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
+
+    def get_used_by_count(self, obj):
+        cache = self.context.get('_ref_counts') if hasattr(self, 'context') else None
+        if cache is None:
+            cache = _count_business_refs()
+            try:
+                self.context['_ref_counts'] = cache
+            except Exception:  # noqa: BLE001
+                pass
+        return cache.get(obj.name, 0)
+
+
+def _count_business_refs():
+    """统计每个业务动作被多少条 AI 用例的 steps 引用（{ref: 名字}）。
+
+    列表接口一次扫描算出全部计数，避免序列化器里逐条查库。
+    """
+    from apps.ui_automation.models import AICase
+
+    counts = {}
+    try:
+        qs = AICase.objects.exclude(steps=None).only('steps')
+    except Exception:  # noqa: BLE001
+        return counts
+    for steps in qs.values_list('steps', flat=True):
+        if not isinstance(steps, list):
+            continue
+        seen_here = set()
+        for s in steps:
+            if isinstance(s, dict) and s.get('ref'):
+                seen_here.add(str(s.get('ref')))
+        for name in seen_here:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
 

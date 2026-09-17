@@ -139,12 +139,14 @@
             v-for="(task, index) in tasks" 
             :key="task.task_id"
             class="table-row"
-            :class="{ 'selected': isTaskSelected(task.task_id) }">
+            :class="{ 'selected': isTaskSelected(task.task_id) }"
+            @click="viewTaskDetail(task)">
             <div class="body-cell checkbox-cell">
               <input
                 type="checkbox"
                 :checked="isTaskSelected(task.task_id)"
                 @change="toggleTaskSelection(task.task_id)"
+                @click.stop
                 class="task-checkbox">
             </div>
             <div class="body-cell serial-cell">{{ getSerialNumber(index) }}</div>
@@ -175,7 +177,7 @@
             </div>
             <div class="body-cell time-cell">{{ formatDateTime(task.created_at) }}</div>
             <div class="body-cell action-cell">
-              <div class="action-buttons">
+              <div class="action-buttons" @click.stop>
                 <button 
                   class="view-detail-btn" 
                   @click="viewTaskDetail(task)"
@@ -314,6 +316,7 @@
           </div>
           <div class="detail-item">
             <label>测试步骤:</label>
+            <el-alert v-if="!selectedTestCaseDetail.test_steps || !selectedTestCaseDetail.test_steps.trim()" type="error" :closable="false" show-icon title="步骤缺失，请补充操作步骤" style="margin-bottom:8px" />
             <p class="test-steps" v-html="selectedTestCaseDetail.test_steps"></p>
           </div>
           <div class="detail-item">
@@ -1014,14 +1017,14 @@ export default {
         ElMessage.info('用例正在生成中，请稍后查看！')
         return
       }
-      
+
       // completed / failed 都允许查看详情
       if (task.status === 'completed' || task.status === 'failed') {
-        const url = this.$router.resolve({
+        // 改为当前页面跳转，不再新开窗口
+        this.$router.push({
           name: 'TaskDetail',
           params: { taskId: task.task_id }
-        }).href
-        window.open(url, '_blank')
+        })
       }
     },
 
@@ -1705,6 +1708,7 @@ export default {
   grid-template-columns: 50px 60px 180px 320px 120px 130px 100px 105px 100px 170px 220px;
   border-bottom: 1px solid #eee;
   transition: background 0.2s ease;
+  cursor: pointer;
 }
 
 .table-row:hover {

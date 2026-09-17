@@ -10,6 +10,10 @@ SECRET_KEY = config('SECRET_KEY')
 
 DEBUG = config('DEBUG', default=True, cast=bool)
 
+# 设备端 agent（scripts/ios_wda_host.bat）自动注册设备时使用的共享令牌。
+# 留空 = 不校验（内网部署）；配置后 agent 必须在 X-Device-Token 头里带上同值。
+DEVICE_AGENT_TOKEN = config('DEVICE_AGENT_TOKEN', default='')
+
 # 根据DEBUG模式设置ALLOWED_HOSTS，生产环境不应使用通配符
 if DEBUG:
     ALLOWED_HOSTS = ['*']
@@ -56,6 +60,8 @@ LOCAL_APPS = [
     'apps.data_factory',
     'apps.analytics',
     'apps.app_automation.apps.AppAutomationConfig',
+    'apps.api_agent',
+    'apps.zentao',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -323,6 +329,11 @@ LOGGING = {
             'handlers': ['file', 'console'],
             'level': 'INFO',
             'propagate': True,
+        },
+        'apps.zentao': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
         },
     },
 }

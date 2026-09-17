@@ -1,3 +1,4 @@
+import logging
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -8,6 +9,8 @@ from .models import FeatureModule, TestPoint
 from .serializers import FeatureModuleSerializer, TestPointSerializer
 from apps.projects.models import Project
 from apps.core.mixins import ProjectScopedMixin, get_accessible_projects_for_user
+
+logger = logging.getLogger('django')
 
 
 class FeatureModuleListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
@@ -69,6 +72,21 @@ class FeatureModuleDetailView(ProjectScopedMixin, generics.RetrieveUpdateDestroy
         version_ids = self.request.data.get('version_ids')
         if version_ids is not None:
             instance.versions.set(version_ids)
+
+    def perform_destroy(self, instance):
+        """删除功能模块。补充记录请求来源（用户/IP），模块上下文由 models.py 的 pre_delete signal 记录。"""
+        try:
+            user = self.request.user
+            user_name = getattr(user, 'username', None) or str(user.id)
+            ip = self.request.META.get('HTTP_X_FORWARDED_FOR') or self.request.META.get('REMOTE_ADDR') or '?'
+            logger.info(
+                '[FEATURE_MODULE_DELETE_REQUEST] id=%s name=%r requester=%r(user_id=%s) ip=%s',
+                instance.id, instance.name, user_name, getattr(user, 'id', None), ip,
+            )
+        except Exception as e:  # noqa: BLE001 日志失败不影响删除
+            logger.warning('[FEATURE_MODULE_DELETE_REQUEST] 记录请求日志失败 id=%s err=%s',
+                           getattr(instance, 'id', None), e)
+        super().perform_destroy(instance)
 
 
 @api_view(['GET'])

@@ -10,6 +10,7 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
+        ('api_testing', '0002_initial'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
         ('core', '0003_initial'),
         ('api_testing', '0002_initial'),

@@ -26,13 +26,29 @@
         >
           登记 ADB 主机
         </el-button>
+        <el-switch
+          v-model="autoDiscover"
+          active-text="自动发现"
+          inactive-text="手动刷新"
+          style="margin-left: 8px"
+          @change="onAutoDiscoverChange"
+        />
+        <el-radio-group
+          v-model="platformFilter"
+          size="small"
+          style="margin-left: 12px"
+        >
+          <el-radio-button label="">全部({{ platformCounts.all }})</el-radio-button>
+          <el-radio-button label="android">Android({{ platformCounts.android }})</el-radio-button>
+          <el-radio-button label="ios">iOS({{ platformCounts.ios }})</el-radio-button>
+        </el-radio-group>
       </div>
     </div>
 
     <!-- 设备列表 -->
     <el-table
       v-loading="loading"
-      :data="devices"
+      :data="filteredDevices"
       style="width: 100%; margin-top: 20px"
       :empty-text="emptyText"
     >
@@ -75,7 +91,18 @@
         </template>
       </el-table-column>
 
-      <el-table-column prop="android_version" :label="$t('appAutomation.device.androidVersion')" width="120" />
+      <el-table-column prop="platform" label="平台" width="100">
+        <template #default="{ row }">
+          <el-tag
+            :type="(row.platform || 'android') === 'ios' ? 'primary' : 'success'"
+            size="small"
+          >
+            {{ (row.platform || 'android') === 'ios' ? 'iOS' : 'Android' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+
+      <el-table-column prop="android_version" label="系统版本" width="120" />
 
       <el-table-column prop="connection_type" :label="$t('appAutomation.device.connectionType')" width="120">
         <template #default="{ row }">
@@ -431,8 +458,27 @@ const deviceInfoDialogVisible = ref(false)
 const selectedDevice = ref(null)
 const emptyText = ref(t('appAutomation.device.emptyText'))
 const refreshTimer = ref(null)
+const autoDiscover = ref(true)       // 自动发现开关（默认开：周期调 discover，自动把设备+电脑IP同步到执行设备表）
 const editingAdbHostId = ref(null)  // 正在编辑 adb_host 的设备 ID
 const originalAdbHost = ref('')      // 编辑前的原值（用于取消恢复）
+const platformFilter = ref('')       // 平台筛选：'' 全部 / android / ios
+
+// 按平台筛选（Android / iOS 分类展示）
+const filteredDevices = computed(() => {
+  if (!platformFilter.value) return devices.value
+  return devices.value.filter(d => (d.platform || 'android') === platformFilter.value)
+})
+
+// 各类设备数量（用于筛选按钮角标）
+const platformCounts = computed(() => {
+  const counts = { all: devices.value.length, android: 0, ios: 0 }
+  devices.value.forEach(d => {
+    const p = d.platform || 'android'
+    if (p === 'ios') counts.ios += 1
+    else counts.android += 1
+  })
+  return counts
+})
 
 const remoteDeviceForm = ref({
   ip_address: '',
@@ -485,6 +531,44 @@ const refreshDevices = async () => {
     ElMessage.error(t('appAutomation.device.messages.refreshFailed') + ': ' + (error.message || t('appAutomation.device.unknownError')))
   } finally {
     refreshing.value = false
+  }
+}
+
+// 静默自动发现：周期调用 discover，自动把新接入的设备及其电脑IP同步到执行设备表
+// 不弹成功 toast，仅在状态变化时刷新列表，避免每 30s 打扰用户
+const silentDiscover = async () => {
+  try {
+    const res = await discoverDevices()
+    if (res.data && res.data.success) {
+      devices.value = res.data.devices || devices.value
+    }
+  } catch (error) {
+    // 自动发现失败（如所有主机不可达）静默忽略，下次周期重试
+    console.debug('自动发现跳过:', error?.message)
+  }
+}
+
+const onAutoDiscoverChange = (val) => {
+  if (val) {
+    ElMessage.success('已开启自动发现：每 30 秒自动扫描 ADB 主机')
+    startAutoDiscoverTimer()
+  } else {
+    stopAutoDiscoverTimer()
+    ElMessage.info('已切换为手动刷新')
+  }
+}
+
+const startAutoDiscoverTimer = () => {
+  stopAutoDiscoverTimer()
+  refreshTimer.value = setInterval(() => {
+    silentDiscover()
+  }, 30000)
+}
+
+const stopAutoDiscoverTimer = () => {
+  if (refreshTimer.value) {
+    clearInterval(refreshTimer.value)
+    refreshTimer.value = null
   }
 }
 
@@ -770,16 +854,15 @@ onMounted(async () => {
   // 再加载完整列表（含数据库中已有的设备）
   getDevices()
 
-  // 30秒自动刷新设备列表（仅读库，避免频繁调 ADB）
-  refreshTimer.value = setInterval(() => {
-    getDevices()
-  }, 30000)
+  // 自动发现开启时：每 30 秒调一次 discover，自动把新接入设备+电脑IP同步到执行设备表
+  // （B/C/D 起 adb server 后无需手动刷新即可被后端识别）
+  if (autoDiscover.value) {
+    startAutoDiscoverTimer()
+  }
 })
 
 onBeforeUnmount(() => {
-  if (refreshTimer.value) {
-    clearInterval(refreshTimer.value)
-  }
+  stopAutoDiscoverTimer()
 })
 </script>
 

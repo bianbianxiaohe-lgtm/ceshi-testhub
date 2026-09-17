@@ -74,10 +74,11 @@ class DeviceManager:
             logger.error(f"ADB验证异常: {str(e)}")
             raise
     
-    def list_devices(self):
+    def list_devices(self, timeout=3):
         """
         获取设备列表
         返回: [{'device_id': 'xxx', 'status': 'online', ...}, ...]
+        timeout: 连接远程 adb server 的短超时（秒），避免死 IP 拖垮扫描
         """
         try:
             # Verify ADB is available before running commands
@@ -89,7 +90,7 @@ class DeviceManager:
                 cmd_args,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=timeout,
                 **self.subprocess_kwargs
             )
             

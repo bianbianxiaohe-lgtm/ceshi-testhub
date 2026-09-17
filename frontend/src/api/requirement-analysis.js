@@ -175,6 +175,29 @@ export function adoptModaoSingleCase(pk, caseIndex) {
   })
 }
 
+// ==================== 阶段1 结构化摘要 ⇄ XMind（方案 A）====================
+
+// 导出 XMind 文件（二进制下载，需 responseType: blob）
+export function exportModaoXmind(pk) {
+  return request({
+    url: `/requirement-analysis/api/modao/${pk}/export-xmind/`,
+    method: 'get',
+    responseType: 'blob'
+  })
+}
+
+// 上传本地修改后的 XMind，覆盖结构化摘要（仅覆盖 requirement_summary，不联动下游）
+export function importModaoXmind(pk, file) {
+  const formData = new FormData()
+  formData.append('file', file)
+  return request({
+    url: `/requirement-analysis/api/modao/${pk}/import-xmind/`,
+    method: 'post',
+    data: formData,
+    headers: { 'Content-Type': 'multipart/form-data' }
+  })
+}
+
 // ==================== 需求拆解结果历史 ====================
 
 // 获取拆解结果历史列表

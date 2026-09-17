@@ -161,6 +161,61 @@ CREATE TABLE IF NOT EXISTS modao_page (
 ''')
 print('ensured table modao_page')
 
+# 确保 modao_page 有 selected / recognition_note 列（画布模块人工校验）
+for col, ddl in (
+    ('selected', 'ALTER TABLE modao_page ADD COLUMN selected TINYINT(1) NOT NULL DEFAULT 1'),
+    ('recognition_note', "ALTER TABLE modao_page ADD COLUMN recognition_note VARCHAR(200) NOT NULL DEFAULT ''"),
+    ('current_stage', 'ALTER TABLE modao_page ADD COLUMN current_stage INT NOT NULL DEFAULT 0'),
+    ('stage_status', "ALTER TABLE modao_page ADD COLUMN stage_status VARCHAR(20) NOT NULL DEFAULT 'pending'"),
+    ('work_log', 'ALTER TABLE modao_page ADD COLUMN work_log LONGTEXT NOT NULL'),
+    ('error_message', 'ALTER TABLE modao_page ADD COLUMN error_message LONGTEXT NOT NULL'),
+    ('rerun_stages', 'ALTER TABLE modao_page ADD COLUMN rerun_stages LONGTEXT NOT NULL'),
+    ('page_summary', 'ALTER TABLE modao_page ADD COLUMN page_summary LONGTEXT NOT NULL'),
+    ('page_clarification', 'ALTER TABLE modao_page ADD COLUMN page_clarification LONGTEXT NOT NULL'),
+    ('page_testpoints_json', 'ALTER TABLE modao_page ADD COLUMN page_testpoints_json LONGTEXT NOT NULL'),
+    ('page_testcases_json', 'ALTER TABLE modao_page ADD COLUMN page_testcases_json LONGTEXT NOT NULL'),
+    ('page_smoke_json', 'ALTER TABLE modao_page ADD COLUMN page_smoke_json LONGTEXT NOT NULL'),
+    ('page_approved', 'ALTER TABLE modao_page ADD COLUMN page_approved TINYINT(1) NOT NULL DEFAULT 0'),
+    ('screenshot_segments', "ALTER TABLE modao_page ADD COLUMN screenshot_segments LONGTEXT NOT NULL DEFAULT ('[]')"),
+    # 画布所属文件夹（墨刀页面树层级），对应迁移 0016_modao_page_folder；
+    # prod 的 manage.py migrate 不可用，必须在这里兜底，否则 modao_list 会因缺列 500。
+    ('folder', "ALTER TABLE modao_page ADD COLUMN folder VARCHAR(500) NOT NULL DEFAULT ''"),
+    # 画布父级分组（2026-09-17 新增，用于层级展示）
+    ('parent_name', "ALTER TABLE modao_page ADD COLUMN parent_name VARCHAR(200) NOT NULL DEFAULT ''"),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'modao_page' AND column_name = %s",
+        (col,),
+    )
+    if not cur.fetchone():
+        cur.execute(ddl)
+        print(f'ensured column {col} on modao_page')
+    else:
+        print(f'{col} already exists')
+
+# modao_page 这几个文本列在老库是 text（上限 64KB），画布工作日志 / 错误信息 / 重跑阶段
+# 写满会被截断，迁移后应为 longtext。这里幂等扩容兜底（保留原有可空性）。
+for _col in ('work_log', 'error_message', 'rerun_stages'):
+    cur.execute(
+        "SELECT data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'modao_page' AND column_name = %s",
+        (_col,),
+    )
+    _row = cur.fetchone()
+    if _row is None:
+        print('skip widening %s on modao_page (column not found)' % _col)
+    elif _row[0] != 'longtext':
+        cur.execute(
+            'ALTER TABLE modao_page MODIFY %s LONGTEXT %s'
+            % (_col, 'NULL' if _row[1] == 'YES' else 'NOT NULL')
+        )
+        print('widened %s on modao_page to longtext' % _col)
+    else:
+        print('%s on modao_page already longtext' % _col)
+
+
+
 # 确保墨刀原型表有 work_log 列（工作日志：各阶段进度记录）
 cur.execute(
     "SELECT 1 FROM information_schema.columns "
@@ -191,6 +246,19 @@ for col in ('feature_module_id', 'version_id'):
     )
     if not cur.fetchone():
         cur.execute(f'ALTER TABLE modao_prototype ADD COLUMN {col} INT')
+        print(f'ensured column {col} on modao_prototype')
+    else:
+        print(f'{col} already exists')
+
+# 确保 modao_prototype 有汇总采纳字段（A2-c：已采纳画布用例合并视图）
+for col in ('merged_testcases_json', 'merged_smoke_json'):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'modao_prototype' AND column_name = %s",
+        (col,),
+    )
+    if not cur.fetchone():
+        cur.execute(f'ALTER TABLE modao_prototype ADD COLUMN {col} LONGTEXT NOT NULL')
         print(f'ensured column {col} on modao_prototype')
     else:
         print(f'{col} already exists')
@@ -236,6 +304,179 @@ if not cur.fetchone():
     print('ensured column confirmed_answers on testcase_generation_task')
 else:
     print('confirmed_answers already exists')
+
+# 确保项目知识库表有 needs_review 列（知识沉淀待复核机制：自动沉淀条目默认待复核，
+# 人工确认前不进入向量召回）
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'project_knowledge' AND column_name = 'needs_review'",
+)
+if not cur.fetchone():
+    cur.execute('ALTER TABLE project_knowledge ADD COLUMN needs_review TINYINT(1) NOT NULL DEFAULT 0')
+    print('ensured column needs_review on project_knowledge')
+else:
+    print('needs_review already exists')
+
+# 确保移动设备表有 wda_host / wda_port 列（iOS 远端 WDA：与 adb_host 对称，
+# 后端通过 http://<wda_host>:<wda_port> 驱动插在其它电脑上的 iPhone）
+for _col, _ddl in (
+    ('wda_host', "ALTER TABLE app_devices ADD COLUMN wda_host VARCHAR(50) NOT NULL DEFAULT ''"),
+    ('wda_port', 'ALTER TABLE app_devices ADD COLUMN wda_port INT NOT NULL DEFAULT 8100'),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'app_devices' AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute(_ddl)
+        print('ensured column %s on app_devices' % _col)
+    else:
+        print('%s already exists on app_devices' % _col)
+
+# 确保业务动作表有 category 列（公共步骤分类：前置准备/业务操作/数据提取/
+# 收尾清理/其他）。老库没有该列时列表接口会 500，故幂等补齐。
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'ui_business_actions' AND column_name = 'category'",
+)
+if not cur.fetchone():
+    cur.execute(
+        "ALTER TABLE ui_business_actions ADD COLUMN category VARCHAR(20) NOT NULL DEFAULT 'business'")
+    print('ensured column category on ui_business_actions')
+else:
+    print('category already exists on ui_business_actions')
+
+# 确保 AI 用例表的 app_config_id / device_id 允许为空。
+# 背景：该表是老表，部分环境建成了 NOT NULL DEFAULT 0，但模型 AICase.app_config / device
+# 均为 null=True。Django 插入时会显式写 NULL，在严格模式下直接报
+# (1048, "Column 'app_config_id' cannot be null")，导致该环境**任何** AI 用例都建不了
+# （不只是 Midscene Web，所有执行模式都受影响）。
+# 由于部分环境的 manage.py migrate 因历史迁移状态不一致而不可用，这里用幂等 DDL 兜底修复。
+for _col in ('app_config_id', 'device_id'):
+    cur.execute(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = %s",
+        (_col,),
+    )
+    _row = cur.fetchone()
+    if _row is None:
+        # 列都不存在（极端老库）就跳过，交给建表逻辑处理
+        print('skip %s on ui_ai_cases (column not found)' % _col)
+    elif _row[0] == 'NO':
+        cur.execute('ALTER TABLE ui_ai_cases MODIFY %s INT NULL DEFAULT NULL' % _col)
+        print('ensured column %s on ui_ai_cases is nullable' % _col)
+    else:
+        print('%s on ui_ai_cases already nullable' % _col)
+
+# 确保 AI 用例表有 auto_dismiss_popup / steps_frozen_at 列（弹窗自动处理 + 坐标回放）
+for _col, _ddl in (
+    ('auto_dismiss_popup',
+     'ALTER TABLE ui_ai_cases ADD COLUMN auto_dismiss_popup TINYINT(1) NOT NULL DEFAULT 1'),
+    ('steps_frozen_at',
+     'ALTER TABLE ui_ai_cases ADD COLUMN steps_frozen_at DATETIME NULL'),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute(_ddl)
+        print('ensured column %s on ui_ai_cases' % _col)
+    else:
+        print('%s already exists on ui_ai_cases' % _col)
+
+# 确保 AI 执行记录表有 token 统计 + error_message 列
+for _col, _ddl in (
+    ('model_calls', 'ALTER TABLE ui_ai_execution_record ADD COLUMN model_calls INT NOT NULL DEFAULT 0'),
+    ('prompt_tokens', 'ALTER TABLE ui_ai_execution_record ADD COLUMN prompt_tokens INT NOT NULL DEFAULT 0'),
+    ('completion_tokens', 'ALTER TABLE ui_ai_execution_record ADD COLUMN completion_tokens INT NOT NULL DEFAULT 0'),
+    ('tokens_estimated', 'ALTER TABLE ui_ai_execution_record ADD COLUMN tokens_estimated TINYINT(1) NOT NULL DEFAULT 0'),
+    ('replay_mode', 'ALTER TABLE ui_ai_execution_record ADD COLUMN replay_mode TINYINT(1) NOT NULL DEFAULT 0'),
+    ('error_message', "ALTER TABLE ui_ai_execution_record ADD COLUMN error_message LONGTEXT NOT NULL DEFAULT ('')"),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_execution_record' AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute(_ddl)
+        print('ensured column %s on ui_ai_execution_record' % _col)
+    else:
+        print('%s already exists on ui_ai_execution_record' % _col)
+
+# ui_ai_cases.steps 在老库是 text（上限 64KB，且无法做 JSON 查询），迁移后应为 json。
+# 只有现存数据全部是合法 JSON 时才转换，避免 ALTER 失败阻断启动。
+cur.execute(
+    "SELECT data_type, is_nullable FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = 'steps'"
+)
+_row = cur.fetchone()
+if _row is None:
+    print('skip steps on ui_ai_cases (column not found)')
+elif _row[0] != 'json':
+    cur.execute(
+        "SELECT COUNT(*) FROM ui_ai_cases "
+        "WHERE steps IS NOT NULL AND steps <> '' AND NOT JSON_VALID(steps)"
+    )
+    _bad = cur.fetchone()[0]
+    if _bad:
+        print('skip converting steps to json: %s rows are not valid json' % _bad)
+    else:
+        cur.execute(
+            'ALTER TABLE ui_ai_cases MODIFY steps JSON %s'
+            % ('NULL' if _row[1] == 'YES' else 'NOT NULL')
+        )
+        print('converted ui_ai_cases.steps to json')
+else:
+    print('ui_ai_cases.steps already json')
+
+
+# 确保 App 设备表有 platform 列（区分 Android / iOS）。
+# 背景：该表原为纯 Android 设计，接入 iOS 后需要平台字段做分类。
+# 部分环境 manage.py migrate 不可用（历史迁移状态不一致），这里用幂等 DDL 兜底。
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'app_automation_devices' "
+    "AND column_name = 'platform'"
+)
+if not cur.fetchone():
+    cur.execute(
+        "ALTER TABLE app_automation_devices "
+        "ADD COLUMN platform VARCHAR(20) NOT NULL DEFAULT 'android'"
+    )
+    print('ensured column platform on app_automation_devices')
+else:
+    print('platform already exists on app_automation_devices')
+
+
+# 确保 App 自动化流水线运行记录表存在（新功能：选应用 + 自定义阶段 + 运行记录重跑）。
+# 注意：app_configs / app_devices 库内主键实际为 INT（与模型 BigAutoField 存在漂移），
+# 因此外键列必须显式用 INT，避免 MySQL 3780 外键类型不兼容。
+cur.execute('''
+CREATE TABLE IF NOT EXISTS app_pipeline_runs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    stages JSON,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    log LONGTEXT,
+    result_summary LONGTEXT,
+    snapshot_path VARCHAR(500),
+    report_url VARCHAR(500),
+    created_at DATETIME NOT NULL,
+    started_at DATETIME NULL,
+    finished_at DATETIME NULL,
+    duration DOUBLE NOT NULL DEFAULT 0,
+    app_config_id INT NOT NULL,
+    device_id INT NULL,
+    created_by_id INT NULL,
+    CONSTRAINT fk_pipeline_app_config FOREIGN KEY (app_config_id) REFERENCES app_configs (id),
+    CONSTRAINT fk_pipeline_device FOREIGN KEY (device_id) REFERENCES app_devices (id),
+    CONSTRAINT fk_pipeline_created_by FOREIGN KEY (created_by_id) REFERENCES auth_user (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+''')
+print('ensured table app_pipeline_runs')
 """
     print("Ensuring center_x/center_y columns exist on ui_test_case_steps...")
     subprocess.run([sys.executable, "-c", ensure_script], check=False)

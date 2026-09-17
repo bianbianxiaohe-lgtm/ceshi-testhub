@@ -173,3 +173,50 @@ export function getOperationLogs(params) {
     params
   })
 }
+
+// ========== API Agent - OpenAPI 文档管理 ==========
+
+// 导入 OpenAPI 文档
+export function importOpenApiSpec(data) {
+  return request({
+    url: '/agent/specs/',
+    method: 'post',
+    data
+  })
+}
+
+// 获取已导入的文档版本列表
+export function getApiSpecs(params) {
+  return request({
+    url: '/agent/specs/',
+    method: 'get',
+    params
+  })
+}
+
+// 获取文档下的接口列表
+export function getSpecEndpoints(specId, params) {
+  return request({
+    url: `/agent/specs/${specId}/endpoints/`,
+    method: 'get',
+    params
+  })
+}
+
+// 对比两个文档版本
+export function diffSpecs(specId, data) {
+  return request({
+    url: `/agent/specs/${specId}/diff/`,
+    method: 'post',
+    data
+  })
+}
+
+// 获取变更列表
+export function getApiChanges(params) {
+  return request({
+    url: '/agent/changes/',
+    method: 'get',
+    params
+  })
+}

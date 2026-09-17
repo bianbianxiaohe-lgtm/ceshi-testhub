@@ -65,6 +65,12 @@ class TestCaseSerializer(serializers.ModelSerializer):
 
 class TestCaseCreateSerializer(serializers.ModelSerializer):
     project_id = serializers.IntegerField(required=False, allow_null=True, help_text="项目ID，可选")
+    source = serializers.ChoiceField(
+        choices=TestCase.SOURCE_CHOICES,
+        default='manual',
+        required=False,
+        help_text="用例来源：manual=人工编写，ai=AI生成",
+    )
     version_ids = serializers.ListField(
         child=serializers.IntegerField(), 
         required=False, 
@@ -84,7 +90,7 @@ class TestCaseCreateSerializer(serializers.ModelSerializer):
         fields = [
             'title', 'description', 'preconditions', 'steps', 'expected_result', 
             'priority', 'status', 'test_type', 'tags', 'project_id', 'version_ids',
-            'feature_module_ids', 'test_point_id'
+            'feature_module_ids', 'test_point_id', 'source'
         ]
     
     def create(self, validated_data):
@@ -132,7 +138,7 @@ class TestCaseUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'title', 'description', 'preconditions', 'steps', 'expected_result', 
             'priority', 'status', 'test_type', 'tags', 'project_id', 'version_ids',
-            'feature_module_ids', 'test_point_id'
+            'feature_module_ids', 'test_point_id', 'source'
         ]
     
     def update(self, instance, validated_data):

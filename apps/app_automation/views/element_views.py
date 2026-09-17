@@ -13,10 +13,38 @@ import hashlib
 import re
 import logging
 
+import django_filters
 from ..models import AppElement
 from ..serializers import AppElementSerializer
 
 logger = logging.getLogger(__name__)
+
+
+class AppElementFilter(django_filters.FilterSet):
+    """自定义过滤，避免 ModelChoiceFilter/NumberFilter 对空值/非数字报 400。"""
+    project = django_filters.CharFilter(field_name='project_id', method='filter_project')
+    element_type = django_filters.ChoiceFilter(
+        field_name='element_type',
+        choices=AppElement.ELEMENT_TYPE_CHOICES,
+        required=False,
+    )
+    is_active = django_filters.BooleanFilter(field_name='is_active', required=False)
+
+    class Meta:
+        model = AppElement
+        fields = ['project', 'element_type', 'is_active']
+
+    def filter_project(self, queryset, name, value):
+        """project 为空字符串或非数字时直接忽略，避免 NumberFilter 报'输入一个数字'。"""
+        if value is None:
+            return queryset
+        value = str(value).strip()
+        if not value:
+            return queryset
+        try:
+            return queryset.filter(project_id=int(value))
+        except (ValueError, TypeError):
+            return queryset.none()
 
 
 class AppElementViewSet(viewsets.ModelViewSet):
@@ -27,7 +55,7 @@ class AppElementViewSet(viewsets.ModelViewSet):
     pagination_class = AppPagination
     # ⚠️ 移除 SearchFilter，使用自定义搜索逻辑
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ['element_type', 'is_active', 'project']
+    filterset_class = AppElementFilter
     
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)

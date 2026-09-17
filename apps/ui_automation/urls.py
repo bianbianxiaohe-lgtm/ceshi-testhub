@@ -24,6 +24,7 @@ from .views import (
     UiDashboardViewSet,
     AppDeviceViewSet,
     AppConfigViewSet,
+    BusinessActionViewSet,
     get_all_projects_unified,
     ensure_ui_project,
     learn_elements,
@@ -34,8 +35,11 @@ from .views import (
     stop_recording,
     generate_recording_case,
     import_airtest_script,
+    device_agent_register,
+    llm_proxy,
 )
 from .views_config import EnvironmentConfigViewSet, AIIntelligentModeConfigViewSet
+from .pipeline_views import AppPipelineRunViewSet
 
 router = DefaultRouter()
 router.register(r'dashboard', UiDashboardViewSet, basename='dashboard')
@@ -68,6 +72,8 @@ router.register(r'ai-models', AIIntelligentModeConfigViewSet, basename='ai-model
 # App 自动化设备管理
 router.register(r'app-devices', AppDeviceViewSet)
 router.register(r'app-configs', AppConfigViewSet)
+router.register(r'app-pipelines', AppPipelineRunViewSet)
+router.register(r'business-actions', BusinessActionViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -81,6 +87,10 @@ urlpatterns = [
     path('recording/stop/', stop_recording, name='recording-stop'),
     path('recording/generate/', generate_recording_case, name='recording-generate'),
     path('airtest/import/', import_airtest_script, name='airtest-import'),
+    path('device-agent/register/', device_agent_register, name='device-agent-register'),
+    # LLM 用量统计代理：OpenAI 兼容转发，顺带把 usage 记到执行记录上
+    path('llm-proxy/', llm_proxy, name='llm-proxy'),
+    path('llm-proxy/<path:rest>', llm_proxy, name='llm-proxy-rest'),
 ]
 
 # 添加媒体文件路由

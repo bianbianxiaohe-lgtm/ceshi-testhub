@@ -70,3 +70,48 @@ _cmp_*
 _ws_db*.py
 $null
 webshare_test.html;
+
+# 敏感凭证：墨刀登录 cookie，禁止入库
+media/modao_cookies.json
+
+# 前端构建产物 dump 与打包产物
+_assets_dump/
+_dist_assets_dump/
+_ext/
+_sync.tar
+appium_workspace/
+skills-dist/
+
+# 本地临时验证文件
+_chk_*.py
+_ensure_*.py
+_fe_build.txt
+_nginx.conf
+_proj_pages.txt
+snapshot_*.png
+vout.txt
+logs.bat
+watch.bat
+watch_prod.bat
+watch_prod.ps1
+docker_cleanup_compact.bat
+docker_cleanup_compact.ps1
+
+# 墨刀样本素材（本地演示用，不入库）
+media/modao_samples/
+
+# 本地 AI 助手技能与临时脚本
+.codebuddy/skills/
+_fake_mig.py
+nul; Write-Output cleaned
+
+# 一次性排查/修复脚本及其输出（根目录 _ 前缀，全部为本地临时产物，禁止入库）
+/_*.py
+/_*.txt
+/_*.tar
+/_*.jpg
+/_*.json
+/_*.out
+.debug_tmps/
+frontend/_build_out.txt
+frontend/_build_err.txt
