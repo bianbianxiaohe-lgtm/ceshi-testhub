@@ -1057,10 +1057,15 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
     def load_defaults(self, request):
         """加载默认提示词"""
         try:
+            # 独立线 Skill 包内 prompts 目录（运行期真源，已进镜像）
+            _SKILL_PROMPTS_DIR = os.path.join(
+                settings.BASE_DIR, 'apps', 'requirement_analysis',
+                'independent_skill', 'prompts'
+            )
             # 读取用例编写提示词
-            writer_prompt_path = os.path.join(settings.BASE_DIR, 'tester.md')
+            writer_prompt_path = os.path.join(_SKILL_PROMPTS_DIR, 'tester.md')
             # 读取用例评审提示词
-            reviewer_prompt_path = os.path.join(settings.BASE_DIR, 'tester_pro.md')
+            reviewer_prompt_path = os.path.join(_SKILL_PROMPTS_DIR, 'tester_pro.md')
             
             defaults = {}
 
@@ -1104,8 +1109,8 @@ class PromptConfigViewSet(viewsets.ModelViewSet):
 3. 补充的测试场景（如有）
 4. 修改后的测试用例（如需要）"""
 
-            # 需求分析提示词
-            analyzer_prompt_path = os.path.join(settings.BASE_DIR, 'tester_analyzer.md')
+            # 需求分析提示词（独立线 Skill 包内）
+            analyzer_prompt_path = os.path.join(_SKILL_PROMPTS_DIR, 'tester_analyzer.md')
             try:
                 with open(analyzer_prompt_path, 'r', encoding='utf-8') as f:
                     defaults['analyzer'] = f.read()
@@ -1591,15 +1596,19 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                 logger.info(f"任务 {task.task_id} 使用生成配置: auto_review={enable_auto_review}, review_timeout={review_timeout}s")
 
-                                # 预取所有 ForeignKey 数据 + 知识库上下文（必须在 async 上下文之前完成）
-                                # 避免 async def 中触发同步 ORM 懒加载导致 SynchronousOnlyOperation
-                                _writer_prompt = task.writer_prompt_config.content if task.writer_prompt_config else ""
-                                _reviewer_prompt = task.reviewer_prompt_config.content if task.reviewer_prompt_config else ""
-                                _writer_model = task.writer_model_config
-                                _reviewer_model = task.reviewer_model_config
-                                # 预计算知识库上下文（含 project FK + ProjectKnowledge 查询）
+                                # 预取所有 ForeignKey 数据 + 知识库上下文 + 异常场景统计
+                                # 必须在 async 上下文之前完成，避免 async def 中触发同步 ORM 懒加载导致 SynchronousOnlyOperation
+                                # 全部挂到 task 实例上，供下方 generate_test_cases_stream / review_test_cases_stream 在 async 内只读缓存属性
+                                task._pre_writer_prompt = task.writer_prompt_config.content if task.writer_prompt_config else ""
+                                task._pre_reviewer_prompt = task.reviewer_prompt_config.content if task.reviewer_prompt_config else ""
+                                # 触发 FK 缓存（避免 async 内懒加载）
+                                task._pre_writer_model = task.writer_model_config
+                                task._pre_reviewer_model = task.reviewer_model_config
+                                # 知识库上下文（含 project FK + ProjectKnowledge 查询）
                                 task._pre_fetched_knowledge_context = AIModelService.build_knowledge_context(task)
-                                logger.info(f"[PREFETCH] writer_prompt={bool(_writer_prompt)}, reviewer_prompt={bool(_reviewer_prompt)}, kb_context_len={len(task._pre_fetched_knowledge_context)}")
+                                # 异常场景统计（查 CoverageReport，必须在 async 外完成，否则 async 内 SynchronousOnlyOperation）
+                                task._pre_abnormal_scene = AIModelService._build_abnormal_scene_section(task)
+                                logger.info(f"[PREFETCH] writer_prompt={bool(task._pre_writer_prompt)}, reviewer_prompt={bool(task._pre_reviewer_prompt)}, kb={len(task._pre_fetched_knowledge_context)}, abnormal_scenes={len(task._pre_abnormal_scene)}")
 
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)

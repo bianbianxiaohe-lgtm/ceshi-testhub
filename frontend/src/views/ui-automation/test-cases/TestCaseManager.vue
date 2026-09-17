@@ -109,13 +109,14 @@
                 </template>
                 <template v-else>
                   <el-option label="Playwright" value="playwright" />
+                  <el-option label="Midscene Web (AI)" value="midscene_web" />
                   <el-option label="Selenium" value="selenium" />
                   <el-option label="Appium" value="appium" />
                   <el-option label="Airtest" value="airtest" />
                 </template>
               </el-select>
               <!-- Web 引擎选项（仅 Playwright/Selenium 需要浏览器和运行模式） -->
-              <template v-if="selectedEngine === 'playwright' || selectedEngine === 'selenium'">
+              <template v-if="selectedEngine === 'playwright' || selectedEngine === 'selenium' || selectedEngine === 'midscene_web'">
                 <el-select v-model="selectedBrowser" placeholder="选择浏览器" size="small" style="width: 120px; margin-right: 10px">
                   <el-option label="Chrome" value="chrome" />
                   <el-option label="Firefox" value="firefox" />
@@ -230,6 +231,14 @@
                             <el-option label="关闭应用" value="close_app" />
                             <el-option label="返回" value="back" />
                             <el-option label="主页" value="home" />
+                            <el-option-group label="Midscene AI">
+                              <el-option label="AI操作" value="aiAct" />
+                              <el-option label="AI点击" value="aiTap" />
+                              <el-option label="AI输入" value="aiInput" />
+                              <el-option label="AI查询" value="aiQuery" />
+                              <el-option label="AI断言" value="aiAssert" />
+                              <el-option label="导航" value="navigate" />
+                            </el-option-group>
                           </el-select>
                           <el-select
                             v-if="needsElement(element.action_type)"
@@ -1243,15 +1252,19 @@ const onStepsReorder = () => {
 
 const onActionTypeChange = (step) => {
   // 根据操作类型重置相关参数
-  if (!['fill', 'input', 'swipe'].includes(step.action_type)) {
+  if (!['fill', 'input', 'swipe', 'aiInput', 'navigate'].includes(step.action_type)) {
     step.input_value = ''
   }
   if (step.action_type !== 'wait') {
     step.wait_time = 1000
   }
-  if (step.action_type !== 'assert') {
+  if (!['assert', 'aiAssert'].includes(step.action_type)) {
     step.assert_type = 'textContains'
     step.assert_value = ''
+  }
+  // Midscene 动作不需要元素选择，清空 element_id
+  if (['aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'navigate'].includes(step.action_type)) {
+    step.element_id = null
   }
 }
 
@@ -1264,7 +1277,7 @@ const onElementChange = (step) => {
 }
 
 const needsInputValue = (actionType) => {
-  return ['fill', 'input', 'swipe', 'long_press'].includes(actionType)
+  return ['fill', 'input', 'swipe', 'long_press', 'aiInput', 'navigate'].includes(actionType)
 }
 
 const needsWaitTime = (actionType) => {
@@ -1272,7 +1285,7 @@ const needsWaitTime = (actionType) => {
 }
 
 const needsElement = (actionType) => {
-  return !['wait', 'switchTab', 'screenshot', 'swipe', 'launch_app', 'close_app', 'back', 'home'].includes(actionType)
+  return !['wait', 'switchTab', 'screenshot', 'swipe', 'launch_app', 'close_app', 'back', 'home', 'aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'navigate'].includes(actionType)
 }
 
 const expandAllSteps = () => {
@@ -1687,7 +1700,13 @@ const getActionTypeText = (actionType) => {
     'launch_app': '启动应用',
     'close_app': '关闭应用',
     'back': '返回',
-    'home': '主页'
+    'home': '主页',
+    'aiAct': 'AI操作',
+    'aiTap': 'AI点击',
+    'aiInput': 'AI输入',
+    'aiQuery': 'AI查询',
+    'aiAssert': 'AI断言',
+    'navigate': '导航'
   }
   return textMap[actionType] || actionType
 }
@@ -1720,7 +1739,13 @@ const getActionText = (actionType) => {
     'launch_app': '启动应用',
     'close_app': '关闭应用',
     'back': '返回',
-    'home': '主页'
+    'home': '主页',
+    'aiAct': 'AI操作',
+    'aiTap': 'AI点击',
+    'aiInput': 'AI输入',
+    'aiQuery': 'AI查询',
+    'aiAssert': 'AI断言',
+    'navigate': '导航'
   }
   return actionMap[actionType] || actionType
 }

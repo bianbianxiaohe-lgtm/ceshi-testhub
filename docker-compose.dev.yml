@@ -83,7 +83,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:${DEV_BACKEND_PORT:-18000}:8000"
+      # 绑定 0.0.0.0：插着手机的电脑（局域网内其它机器）要能直接
+      # POST /api/ui-automation/device-agent/register/ 上报设备，
+      # 绑 127.0.0.1 时只能从本机访问。
+      - "${DEV_BACKEND_PORT:-18000}:8000"
     mem_limit: 4g
     cpus: 2.0
 

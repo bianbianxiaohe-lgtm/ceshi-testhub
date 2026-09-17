@@ -22,6 +22,7 @@ record_action / generate_recording_case）可以无缝切换到 Airtest 驱动�
 import base64
 import os
 import time
+import xml.etree.ElementTree as ET
 
 import cv2
 import numpy as np
@@ -94,7 +95,7 @@ class AirtestRecordingEngine:
         except Exception:
             pass
 
-        # 初始化 Poco（best-effort，失败则退化为坐标操作）
+        # 初始化 Poco（best-effort，失败则退化为 uiautomator dump 坐标操作）
         try:
             if self.platform == 'ios':
                 from poco.drivers.ios import iosPoco
@@ -104,8 +105,9 @@ class AirtestRecordingEngine:
                 self.poco = AndroidUiautomationPoco(
                     self.device, use_airtest_input=True, screenshot_each_action=False
                 )
-        except Exception:
+        except Exception as exc:
             self.poco = None
+            print(f"[Airtest] Poco 初始化失败（将 fallback 到 uiautomator dump）: {exc}", flush=True)
 
         if self.app_package:
             try:
@@ -160,82 +162,155 @@ class AirtestRecordingEngine:
         raise RuntimeError('截图失败:snapshot()与adb screencap均不可用')
 
     def dump_page_elements(self):
-        """用 Poco dump 生成与 smart_locator.dump_page_elements 同 schema 的控件列表
+        """生成与 smart_locator.dump_page_elements 同 schema 的控件列表。
 
+        优先用 Poco dump（快、信息全）；Poco 不可用时 fallback 到 adb uiautomator dump。
         返回字段：chinese_name, strategy('id'|'xpath'), value, text, class_name,
                  clickable, bounds("[x1,y1][x2,y2]"), center_x, center_y
-        Poco 的 pos/size 为屏幕归一化坐标，乘以 display_size 得到像素坐标。
         """
-        if self.poco is None:
-            return []
-        tree = self.poco.dump()
-        root = tree.get('root', tree) if isinstance(tree, dict) else tree
-        w, h = self.display_size
+        if self.poco is not None:
+            try:
+                tree = self.poco.dump()
+                root = tree.get('root', tree) if isinstance(tree, dict) else tree
+                w, h = self.display_size
+                out = []
+                seen = set()
+
+                def walk(node):
+                    if not isinstance(node, dict):
+                        return
+                    payload = node.get('payload', {}) or {}
+                    rid = (payload.get('resourceId') or payload.get('name') or '').strip()
+                    text = (payload.get('text') or '').strip()
+                    typ = payload.get('type') or payload.get('name') or ''
+                    visible = payload.get('visible', True)
+                    touchable = payload.get('touchable', False)
+                    pos = payload.get('pos')
+                    size = payload.get('size')
+
+                    cx = cy = x1 = y1 = x2 = y2 = None
+                    bstr = ''
+                    if pos and size and w and h:
+                        sw, sh = size[0], size[1]
+                        x1 = int((pos[0] - sw / 2) * w)
+                        y1 = int((pos[1] - sh / 2) * h)
+                        x2 = int((pos[0] + sw / 2) * w)
+                        y2 = int((pos[1] + sh / 2) * h)
+                        cx = int((x1 + x2) / 2)
+                        cy = int((y1 + y2) / 2)
+                        bstr = f"[{x1},{y1}][{x2},{y2}]"
+
+                    if rid:
+                        strategy = 'id'
+                        value = rid
+                        label = text or rid.split(':id/')[-1]
+                    elif text and visible:
+                        strategy = 'xpath'
+                        value = f"//*[@text='{text}']"
+                        label = text
+                    else:
+                        strategy = None
+
+                    if strategy and visible:
+                        key = (strategy, value, bstr)
+                        if key not in seen:
+                            seen.add(key)
+                            out.append({
+                                'chinese_name': label,
+                                'strategy': strategy,
+                                'value': value,
+                                'text': text,
+                                'class_name': typ,
+                                'clickable': bool(touchable),
+                                'bounds': bstr,
+                                'center_x': cx,
+                                'center_y': cy,
+                            })
+
+                    for child in node.get('children', []) or []:
+                        walk(child)
+
+                walk(root)
+                if out:
+                    return out
+            except Exception as exc:
+                print(f"[Airtest] Poco dump 失败，fallback 到 uiautomator: {exc}", flush=True)
+        return self._dump_via_uiautomator()
+
+    def _dump_via_uiautomator(self):
+        """通过 adb shell uiautomator dump 解析当前页面控件（Poco 不可用时的 fallback）。
+
+        适用于远程 ADB / 容器环境 Poco 服务无法正常初始化的场景。
+        """
         out = []
-        seen = set()
+        try:
+            self.device.shell('uiautomator dump /sdcard/window_dump.xml')
+            raw = self.device.shell('cat /sdcard/window_dump.xml')
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='ignore')
+            if not raw or not raw.strip().startswith('<'):
+                return out
+            root = ET.fromstring(raw)
+            seen = set()
 
-        def walk(node):
-            if not isinstance(node, dict):
-                return
-            payload = node.get('payload', {}) or {}
-            # iOS Poco 无 resourceId，用 name(accessibility identifier) 作为定位值；
-            # Android 既有 resourceId 也有 name，优先 resourceId。
-            rid = (payload.get('resourceId') or payload.get('name') or '').strip()
-            text = (payload.get('text') or '').strip()
-            typ = payload.get('type') or payload.get('name') or ''
-            visible = payload.get('visible', True)
-            touchable = payload.get('touchable', False)
-            pos = payload.get('pos')
-            size = payload.get('size')
+            def _bounds_to_center(b):
+                # bounds="[x1,y1][x2,y2]"
+                import re as _re
+                m = _re.findall(r'\[(\d+),(\d+)\]', b or '')
+                if len(m) >= 2:
+                    x1, y1 = int(m[0][0]), int(m[0][1])
+                    x2, y2 = int(m[1][0]), int(m[1][1])
+                    return x1, y1, x2, y2, (x1 + x2) // 2, (y1 + y2) // 2
+                return None, None, None, None, None, None
 
-            cx = cy = x1 = y1 = x2 = y2 = None
-            bstr = ''
-            if pos and size and w and h:
-                sw, sh = size[0], size[1]
-                # center_x/center_y 必须是控件中心点（input tap 用中心才点得中）。
-                # 旧实现把左上角当 center，导致 input tap 点到控件左上角边缘无效。
-                x1 = int((pos[0] - sw / 2) * w)
-                y1 = int((pos[1] - sh / 2) * h)
-                x2 = int((pos[0] + sw / 2) * w)
-                y2 = int((pos[1] + sh / 2) * h)
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-                bstr = f"[{x1},{y1}][{x2},{y2}]"
+            def walk(node):
+                if node.tag not in ('node', 'hierarchy'):
+                    return
+                if node.tag == 'node':
+                    rid = (node.get('resource-id') or '').strip()
+                    text = (node.get('text') or '').strip()
+                    content = (node.get('content-desc') or '').strip()
+                    typ = node.get('class') or ''
+                    clickable = node.get('clickable') == 'true'
+                    enabled = node.get('enabled') == 'true'
+                    visible = not (node.get('enabled') == 'false' and node.get('scrollable') == 'false')
+                    x1, y1, x2, y2, cx, cy = _bounds_to_center(node.get('bounds'))
+                    if cx is None:
+                        return
+                    # content-desc 作为文本兜底（如 ImageButton 没有 text）
+                    display_text = text or content
+                    if rid:
+                        strategy = 'id'
+                        value = rid
+                        label = display_text or rid.split(':id/')[-1]
+                    elif display_text and visible:
+                        strategy = 'xpath'
+                        value = f"//*[@text='{display_text}']"
+                        label = display_text
+                    else:
+                        strategy = None
+                    if strategy and visible:
+                        bstr = f"[{x1},{y1}][{x2},{y2}]"
+                        key = (strategy, value, bstr)
+                        if key not in seen:
+                            seen.add(key)
+                            out.append({
+                                'chinese_name': label,
+                                'strategy': strategy,
+                                'value': value,
+                                'text': display_text,
+                                'class_name': typ,
+                                'clickable': clickable and enabled,
+                                'bounds': bstr,
+                                'center_x': cx,
+                                'center_y': cy,
+                            })
+                for child in node:
+                    walk(child)
 
-            if rid:
-                strategy = 'id'
-                value = rid
-                label = text or rid.split(':id/')[-1]
-            elif text and visible:
-                strategy = 'xpath'
-                value = f"//*[@text='{text}']"
-                label = text
-            else:
-                strategy = None
-
-            if strategy and visible:
-                # 按 (策略, 值, 位置) 去重：RecyclerView 内多个子项常共用同一
-                # resourceId/文本，仅按前两者去重会把子项全部折叠成容器本身，
-                # 导致点选坐标反查命中容器而非具体子项。加入 bounds 区分位置。
-                key = (strategy, value, bstr)
-                if key not in seen:
-                    seen.add(key)
-                    out.append({
-                        'chinese_name': label,
-                        'strategy': strategy,
-                        'value': value,
-                        'text': text,
-                        'class_name': typ,
-                        'clickable': bool(touchable),
-                        'bounds': bstr,
-                        'center_x': cx,
-                        'center_y': cy,
-                    })
-
-            for child in node.get('children', []) or []:
-                walk(child)
-
-        walk(root)
+            walk(root)
+        except Exception as exc:
+            print(f"[Airtest] uiautomator dump fallback 也失败: {exc}", flush=True)
         return out
 
     # ==================== 步骤执行 ====================
@@ -281,11 +356,11 @@ class AirtestRecordingEngine:
                 if self.app_package:
                     self.device.stop_app(self.app_package)
             elif action_type in ('assert', 'getText'):
-                rid = element.get('value') if element.get('locator_strategy') == 'id' else None
-                if rid and self.poco is not None:
-                    exists = bool(self.poco(rid).exists())
-                    if action_type == 'assert' and not exists:
-                        raise AssertionError(f"断言元素不存在: {rid}")
+                # 统一用 dump+坐标判定元素是否存在，避免依赖 Poco 选择器语义
+                try:
+                    self._resolve_element_coords(element)
+                except Exception:
+                    raise AssertionError(f"断言元素不存在: {element.get('value') or element.get('name')}")
             else:
                 raise ValueError(f"不支持的操作类型: {action_type}")
 
@@ -359,6 +434,15 @@ class AirtestRecordingEngine:
                     if cand == el_value or cand == el_name or cand == el_text:
                         matched = True
                         break
+                    # resourceId 常写成短 id（clConfirmContainer）而 dump 出来是完整 id
+                    # （com.youloft.calorie:id/clConfirmContainer），允许互相包含/后缀匹配。
+                    cand_short = cand.split(':id/')[-1] if ':id/' in cand else cand.split('/')[-1]
+                    el_short = el_value.split(':id/')[-1] if ':id/' in el_value else el_value.split('/')[-1]
+                    if cand_short and el_short and (cand_short == el_short or
+                                                     cand_short in el_value or
+                                                     el_short in cand):
+                        matched = True
+                        break
                 if matched and el.get('center_x') is not None and el.get('center_y') is not None:
                     return int(el['center_x']), int(el['center_y'])
             time.sleep(interval)
@@ -406,19 +490,12 @@ class AirtestRecordingEngine:
             if self._image_click(element):
                 return
             return
-        rid = self._resource_id(element)
         cx, cy = element.get('center_x'), element.get('center_y')
-        # 镜像点选录制场景：坐标精确命中用户点击的真实控件。RecyclerView 内
-        # 多个子项常共用同一 resourceId，poco(rid).click() 会点到第一个而非用户
-        # 实际点的那个，因此优先用坐标（input tap）。
-        if cx is not None and cy is not None:
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
-        elif rid and self.poco is not None:
-            self.poco(rid).click()
-        else:
-            # 导入的 Poco 脚本（仅逻辑定位，无坐标）：dump 页面匹配控件并等待出现
+        # 统一走坐标点击：有坐标直接用；无坐标则 dump 页面等待元素出现后计算中心点。
+        # 避免 Poco(rid).click() 的语义问题（直接传字符串匹配的是 name 而非 resourceId）。
+        if cx is None or cy is None:
             cx, cy = self._resolve_element_coords(element)
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
+        self.device.shell(f'input tap {int(cx)} {int(cy)}')
 
     def _image_click(self, element):
         """Airtest 图像识别：截屏 + 模板匹配，点击命中位置。返回是否执行了点击。"""
@@ -447,57 +524,40 @@ class AirtestRecordingEngine:
         if self._is_image_element(element):
             self._image_click(element)
             return
-        rid = self._resource_id(element)
         cx, cy = element.get('center_x'), element.get('center_y')
-        if cx is not None and cy is not None:
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
-            time.sleep(0.08)
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
-        elif rid and self.poco is not None:
-            self.poco(rid).double_click()
-        else:
+        if cx is None or cy is None:
             cx, cy = self._resolve_element_coords(element)
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
-            time.sleep(0.08)
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
+        self.device.shell(f'input tap {int(cx)} {int(cy)}')
+        time.sleep(0.08)
+        self.device.shell(f'input tap {int(cx)} {int(cy)}')
 
     def _do_long_press(self, element):
         if self._is_image_element(element):
             self._image_click(element)
             return
-        rid = self._resource_id(element)
         cx, cy = element.get('center_x'), element.get('center_y')
-        if cx is not None and cy is not None:
-            self.device.shell(f'input swipe {int(cx)} {int(cy)} {int(cx)} {int(cy)} 800')
-        elif rid and self.poco is not None:
-            self.poco(rid).long_click()
-        else:
+        if cx is None or cy is None:
             cx, cy = self._resolve_element_coords(element)
-            self.device.shell(f'input swipe {int(cx)} {int(cy)} {int(cx)} {int(cy)} 800')
+        self.device.shell(f'input swipe {int(cx)} {int(cy)} {int(cx)} {int(cy)} 800')
 
     def _do_input(self, element, text):
-        rid = self._resource_id(element)
         cx, cy = element.get('center_x'), element.get('center_y')
-        if rid and self.poco is not None:
-            self.poco(rid).set_text(text)
-        else:
-            if cx is None or cy is None:
-                cx, cy = self._resolve_element_coords(element)
-            self.device.shell(f'input tap {int(cx)} {int(cy)}')
-            time.sleep(0.3)
-            self.device.text(text, enter=False)
-
-    def _do_clear(self, element):
-        rid = self._resource_id(element)
-        cx, cy = element.get('center_x'), element.get('center_y')
-        if rid and self.poco is not None:
-            self.poco(rid).set_text('')
-            return
         if cx is None or cy is None:
             cx, cy = self._resolve_element_coords(element)
         self.device.shell(f'input tap {int(cx)} {int(cy)}')
-        for _ in range(50):
-            self.device.shell('input keyevent 67')
+        time.sleep(0.3)
+        self.device.text(text, enter=False)
+
+    def _do_clear(self, element):
+        cx, cy = element.get('center_x'), element.get('center_y')
+        if cx is None or cy is None:
+            cx, cy = self._resolve_element_coords(element)
+        self.device.shell(f'input tap {int(cx)} {int(cy)}')
+        time.sleep(0.2)
+        # 全选后删除，比连续按 DEL 更稳
+        self.device.shell('input keyevent 29 112')  # KEYCODE_A, KEYCODE_FORWARD_DEL
+        for _ in range(30):
+            self.device.shell('input keyevent 112')
 
     def _swipe_points(self, element, direction, ratio):
         # 优先把 direction(即 record_action 传入的 input_value) 解析为坐标 "x1,y1,x2,y2"。

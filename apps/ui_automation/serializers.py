@@ -844,6 +844,27 @@ class AICaseSerializer(serializers.ModelSerializer):
     project = UiProjectSerializer(read_only=True)
     created_by = UserSerializer(read_only=True)
     project_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    # 设备在编辑用例时选定，执行时不再询问。用例列表需要直接展示"这条用例会
+    # 跑在哪台设备上"，所以额外带一份只读的设备详情。
+    # 用 SerializerMethodField 而不是直接嵌套 AppDeviceSerializer：后者定义在
+    # 本文件更靠后的位置，直接引用会是 NameError。
+    device_detail = serializers.SerializerMethodField()
+
+    def get_device_detail(self, obj):
+        if not obj.device_id:
+            return None
+        d = obj.device
+        return {
+            'id': d.id,
+            'name': d.name,
+            'platform': d.platform,
+            'platform_version': d.platform_version,
+            'udid': d.udid,
+            'status': d.status,
+            'status_display': d.get_status_display(),
+            'wda_host': d.wda_host,
+            'wda_port': d.wda_port,
+        }
 
     class Meta:
         model = AICase
@@ -991,6 +1012,7 @@ class AppDeviceSerializer(serializers.ModelSerializer):
             'id', 'name', 'platform', 'platform_display', 'platform_version',
             'device_type', 'device_type_display', 'udid', 'appium_server_url',
             'adb_host',
+            'wda_host', 'wda_port',
             'status', 'status_display', 'resolution', 'capabilities',
             'last_heartbeat', 'notes', 'created_at', 'updated_at'
         ]
@@ -1048,14 +1070,53 @@ class AppPipelineRunSerializer(serializers.ModelSerializer):
 class BusinessActionSerializer(serializers.ModelSerializer):
     """业务动作序列化器（Prompt 与代码分离）"""
     action_display = serializers.CharField(source='get_action_display', read_only=True)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
     created_by_name = serializers.CharField(source='created_by.username', read_only=True, allow_null=True)
+    # 被多少条用例引用（写进 step 的 {ref: 名字}），前端用于展示影响面
+    used_by_count = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessAction
         fields = [
-            'id', 'name', 'description', 'action', 'action_display', 'prompt',
+            'id', 'name', 'category', 'category_display', 'description',
+            'action', 'action_display', 'prompt',
             'selector_hint', 'value', 'wait_ms', 'extract', 'assert_config',
+            'used_by_count',
             'created_by', 'created_by_name', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
+
+    def get_used_by_count(self, obj):
+        cache = self.context.get('_ref_counts') if hasattr(self, 'context') else None
+        if cache is None:
+            cache = _count_business_refs()
+            try:
+                self.context['_ref_counts'] = cache
+            except Exception:  # noqa: BLE001
+                pass
+        return cache.get(obj.name, 0)
+
+
+def _count_business_refs():
+    """统计每个业务动作被多少条 AI 用例的 steps 引用（{ref: 名字}）。
+
+    列表接口一次扫描算出全部计数，避免序列化器里逐条查库。
+    """
+    from apps.ui_automation.models import AICase
+
+    counts = {}
+    try:
+        qs = AICase.objects.exclude(steps=None).only('steps')
+    except Exception:  # noqa: BLE001
+        return counts
+    for steps in qs.values_list('steps', flat=True):
+        if not isinstance(steps, list):
+            continue
+        seen_here = set()
+        for s in steps:
+            if isinstance(s, dict) and s.get('ref'):
+                seen_here.add(str(s.get('ref')))
+        for name in seen_here:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
 

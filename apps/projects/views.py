@@ -308,7 +308,7 @@ def _resolve_knowledge_path(project: Project) -> str:
 def knowledge_fs_tree(request, project_id):
     """
     扫描项目知识库目录，返回文件树结构。
-    仅扫描 .md 文件，按文件名自然排序。
+    扫描 .md 文件与目录结构（含空目录），按文件名自然排序。
     返回格式：
     [
       {
@@ -373,13 +373,13 @@ def knowledge_fs_tree(request, project_id):
                     })
             elif entry.is_dir():
                 children = scan_dir(entry.path, f"{rel}/")
-                if children:
-                    items.append({
-                        'type': 'directory',
-                        'path': rel,
-                        'name': entry.name,
-                        'children': children,
-                    })
+                # 空目录也展示：用户在前端按需创建 .md 文件，不再过滤无内容的目录
+                items.append({
+                    'type': 'directory',
+                    'path': rel,
+                    'name': entry.name,
+                    'children': children,
+                })
         return items
 
     files = scan_dir(kb_path)

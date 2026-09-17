@@ -1051,6 +1051,8 @@ class AppDevice(models.Model):
     udid = models.CharField(max_length=200, unique=True, verbose_name='设备唯一标识')
     appium_server_url = models.CharField(max_length=500, default='http://localhost:4723', verbose_name='Appium Server地址')
     adb_host = models.CharField(max_length=50, null=True, blank=True, default='', verbose_name='ADB主机', help_text='手机USB所在电脑的 IP:PORT（如 192.168.8.71:5037），后端通过该电脑的ADB服务控制此设备')
+    wda_host = models.CharField(max_length=50, blank=True, default='', verbose_name='WDA主机', help_text='iOS 设备专用：手机USB所在电脑的 IP（如 192.168.8.71），该电脑需已跑通 WDA 并转发 8100 端口')
+    wda_port = models.PositiveIntegerField(default=8100, verbose_name='WDA端口', help_text='iOS 设备专用：WDA 服务端口，默认 8100')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='offline', verbose_name='设备状态')
     resolution = models.CharField(max_length=50, blank=True, verbose_name='屏幕分辨率')
     capabilities = models.JSONField(default=dict, blank=True, verbose_name='额外配置', help_text='额外的Appium Capabilities')
@@ -1138,6 +1140,19 @@ class AICase(models.Model):
         AppDevice, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='ai_cases', verbose_name='执行设备'
     )
+    # 弹窗（权限请求/隐私协议/开屏广告……）是随机出现的，挡路就会让步骤失败。
+    # 默认自动关掉；专门验证弹窗本身的用例可以取消勾选。
+    auto_dismiss_popup = models.BooleanField(
+        default=True, verbose_name='自动处理弹窗',
+        help_text='执行时遇到权限请求/协议/广告等弹窗自动关闭并重试该步骤'
+    )
+    # 第一次用自然语言跑通后，每一步「点在哪里」都已经知道了，把这些坐标写回
+    # steps 并打上时间戳，之后回放就只按坐标操作、不再调用视觉模型。
+    # 为空 = 还没固化（走 AI 探索模式）。
+    steps_frozen_at = models.DateTimeField(
+        null=True, blank=True, verbose_name='步骤固化时间',
+        help_text='非空表示 steps 里已带坐标，执行时走纯坐标回放（不调用视觉模型）'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, verbose_name='创建者')
@@ -1176,6 +1191,23 @@ class AIExecutionRecord(models.Model):
     executed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, verbose_name='执行人')
     gif_path = models.CharField(max_length=500, null=True, blank=True, verbose_name='GIF录制路径')
     screenshots_sequence = models.JSONField(default=list, verbose_name='截图序列')
+    error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
+
+    # ---- 模型消耗统计 ----
+    # 回放模式的目标是"零模型"，所以必须能量化每次执行到底花掉多少，
+    # 否则无法判断固化到底有没有收益。数字优先取 LLM 代理返回的真实 usage，
+    # 代理不可用时退化为按截图尺寸估算（见 llm_usage.py）。
+    model_calls = models.IntegerField(default=0, verbose_name='模型调用次数')
+    prompt_tokens = models.IntegerField(default=0, verbose_name='输入 token')
+    completion_tokens = models.IntegerField(default=0, verbose_name='输出 token')
+    tokens_estimated = models.BooleanField(
+        default=False, verbose_name='token 为估算值',
+        help_text='True 表示没有拿到接口返回的真实 usage，数字是按截图尺寸估算的'
+    )
+    replay_mode = models.BooleanField(
+        default=False, verbose_name='纯坐标回放',
+        help_text='True 表示本次执行走的是固化回放，理论上不调用视觉模型'
+    )
 
     class Meta:
         db_table = 'ui_ai_execution_records'
@@ -1262,7 +1294,18 @@ class BusinessAction(models.Model):
         ('assert', 'assert（断言）'),
     ]
 
+    CATEGORY_CHOICES = [
+        ('precondition', '前置准备'),
+        ('business', '业务操作'),
+        ('extract', '数据提取'),
+        ('teardown', '收尾清理'),
+        ('other', '其他'),
+    ]
+
     name = models.CharField(max_length=100, unique=True, verbose_name='动作名', help_text='唯一标识，如 login / select-product')
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='business',
+                                verbose_name='分类',
+                                help_text='前置准备=登录/切账号等；业务操作=下单/搜索等；收尾清理=退出登录')
     description = models.CharField(max_length=200, blank=True, verbose_name='描述')
     action = models.CharField(max_length=20, choices=ACTION_CHOICES, default='aiAct', verbose_name='动作类型')
     prompt = models.TextField(verbose_name='语义指令', help_text='自然语言操作指令，禁止写坐标，跨机型可复用')

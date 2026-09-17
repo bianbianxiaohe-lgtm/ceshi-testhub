@@ -38,6 +38,31 @@
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="执行方式" width="110" align="center">
+          <template #default="{ row }">
+            <!-- 固化回放 = 按坐标操作，不调用视觉模型；AI 探索 = 每步都要模型 -->
+            <el-tag v-if="row.replay_mode" type="success" size="small" effect="plain">
+              脚本回放
+            </el-tag>
+            <el-tag v-else type="warning" size="small" effect="plain">
+              AI 探索
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="模型消耗" width="150" align="center">
+          <template #default="{ row }">
+            <div v-if="row.model_calls || row.prompt_tokens">
+              <div>{{ row.model_calls || 0 }} 次调用</div>
+              <div style="color:#909399;font-size:12px;">
+                {{ formatTokens(row) }} tokens
+                <el-tooltip v-if="row.tokens_estimated" content="未拿到接口返回的真实用量，此处为按截图尺寸估算" placement="top">
+                  <span style="color:#e6a23c;">≈</span>
+                </el-tooltip>
+              </div>
+            </div>
+            <span v-else style="color:#67c23a;">0 模型调用</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="duration" label="耗时(秒)" width="120">
           <template #default="{ row }">
             {{ row.duration ? row.duration.toFixed(2) : '-' }}
@@ -92,6 +117,19 @@
           <span class="label">耗时:</span>
           <span>{{ currentRecord.duration ? currentRecord.duration.toFixed(2) + ' 秒' : '未知' }}</span>
         </div>
+        <div class="detail-item">
+          <span class="label">执行方式:</span>
+          <el-tag v-if="currentRecord.replay_mode" type="success" size="small">脚本回放（纯坐标，零模型）</el-tag>
+          <el-tag v-else type="warning" size="small">AI 探索（每步调用视觉模型）</el-tag>
+        </div>
+        <div class="detail-item">
+          <span class="label">模型消耗:</span>
+          <span>
+            {{ currentRecord.model_calls || 0 }} 次调用 ·
+            {{ formatTokens(currentRecord) }} tokens
+            <span v-if="currentRecord.tokens_estimated" style="color:#e6a23c;">（估算）</span>
+          </span>
+        </div>
 
         <!-- 任务描述 -->
         <div v-if="currentRecord.task_description" class="detail-item mt-15">
@@ -144,6 +182,15 @@ const pagination = reactive({
 const showDetailDialog = ref(false)
 const currentRecord = ref(null)
 let pollTimer = null
+
+// token 数字可读化：1234 -> 1.2k，1234567 -> 1.2M
+const formatTokens = (row) => {
+  const n = (row?.prompt_tokens || 0) + (row?.completion_tokens || 0)
+  if (!n) return '0'
+  if (n < 1000) return String(n)
+  if (n < 1000000) return (n / 1000).toFixed(1) + 'k'
+  return (n / 1000000).toFixed(2) + 'M'
+}
 
 const selectedRecords = ref([])
 const isDeleting = ref(false)

@@ -1,7 +1,8 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse
@@ -12,9 +13,12 @@ from django.utils import timezone
 from apps.core.mixins import OwnerOrMemberMixin, filter_by_owner_or_member
 import logging
 import json
+import os
 import re
 import random
+import threading
 import time
+import subprocess
 
 from .smart_locator import smart_match_locator, parse_swipe_pattern, get_wheel_coords, dump_page_elements
 
@@ -51,6 +55,11 @@ from .operation_logger import log_operation
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+# 同一个 Midscene 用例一次最多并行跑几台设备。
+# 限制的理由：每台设备都会各起一个 iOS Node 服务、各拉一份视觉模型调用，
+# 同时跑太多会把服务器和第三方模型配额吃满。3 台是实测比较稳的档位。
+MAX_PARALLEL_DEVICES = 3
 
 
 def infer_appium_action_type(text):
@@ -3971,9 +3980,13 @@ class AICaseViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            from .midscene_engine import MidsceneAppEngine
-            engine = MidsceneAppEngine(app_config=app_config, device=device)
-            result = engine.playground_run(prompt=prompt, action=action, launch_app=launch_app)
+            if (device.platform or '').strip().lower() == 'ios':
+                # iOS 真机走远端 WDA（设备配置的 wda_host / wda_port）
+                result = self._ios_playground_run(device, app_config, prompt, action, launch_app)
+            else:
+                from .midscene_engine import MidsceneAppEngine
+                engine = MidsceneAppEngine(app_config=app_config, device=device)
+                result = engine.playground_run(prompt=prompt, action=action, launch_app=launch_app)
         except Exception as e:
             logger.warning('[Midscene Playground] 执行失败: %s', e)
             return Response(
@@ -3983,6 +3996,376 @@ class AICaseViewSet(viewsets.ModelViewSet):
 
         return Response(result)
 
+    @staticmethod
+    def _ios_playground_run(device, app_config, prompt, action, launch_app):
+        """iOS 真机 Playground：连远端 WDA 执行单条自然语言指令。
+
+        与 Android 分支的区别只是引擎不同，返回值结构保持一致，
+        前端（截图 / 日志 / query_result）无需区分平台。
+        """
+        from .midscene_ios_engine import MidsceneIOSEngine
+
+        wda_host = (getattr(device, 'wda_host', '') or '').strip()
+        wda_port = getattr(device, 'wda_port', None) or 8100
+        if not wda_host:
+            raise ValueError(
+                '设备「%s」未配置 WDA 地址：请在「设备管理」里填写 WDA主机'
+                '（手机USB所在电脑的 IP，如 192.168.8.71）' % device.name
+            )
+
+        bundle_id = (app_config.package_name if app_config else '') or ''
+        engine = MidsceneIOSEngine(wda_host=wda_host, wda_port=wda_port)
+        return engine.playground_run(
+            prompt=prompt, action=action,
+            bundle_id=bundle_id, launch_first=bool(launch_app),
+        )
+
+    @action(detail=False, methods=['post'], url_path='freeze-to-script')
+    def freeze_to_script(self, request):
+        """把「AI 探索成功」的执行结果固化成确定性脚本（Record & Replay）。
+
+        背景：Midscene 每次执行都要调视觉模型（每步一次），又慢又费钱。
+        但第一次跑通后，每一步的「目标元素在屏幕哪个位置」就已经知道了 ——
+        把坐标固化下来，后续回放直接按坐标点，**完全不需要模型**。
+
+        入参：
+          execution_id  执行记录 id（必填），取其 steps_completed 里的 location
+          test_case_id  可选，写入已有的 TestCase；不传则新建
+          case_name     新建时的用例名（可选）
+
+        产出：一条 TestCase（含若干 TestCaseStep，带 center_x/center_y）。
+        之后用 test-case 的回放链路执行，不再调用任何视觉模型。
+
+        注意：**只固化采到坐标的步骤**。没坐标的步骤（launch/back/wait 这类
+        本来就不需要定位，或定位采样失败的）如实报告，不静默丢失。
+        """
+        from .models import TestCase, TestCaseStep
+
+        data = request.data
+        execution_id = data.get('execution_id')
+        if not execution_id:
+            return Response({'success': False, 'message': '请提供 execution_id'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            record = AIExecutionRecord.objects.get(id=execution_id)
+        except AIExecutionRecord.DoesNotExist:
+            return Response({'success': False, 'message': '执行记录不存在 id=%s' % execution_id},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        steps_completed = record.steps_completed or []
+        if not steps_completed:
+            return Response(
+                {'success': False, 'message': '该执行记录没有步骤，无法固化'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        ai_case = record.ai_case
+        if ai_case is None:
+            return Response({'success': False, 'message': '该执行记录未关联 AI 用例'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not ai_case.device:
+            return Response(
+                {'success': False,
+                 'message': '该 AI 用例未关联执行设备，回放时无法确定目标机型'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        # 记录执行时的屏幕尺寸（用于换机型时按比例换算坐标）
+        device = ai_case.device
+        src_resolution = (device.resolution or '').strip()
+
+        # ---- 逐条转换：AI 步骤 → TestCaseStep（带坐标）----
+        ACTION_MAP = {
+            'aiTap': 'tap', 'aiAct': 'tap', 'aiInput': 'input',
+            'aiQuery': 'getText', 'aiAssert': 'assert',
+            'launch': 'launch_app', 'back': 'back', 'home': 'home',
+            'wait': 'wait', 'screenshot': 'screenshot',
+        }
+        converted, skipped = [], []
+        for i, s in enumerate(steps_completed):
+            if not isinstance(s, dict):
+                continue
+            ai_action = (s.get('action') or '').strip()
+            loc = s.get('location') or {}
+            center = loc.get('center') or []
+            cx = cy = None
+            if isinstance(center, (list, tuple)) and len(center) >= 2:
+                try:
+                    cx, cy = int(center[0]), int(center[1])
+                except (TypeError, ValueError):
+                    cx = cy = None
+            elif isinstance(center, dict):
+                try:
+                    cx, cy = int(center.get('x')), int(center.get('y'))
+                except (TypeError, ValueError):
+                    cx = cy = None
+
+            target_action = ACTION_MAP.get(ai_action, 'tap')
+            # 需要定位才能回放的动作，必须有坐标
+            needs_location = ai_action in ('aiTap', 'aiAct', 'aiInput')
+            if needs_location and (cx is None or cy is None):
+                skipped.append({
+                    'step': i + 1, 'action': ai_action,
+                    'name': s.get('name') or '',
+                    'reason': '未采集到坐标（首次执行时定位采样失败或被跳过）',
+                })
+                continue
+
+            converted.append({
+                'step_number': len(converted) + 1,
+                'action_type': target_action,
+                'center_x': cx,
+                'center_y': cy,
+                'input_value': (s.get('prompt') if ai_action == 'aiInput' else '') or '',
+                'wait_time': int(s.get('wait_ms') or 1000),
+                'description': s.get('name') or ('步骤%d' % (i + 1)),
+                'assert_value': ((s.get('assert') or {}).get('reason') or '') or '',
+            })
+
+        if not converted:
+            return Response({
+                'success': False,
+                'message': '没有任何步骤采集到坐标，无法固化。请先成功执行一次'
+                           '（执行时会自动采集每步的目标坐标）',
+                'skipped': skipped,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # ---- 落库 ----
+        test_case_id = data.get('test_case_id')
+        created_case = False
+        if test_case_id:
+            try:
+                test_case = TestCase.objects.get(id=test_case_id)
+            except TestCase.DoesNotExist:
+                return Response({'success': False, 'message': '目标测试用例不存在'},
+                                status=status.HTTP_404_NOT_FOUND)
+        else:
+            base_name = (data.get('case_name') or '').strip() \
+                or ('%s（固化脚本）' % ai_case.name)
+            # TestCase.project / created_by 都是 NOT NULL，必须兜住：
+            # 先取 AI 用例的项目，再退到其应用配置的项目，最后取全局第一个 UI 项目。
+            project = ai_case.project
+            if project is None and ai_case.app_config is not None:
+                project = getattr(ai_case.app_config, 'project', None)
+            if project is None:
+                project = UiProject.objects.order_by('id').first()
+            if project is None:
+                return Response(
+                    {'success': False,
+                     'message': '系统里还没有任何 UI 项目，无法创建测试用例，请先建一个项目'},
+                    status=status.HTTP_400_BAD_REQUEST)
+
+            creator = request.user if request.user.is_authenticated else None
+            if creator is None:
+                creator = ai_case.created_by or get_user_model().objects.filter(
+                    is_active=True).order_by('id').first()
+            if creator is None:
+                return Response({'success': False, 'message': '找不到可用的创建人账号'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            test_case = TestCase.objects.create(
+                name=base_name,
+                description='由 AI 探索执行固化而来（execution#%s），'
+                            '按坐标回放，不再调用视觉模型' % record.id,
+                project=project,
+                status='ready',
+                priority='medium',
+                created_by=creator,
+                tags=['frozen', 'ai-explored'],
+            )
+            created_case = True
+
+        start_no = (TestCaseStep.objects.filter(test_case=test_case)
+                    .order_by('-step_number').values_list('step_number', flat=True).first() or 0)
+        objs = [
+            TestCaseStep(test_case=test_case, **{**c, 'step_number': start_no + c['step_number']})
+            for c in converted
+        ]
+        TestCaseStep.objects.bulk_create(objs)
+        # 记录来源，便于审计与换机型换算
+        try:
+            tags = list(test_case.tags or [])
+            for t in ('frozen', 'ai-explored'):
+                if t not in tags:
+                    tags.append(t)
+            test_case.tags = tags
+            test_case.save(update_fields=['tags', 'updated_at'])
+        except Exception:  # noqa: BLE001
+            pass
+
+        logger.info('[固化脚本] execution#%s -> TestCase#%s，写入 %d 步，跳过 %d 步',
+                    record.id, test_case.id, len(converted), len(skipped))
+        return Response({
+            'success': True,
+            'message': '已固化 %d 个步骤到用例「%s」%s'
+                       % (len(converted), test_case.name,
+                          ('，%d 步因无坐标被跳过' % len(skipped)) if skipped else ''),
+            'created_case': created_case,
+            'test_case_id': test_case.id,
+            'test_case_name': test_case.name,
+            'frozen_steps': len(converted),
+            'skipped': skipped,
+            'source_resolution': src_resolution,
+            'steps': converted,
+        })
+
+    @action(detail=False, methods=['post'], url_path='generate-steps')
+    def generate_steps(self, request):
+        """自然语言 → 结构化步骤（直接生成用例步骤，不必先建公共步骤）。
+
+        入参：
+          text        自然语言操作描述（必填，可多行）
+          app_config  可选，被测应用配置 id（有则带上应用名做上下文）
+          用例名/描述等其余信息由调用方自己保存，这里只负责产出 steps。
+
+        返回 steps 数组，元素与编辑器同结构：
+          {action, name, prompt, value, wait_ms, extract: [], assert: {prompt, expect}}
+
+        设计取舍：
+        - **只生成、不落库**：调用方拿到 steps 后在编辑器里预览/修改，确认再保存。
+          避免模型幻觉直接污染用例数据。
+        - **拆步而不是一整句**：每个原子操作独立一步，执行日志才能定位到具体哪步失败
+          （把 7 个动作塞进一句 prompt 交给视觉模型自己拆，漏做/做错无法察觉）。
+        - 模型不可用/返回不合法时**明确报错**，不静默返回空 steps。
+        """
+        data = request.data
+        text = (data.get('text') or data.get('task_description') or '').strip()
+        if not text:
+            return Response({'success': False, 'message': '请填写自然语言操作描述'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        app_name = ''
+        app_config_id = data.get('app_config')
+        if app_config_id:
+            cfg = AppConfig.objects.filter(id=app_config_id).first()
+            if cfg:
+                app_name = cfg.name or ''
+
+        try:
+            steps = self._generate_steps_by_llm(text, app_name)
+        except _StepsGenerationUnavailable as exc:
+            return Response({'success': False, 'message': str(exc)},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[生成步骤] 失败: %s', exc)
+            return Response({'success': False, 'message': '生成失败：%s' % exc},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({
+            'success': True,
+            'message': '已生成 %d 个步骤，请预览确认后保存' % len(steps),
+            'steps': steps,
+            'raw_text': text,
+        })
+
+    def _generate_steps_by_llm(self, text, app_name=''):
+        """调 LLM 把自然语言拆成结构化步骤，返回规范化后的 steps。"""
+        import json as _json
+        import re as _re
+
+        from apps.requirement_analysis.models import AIModelConfig
+
+        # 优先级：midscene_vision（懂真机操作）→ writer → analyzer
+        config = None
+        for role in ('midscene_vision', 'writer', 'analyzer'):
+            config = AIModelConfig.objects.filter(role=role, is_active=True).first()
+            if config:
+                break
+        if config is None:
+            raise _StepsGenerationUnavailable(
+                '未配置可用于生成步骤的模型：请在「模型配置」里启用 midscene_vision '
+                '或 writer / analyzer 角色'
+            )
+
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=config.model_name,
+            api_key=config.api_key,
+            base_url=config.base_url,
+            temperature=0.0,
+        )
+
+        app_hint = ('被测应用：%s\n' % app_name) if app_name else ''
+        system = (
+            '你是移动端 UI 自动化步骤拆解专家。把用户的自然语言操作描述，'
+            '拆解成一条条**原子**操作步骤，供视觉驱动引擎逐步执行。\n\n'
+            '硬性要求：\n'
+            '1. 只输出 JSON 数组，不要任何解释、不要 markdown 代码块围栏。\n'
+            '2. 数组每个元素结构：\n'
+            '   {"action":"动作","name":"步骤简称","prompt":"给视觉模型的自然语言指令",'
+            '"value":"","wait_ms":0}\n'
+            '3. action 只能取：launch / aiTap / aiInput / aiAct / back / home / wait / screenshot\n'
+            '   - launch：启动应用，prompt 写应用名\n'
+            '   - aiTap：明确点击某个控件，prompt 写"点击XX"\n'
+            '   - aiInput：输入文本，prompt 写"在XX输入框输入"，value 写要输入的内容\n'
+            '   - aiAct：无法归入以上的复合操作\n'
+            '   - back / home：返回、回主屏（prompt 留空）\n'
+            '4. **一个步骤只做一件事**。遇到"点击A，然后点击B，再进入C"，必须拆成 3 个步骤，'
+            '禁止把多个动作塞进同一句 prompt（否则失败时无法定位）。\n'
+            '5. prompt 要用**界面上的可见文字**描述目标，例如"点击底部「天气」标签"、'
+            '"点击左上角的「+」按钮"，不要写坐标（如 (100,200)）。\n'
+            '6. name 用 4-10 个字概括该步，方便在报告里辨认。\n'
+            '7. 用户描述里没提到的中间跳转，不要凭空编造步骤。\n'
+        )
+        user = (
+            '%s请拆解下面这段操作描述：\n"""\n%s\n"""\n\n'
+            '直接输出 JSON 数组。' % (app_hint, text)
+        )
+
+        resp = llm.invoke([
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': user},
+        ])
+        content = getattr(resp, 'content', '') or ''
+        if isinstance(content, list):
+            content = ''.join(
+                c.get('text', '') if isinstance(c, dict) else str(c) for c in content
+            )
+
+        # 去掉可能存在的 ```json 围栏
+        content = _re.sub(r'^\s*```(?:json)?|```\s*$', '', content.strip(), flags=_re.M).strip()
+        match = _re.search(r'\[.*\]', content, _re.DOTALL)
+        if not match:
+            raise ValueError('模型没有返回可解析的步骤数组，原始输出：%s' % content[:200])
+
+        try:
+            parsed = _json.loads(match.group(0))
+        except _json.JSONDecodeError as exc:
+            raise ValueError('步骤 JSON 解析失败：%s' % exc) from exc
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError('模型返回的步骤为空')
+
+        allowed = {'launch', 'aiTap', 'aiInput', 'aiAct', 'aiQuery',
+                   'back', 'home', 'wait', 'screenshot', 'assert'}
+        steps = []
+        for i, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get('action') or '').strip()
+            if action not in allowed:
+                action = 'aiAct'
+            prompt = str(item.get('prompt') or '').strip()
+            value = str(item.get('value') or '').strip()
+            # 需要 prompt 的动作没给 prompt 就丢掉，避免产出"空步骤"
+            if action in ('launch', 'aiTap', 'aiInput', 'aiAct', 'aiQuery') and not prompt:
+                continue
+            try:
+                wait_ms = int(item.get('wait_ms') or 0)
+            except (TypeError, ValueError):
+                wait_ms = 0
+            steps.append({
+                'action': action,
+                'name': str(item.get('name') or '').strip() or ('步骤 %d' % (i + 1)),
+                'prompt': prompt,
+                'value': value,
+                'wait_ms': max(0, wait_ms),
+                'extract': [],
+                'assert': {'prompt': '', 'expect': ''},
+            })
+
+        if not steps:
+            raise ValueError('模型返回的步骤都不合法（缺少 action 或 prompt）')
+        return steps
+
     @action(detail=False, methods=['post'], url_path='midscene-save-step')
     def midscene_save_step(self, request):
         """
@@ -3990,65 +4373,128 @@ class AICaseViewSet(viewsets.ModelViewSet):
         直接 append 进指定 AICase 的 steps（结构化固化），后续走 _run_midscene 重放免重复试错。
 
         入参：
-          ai_case_id  目标用例（必填）
+          ai_case_id  目标用例（不传则新建一条）
           action/prompt/selector_hint/value/name/wait_ms/extract/assert 步骤字段
+
+        批量：传 `steps: [...]` 可一次性追加多条（AI 拆步后整体写入），
+        比前端循环调用更安全 —— 中途失败不会写出半截用例。
         """
         data = request.data
         ai_case_id = data.get('ai_case_id')
-        prompt = (data.get('prompt') or '').strip()
-        action = data.get('action') or 'aiAct'
 
-        if not ai_case_id:
+        # ---- 组装待写入的步骤列表：批量优先，否则按单条处理 ----
+        batch = data.get('steps')
+        if isinstance(batch, list) and batch:
+            incoming = batch
+        else:
+            incoming = [{
+                'action': data.get('action') or 'aiAct',
+                'prompt': data.get('prompt'),
+                'name': data.get('name'),
+                'value': data.get('value'),
+                'selector_hint': data.get('selector_hint'),
+                'wait_ms': data.get('wait_ms'),
+                'extract': data.get('extract'),
+                'assert': data.get('assert'),
+            }]
+
+        allowed_actions = ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'assert', 'wait',
+                           'launch', 'back', 'home', 'screenshot')
+
+        # 这些动作天然不需要 prompt（返回/回主屏/等待/截图），
+        # 强制要求 prompt 会把 AI 拆出来的 back 步骤全部拦下来。
+        PROMPTLESS_ACTIONS = ('back', 'home', 'wait', 'screenshot')
+
+        prepared = []
+        for raw in incoming:
+            if not isinstance(raw, dict):
+                continue
+            prompt = (raw.get('prompt') or '').strip()
+            action = raw.get('action') or 'aiAct'
+            if action not in allowed_actions:
+                return Response(
+                    {'error': 'action 不支持: %s' % action},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if not prompt and action not in PROMPTLESS_ACTIONS:
+                return Response(
+                    {'error': 'prompt（自然语言操作指令）不能为空'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            prepared.append((action, prompt, raw))
+
+        if not prepared:
             return Response(
-                {'error': 'ai_case_id 必填（要沉淀到哪个 AI 用例的 steps）'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if not prompt:
-            return Response(
-                {'error': 'prompt（自然语言操作指令）不能为空'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if action not in ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'assert', 'wait',
-                          'launch', 'back', 'home', 'screenshot'):
-            return Response(
-                {'error': 'action 不支持: %s' % action},
+                {'error': '没有可写入的步骤'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            ai_case = AICase.objects.get(id=ai_case_id)
-        except AICase.DoesNotExist:
-            return Response(
-                {'error': 'AI 用例不存在 id=%s' % ai_case_id},
-                status=status.HTTP_404_NOT_FOUND
+        created_case = False
+        if ai_case_id:
+            try:
+                ai_case = AICase.objects.get(id=ai_case_id)
+            except AICase.DoesNotExist:
+                return Response(
+                    {'error': 'AI 用例不存在 id=%s' % ai_case_id},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            # 未指定用例 → 现场新建一条独立用例。
+            # 场景：Playground 试出一个全新的操作，还没有任何用例承载它。
+            # 设备/应用配置直接沿用 Playground 当前选择，省得再选一遍。
+            new_name = (data.get('new_case_name') or '').strip()
+            if not new_name:
+                new_name = 'Playground 用例 %s' % timezone.now().strftime('%m-%d %H:%M')
+            ai_case = AICase.objects.create(
+                name=new_name,
+                project_id=data.get('project_id') or None,
+                app_config_id=data.get('app_config_id') or None,
+                device_id=data.get('device_id') or None,
+                execution_mode='midscene',
+                steps=[],
+                created_by=request.user if request.user.is_authenticated else None,
             )
+            created_case = True
 
         # 沉淀到 midscene 用例：若用例仍是 text 模式，自动切换为 midscene（steps 才有意义）
         if ai_case.execution_mode != 'midscene':
             ai_case.execution_mode = 'midscene'
 
-        step = {
-            'name': (data.get('name') or '').strip() or '步骤%d' % (len(ai_case.steps) + 1),
-            'action': action,
-            'prompt': prompt,
-            'selector_hint': (data.get('selector_hint') or '').strip(),
-            'value': (data.get('value') or '').strip(),
-            'wait_ms': int(data.get('wait_ms') or 0),
-        }
-        extract = data.get('extract')
-        if extract:
-            step['extract'] = extract
-        assert_cfg = data.get('assert')
-        if assert_cfg:
-            step['assert'] = assert_cfg
+        existing = ai_case.steps or []
+        new_steps = []
+        for action, prompt, raw in prepared:
+            step = {
+                'name': (raw.get('name') or '').strip()
+                        or '步骤%d' % (len(existing) + len(new_steps) + 1),
+                'action': action,
+                'prompt': prompt,
+                'selector_hint': (raw.get('selector_hint') or '').strip(),
+                'value': (raw.get('value') or '').strip(),
+                'wait_ms': int(raw.get('wait_ms') or 0),
+            }
+            extract = raw.get('extract')
+            if extract:
+                step['extract'] = extract
+            assert_cfg = raw.get('assert')
+            if assert_cfg:
+                step['assert'] = assert_cfg
+            new_steps.append(step)
 
-        ai_case.steps = (ai_case.steps or []) + [step]
+        ai_case.steps = existing + new_steps
         ai_case.save(update_fields=['steps', 'execution_mode', 'updated_at'])
 
-        logger.info('[Midscene] 步骤已沉淀到 AICase#%s，当前 steps 数=%d', ai_case.id, len(ai_case.steps))
+        logger.info('[Midscene] %d 条步骤已沉淀到 AICase#%s，当前 steps 数=%d',
+                    len(new_steps), ai_case.id, len(ai_case.steps))
+        if created_case:
+            message = '已新建用例「%s」并写入 %d 条步骤' % (ai_case.name, len(new_steps))
+        else:
+            message = '已追加 %d 条步骤到用例「%s」' % (len(new_steps), ai_case.name)
         return Response({
-            'message': '步骤已追加到用例「%s」' % ai_case.name,
+            'message': message,
             'ai_case_id': ai_case.id,
+            'ai_case_name': ai_case.name,
+            'created_case': created_case,
+            'added_count': len(new_steps),
             'steps_count': len(ai_case.steps),
             'steps': ai_case.steps,
         })
@@ -4341,18 +4787,408 @@ class AICaseViewSet(viewsets.ModelViewSet):
             'execution_id': execution_record.id
         })
 
+    def _execute_midscene_case(self, ai_case, device, force_ai=False):
+        """执行一次用例，返回 (engine, result)。
+
+        是否走纯坐标回放由「用例是否已固化」决定：
+          * ai_case.steps_frozen_at 非空且步骤带坐标 -> 回放模式（不调视觉模型）
+          * 其余情况                                 -> AI 探索模式
+        force_ai=True 用于"回放失败后降级重跑"，强制走 AI 模式。
+        """
+        is_ios = (device.platform or '').strip().lower() == 'ios'
+        steps = ai_case.steps or []
+
+        want_replay = bool(
+            not force_ai
+            and getattr(ai_case, 'steps_frozen_at', None)
+            and steps
+            and all(
+                (not isinstance(s, dict))
+                or (s.get('action') not in ('aiTap', 'aiAct', 'aiInput'))
+                or (s.get('center_x') is not None and s.get('center_y') is not None)
+                for s in steps
+            )
+        )
+
+        if is_ios:
+            return self._run_ios_engine(ai_case, device, replay_mode=want_replay)
+
+        from .midscene_engine import MidsceneAppEngine
+        engine = MidsceneAppEngine(
+            app_config=ai_case.app_config,
+            device=device,
+            # 用例级开关：默认自动关弹窗，专门测弹窗的用例可关掉
+            auto_dismiss_popup=getattr(ai_case, 'auto_dismiss_popup', None),
+            replay_mode=want_replay,
+        )
+        engine.connect()
+        result = engine.run(steps)
+        return engine, result
+
+    def _freeze_case_steps(self, ai_case, executed_steps, logs):
+        """把本次执行采到的坐标写回用例，并打上固化时间戳。
+
+        只固化"确实需要定位"的动作（aiTap/aiAct/aiInput）。launch/back/wait
+        这类本来就不需要坐标，如实跳过即可。
+
+        只要有一个需要定位的步骤没采到坐标，就整体不固化 —— 半固化的用例
+        回放时会在那一步点空，反而比不固化更糟（等于把失败固化了下来）。
+        """
+        if not executed_steps:
+            logs.append('[固化] 本次执行没有步骤结果，跳过固化')
+            return
+
+        need = ('aiTap', 'aiAct', 'aiInput')
+        patched = []
+        missing = []
+        for idx, s in enumerate(executed_steps):
+            if not isinstance(s, dict):
+                continue
+            if s.get('action') not in need:
+                continue
+            loc = s.get('location') or {}
+            center = loc.get('center') or []
+            cx = cy = None
+            if isinstance(center, (list, tuple)) and len(center) >= 2:
+                cx, cy = center[0], center[1]
+            elif isinstance(center, dict):
+                cx, cy = center.get('x'), center.get('y')
+            if cx is None or cy is None:
+                missing.append(idx + 1)
+            else:
+                patched.append((idx, int(cx), int(cy)))
+
+        if missing:
+            logs.append('[固化] 第 %s 步没有采到坐标，本次不固化（避免固化出会点空的半成品）'
+                        % '、'.join(str(m) for m in missing))
+            return
+
+        if not patched:
+            logs.append('[固化] 本次没有任何"需要定位"的步骤，无需固化')
+            return
+
+        # 按原用例的步骤顺序回填坐标（executed_steps 与 ai_case.steps 同序）。
+        # 这里显式复制每个 dict：list() 只是浅拷贝，直接改元素会连带改到
+        # 调用方传进来的那份 JSON，出现"没保存却已经变了"的诡异现象。
+        steps = []
+        for s in (ai_case.steps or []):
+            steps.append(dict(s) if isinstance(s, dict) else s)
+
+        patched_n = 0
+        for idx, cx, cy in patched:
+            if 0 <= idx < len(steps) and isinstance(steps[idx], dict):
+                steps[idx]['center_x'] = cx
+                steps[idx]['center_y'] = cy
+                patched_n += 1
+
+        ai_case.steps = steps
+        ai_case.steps_frozen_at = timezone.now()
+        ai_case.save(update_fields=['steps', 'steps_frozen_at', 'updated_at'])
+        logs.append('[固化] 已固化 %d 步坐标，下次执行将走纯坐标回放（不调用视觉模型）'
+                    % patched_n)
+
+    @staticmethod
+    def _dismiss_popups_safely(engine, label=''):
+        """清一轮弹窗，任何异常都不能影响用例执行。
+
+        应用冷启动后最容易弹权限请求 / 隐私协议 / 开屏广告，这时候提前清掉
+        能省掉第一个步骤的一次失败重试。步骤级别的失败重试仍然是主要保障
+        （见 midscene_engine / midscene_ios_engine 的 execute 循环）。
+        """
+        try:
+            from .popup_handler import dismiss_popups
+            adapter = engine._popup_adapter() if hasattr(engine, '_popup_adapter') else None
+            if adapter is None:
+                return
+            n = dismiss_popups(adapter)
+            if n:
+                logger.info('[Midscene%s] 启动后清掉了 %d 个弹窗', label, n)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[Midscene%s] 启动后弹窗清理失败（不影响执行）: %s', label, exc)
+
+    def _run_ios_engine(self, ai_case, device, replay_mode=False):
+        """iOS 真机执行分支：连远端 WebDriverAgent 跑结构化 steps。
+
+        WDA 服务跑在「插着手机的电脑」上，地址取自设备的 wda_host / wda_port
+        （与 Android 的 adb_host 对称）。返回 (engine, result)，result 结构与
+        MidsceneAppEngine.run() 对齐，便于 _run_midscene 统一消费。
+        """
+        from .midscene_ios_engine import MidsceneIOSEngine
+
+        wda_host = (getattr(device, 'wda_host', '') or '').strip()
+        wda_port = getattr(device, 'wda_port', None) or 8100
+        if not wda_host:
+            raise ValueError(
+                '设备「%s」未配置 WDA 地址：请在「设备管理」中填写 WDA主机'
+                '（手机USB所在电脑的 IP，如 192.168.8.71）' % device.name
+            )
+
+        engine = MidsceneIOSEngine(
+            wda_host=wda_host,
+            wda_port=wda_port,
+            # 用例绑定的被测应用。步骤里写「launch: 万年历」这种人类可读名字时，
+            # WDA 只认 bundle id 会返回 400，这里用它的 bundle id 兜底。
+            default_bundle_id=(ai_case.app_config.package_name if ai_case.app_config else '') or '',
+            # 用例级开关：默认自动关弹窗，专门测弹窗的用例可关掉
+            auto_dismiss_popup=getattr(ai_case, 'auto_dismiss_popup', None),
+            # 用例已固化 -> 走纯坐标回放（不调视觉模型）
+            replay_mode=replay_mode,
+        )
+
+        # iOS 的 execute_steps 是「直执行」，不认 {ref: 公共步骤名}。
+        # 引用必须在进引擎前展开成完整 step（Android 侧由
+        # MidsceneAppEngine.run 内部调 _resolve_business_refs 完成，
+        # iOS 这条路原来漏了 —— 结果就是选了公共步骤的用例
+        # 把 {'ref': 'xxx'} 当成一个空步骤执行，报「没有填写提示词 prompt」）。
+        steps = ai_case.steps or []
+        try:
+            from .midscene_engine import MidsceneAppEngine
+            resolver = MidsceneAppEngine.__new__(MidsceneAppEngine)
+            resolver.logs = []
+            steps = resolver._resolve_business_refs(steps)
+            for line in resolver.logs:
+                engine.logs.append(line)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[Midscene-iOS] 展开公共步骤引用失败: %s', exc)
+
+        engine.start()
+        try:
+            bundle_id = (ai_case.app_config.package_name if ai_case.app_config else '') or ''
+            if bundle_id:
+                engine.launch_app(bundle_id)
+                # 冷启动是最容易弹权限/协议/开屏广告的时刻，先清一轮再开始执行，
+                # 免得第一个步骤就被弹窗挡住（步骤级已有失败重试兜底，这里只是
+                # 提前把最常见的情况处理掉）。
+                self._dismiss_popups_safely(engine, 'iOS')
+            raw = engine.execute_steps(steps)
+        finally:
+            try:
+                engine.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        result = {
+            'status': 'passed' if raw.get('status') == 'success' else 'failed',
+            'steps': raw.get('steps') or [],
+            'error': raw.get('error') or '',
+            'context': {},
+        }
+        return engine, result
+
     def _run_midscene(self, request, ai_case):
-        """Midscene APP 自动化执行分支：读取结构化 steps，驱动真机执行"""
+        """Midscene APP 自动化执行分支：读取结构化 steps，驱动真机执行
+
+        设备解析规则：
+          * 请求体里带了 device_id  -> 用请求指定的设备（执行时临时覆盖，
+                                      不会改写用例本身的 device 配置）
+          * 没带                    -> 用用例绑定的 device（向后兼容）
+        无论哪种来源，都必须是「在线」设备。
+        """
         if not ai_case.steps:
             return Response(
                 {'error': '该 Midscene 用例没有步骤（steps）配置'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        if not ai_case.app_config or not ai_case.device:
+        if not ai_case.app_config:
             return Response(
-                {'error': 'Midscene 用例必须关联应用配置(app_config)与执行设备(device)'},
+                {'error': 'Midscene 用例必须关联应用配置(app_config)'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        # ---- 解析本次执行使用的设备（支持多选，最多 MAX_PARALLEL_DEVICES 台） ----
+        #
+        # 请求体格式（两种都支持）：
+        #   {"device_id": 12}                单台（向后兼容）
+        #   {"device_ids": [12, 15]}         多台，同一用例并行跑
+        #
+        # 多台的前提是这些设备 WDA 地址各不相同。同一台电脑的 8100 同一时间
+        # 只能转发一台真机，所以同地址的两台设备并行跑必然互相干扰，这里直接拦掉。
+        from .models import AppDevice
+
+        raw_ids = None
+        try:
+            data = request.data or {}
+            if data.get('device_ids'):
+                raw_ids = data.get('device_ids')
+                if isinstance(raw_ids, str):
+                    raw_ids = [x.strip() for x in raw_ids.split(',') if x.strip()]
+            elif data.get('device_id'):
+                raw_ids = [data.get('device_id')]
+        except Exception:  # noqa: BLE001
+            raw_ids = None
+
+        override_device_ids = []
+        if raw_ids:
+            # 去重并保持顺序，顺手过滤掉非法值
+            for rid in raw_ids:
+                try:
+                    rid = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                if rid not in override_device_ids:
+                    override_device_ids.append(rid)
+
+        if override_device_ids:
+            if len(override_device_ids) > MAX_PARALLEL_DEVICES:
+                return Response(
+                    {
+                        'error': '一次最多同时执行 %d 台设备（当前选中 %d 台）。'
+                                 '请减少选择或分批执行。'
+                                 % (MAX_PARALLEL_DEVICES, len(override_device_ids)),
+                        'max_parallel': MAX_PARALLEL_DEVICES,
+                        'selected': len(override_device_ids),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            found = {d.id: d for d in AppDevice.objects.filter(id__in=override_device_ids)}
+            run_devices = []
+            missing = []
+            for rid in override_device_ids:
+                if rid in found:
+                    run_devices.append(found[rid])
+                else:
+                    missing.append(rid)
+            if missing:
+                return Response(
+                    {'error': '以下执行设备不存在：%s' % ', '.join(str(m) for m in missing)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        elif ai_case.device:
+            run_devices = [ai_case.device]
+        else:
+            run_devices = []
+
+        if not run_devices:
+            return Response(
+                {'error': '未指定执行设备，请在选择设备后重试'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ---- 同一 WDA 地址只能有一台设备（并行会互相踩） ----
+        addr_seen = {}
+        for _d in run_devices:
+            if (_d.platform or '').lower() == 'ios':
+                _addr = ((_d.wda_host or '').strip(), _d.wda_port or 8100)
+            else:
+                _addr = ((_d.adb_host or '').strip(), 5037)
+            if _addr[0] and _addr in addr_seen:
+                return Response(
+                    {
+                        'error': '设备「%s」与「%s」使用同一个服务地址（%s:%s），'
+                                 '同一时间只能跑一台。请只保留其中一台，'
+                                 '或把这些手机分别插到不同的电脑上。'
+                                 % (_d.name, addr_seen[_addr].name, _addr[0], _addr[1]),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if _addr[0]:
+                addr_seen[_addr] = _d
+
+        # ---- 只允许在线设备执行 + 执行前真实预检 ----
+        # 用离线设备跑用例只会得到一串无意义的失败日志，这里统一拦截。
+        #
+        # 注意：不能只信 DB 里的 status —— 那只是个会被写脏的缓存字段。
+        # 设备关机/WDA 停掉之后没人去改它，列表会一直显示「在线」，用户就会
+        # 选到一台其实已经下线的设备。所以这里做一次真实探测（iOS 探
+        # /status 的 ready，Android 跑 adb devices），并且把探测结论回写库，
+        # 让列表状态跟着刷新。
+        #
+        # 多选时**整批校验**：任何一台不可用就整批拒绝，不会出现"只跑了一半"
+        # 这种让人困惑的中间状态。
+        for _d in run_devices:
+            if _d.status == 'busy':
+                return Response(
+                    {
+                        'error': '执行设备「%s」正在执行其他用例，请稍后再试或改选其他设备。'
+                                 % _d.name,
+                        'device_id': _d.id,
+                        'device_name': _d.name,
+                        'device_status': _d.status,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if _d.status != 'online':
+                # 状态本身就不是在线，没必要再花时间探测
+                probe_ok, probe_detail = False, '记录状态为「%s」' % _d.get_status_display()
+            else:
+                probe_ok, probe_detail = probe_device_reachable(_d)
+
+            if not probe_ok:
+                # 探测失败 -> 把真实结论落库，避免列表继续骗人
+                try:
+                    if _d.status != 'busy':
+                        _d.status = 'offline'
+                        _d.save(update_fields=['status', 'updated_at'])
+                except Exception:  # noqa: BLE001
+                    pass
+                if (_d.platform or '').lower() == 'ios':
+                    hint = '请确认手机已解锁、WDA 已启动（在那台电脑上跑 ios_wda_host.bat），或改选一台在线设备。'
+                else:
+                    hint = '请确认设备已连接并授权 USB 调试，或改选一台在线设备。'
+                return Response(
+                    {
+                        'error': '执行设备「%s」当前不可用：%s。%s' % (
+                            _d.name, probe_detail, hint),
+                        'device_id': _d.id,
+                        'device_name': _d.name,
+                        'device_status': 'offline',
+                        'probe_detail': probe_detail,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # ---- 先占位标记 busy，避免两台并发请求抢到同一台设备 ----
+        # （下面 run_task 还会再置一次，这里是为了在创建执行记录之前就把
+        #  设备"锁"住，否则两个请求同时校验通过会导致同一台跑两份。）
+        for _d in run_devices:
+            try:
+                _d.status = 'busy'
+                _d.save(update_fields=['status', 'updated_at'])
+            except Exception:  # noqa: BLE001
+                pass
+
+        multi = len(run_devices) > 1
+        batch_id = timezone.now().strftime('%Y%m%d%H%M%S') if multi else ''
+        created = []
+
+        for _idx, run_device in enumerate(run_devices):
+            created.append(
+                self._spawn_midscene_execution(
+                    ai_case, run_device, request.user,
+                    override=bool(override_device_ids),
+                    batch_id=batch_id,
+                    batch_index=_idx + 1 if multi else 0,
+                    batch_total=len(run_devices) if multi else 0,
+                )
+            )
+
+        if multi:
+            return Response({
+                'message': '已开始执行：同一用例在 %d 台设备上并行运行' % len(created),
+                'execution_ids': [r.id for r in created],
+                'execution_id': created[0].id,
+                'device_count': len(created),
+                'batch_id': batch_id,
+            })
+        return Response({
+            'message': 'Midscene 用例开始执行',
+            'execution_id': created[0].id,
+        })
+
+    def _spawn_midscene_execution(self, ai_case, run_device, user,
+                                  override=False, batch_id='',
+                                  batch_index=0, batch_total=0):
+        """为「用例 × 单台设备」创建一条执行记录并起线程执行。
+
+        多设备并行时每台一条独立记录（各自有日志/步骤/截图/token），
+        用 batch_id + batch_index 关联，方便在列表里看出是同一批。
+        返回创建好的 AIExecutionRecord。
+        """
+        _batch_line = ''
+        if batch_total:
+            _batch_line = '[Midscene] 本批第 %d/%d 台（批次 %s）\n' % (
+                batch_index, batch_total, batch_id)
 
         execution_record = AIExecutionRecord.objects.create(
             project=ai_case.project,
@@ -4361,21 +5197,67 @@ class AICaseViewSet(viewsets.ModelViewSet):
             task_description=ai_case.task_description or '(Midscene 结构化步骤)',
             execution_mode='midscene',
             status='running',
-            executed_by=request.user,
-            logs='[Midscene] 正在连接真机并启动应用...\n'
+            executed_by=user,
+            logs=(
+                _batch_line +
+                '[Midscene] 执行设备：%s（%s %s，UDID %s）%s\n'
+                '[Midscene] 正在连接真机并启动应用...\n'
+            ) % (
+                run_device.name,
+                run_device.platform,
+                run_device.platform_version or '',
+                run_device.udid,
+                '  [本次临时指定]' if override else '',
+            )
         )
 
         def run_task():
             STOP_SIGNALS[execution_record.id] = False
+            # 本次执行真正使用的设备（可能是请求里临时指定的，不一定等于
+            # 用例绑定的 ai_case.device）。
+            _device = run_device
+            # 执行期间标记占用，避免「刷新状态」探活把正在跑用例的设备误判为离线；
+            # 执行结束后无论成败都按真实结果回调状态（失败=设备不可达/异常）。
             try:
-                from .midscene_engine import MidsceneAppEngine
+                _device.status = 'busy'
+                _device.save(update_fields=['status', 'updated_at'])
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # 把本线程绑定到这条执行记录，之后所有 token 统计都记到它头上
+                from .llm_usage import set_current_execution, clear_current_execution
+                set_current_execution(execution_record.id)
 
-                engine = MidsceneAppEngine(
-                    app_config=ai_case.app_config,
-                    device=ai_case.device,
-                )
-                engine.connect()
-                result = engine.run(ai_case.steps)
+                replay_used = False
+                engine, result = self._execute_midscene_case(ai_case, _device)
+                replay_used = bool(getattr(engine, 'replay_mode', False))
+
+                # ---- 回放失败 -> 自动降级回 AI 模式重跑 ----
+                # 坐标固化后如果界面改版/换机型，回放会点空。这时不能直接判失败，
+                # 而是退回 AI 探索模式重跑一次 —— 跑通后会自动重新固化，
+                # 下次又能走回放。这样"重复跑省 token"和"界面变了也能过"两者兼得。
+                if replay_used and result.get('status') != 'passed':
+                    logger.info('[Midscene] 回放失败，降级为 AI 探索模式重跑 (case#%s)', ai_case.id)
+                    engine.logs.append(
+                        '\n[Midscene] 固化坐标回放失败（界面可能已改版或换了机型），'
+                        '自动切换为 AI 探索模式重跑...'
+                    )
+                    degraded_logs = list(engine.logs)
+                    engine2, result2 = self._execute_midscene_case(
+                        ai_case, _device, force_ai=True)
+                    result2['steps'] = list(result2.get('steps') or [])
+                    engine = engine2
+                    result = result2
+                    replay_used = False
+                    engine.logs = degraded_logs + [''] + list(engine2.logs)
+
+                # ---- 跑通且尚未固化 -> 自动固化坐标 ----
+                if result.get('status') == 'passed' and not getattr(engine, 'replay_mode', False):
+                    try:
+                        self._freeze_case_steps(ai_case, result.get('steps') or [], engine.logs)
+                    except Exception as fexc:  # noqa: BLE001
+                        engine.logs.append('[固化] 自动固化失败（不影响用例结果）: %s' % fexc)
+                        logger.warning('[Midscene] 自动固化失败 case#%s: %s', ai_case.id, fexc)
 
                 # 合并引擎日志与每步结果
                 logs = list(engine.logs)
@@ -4403,10 +5285,14 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 execution_record.steps_completed = result.get('steps', [])
                 execution_record.screenshots_sequence = screenshots
                 execution_record.error_message = result.get('error') or ''
+                execution_record.replay_mode = replay_used
                 execution_record.end_time = timezone.now()
                 execution_record.duration = (
                     execution_record.end_time - execution_record.start_time
                 ).total_seconds()
+                # token 统计由 llm_usage 旁路累加，这里刷新一下拿最新值
+                execution_record.refresh_from_db(fields=[
+                    'model_calls', 'prompt_tokens', 'completion_tokens', 'tokens_estimated'])
                 execution_record.save()
             except Exception as e:
                 execution_record.status = 'failed'
@@ -4419,16 +5305,49 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 execution_record.save()
                 logger.warning('[Midscene] 执行失败: %s', e)
             finally:
+                # 解绑线程的 token 统计目标，避免串到别的执行上
+                try:
+                    from .llm_usage import clear_current_execution
+                    clear_current_execution()
+                except Exception:  # noqa: BLE001
+                    pass
+                # 释放占用。
+                #
+                # 注意：**用例失败 != 设备离线**。断言不通过、元素没找到、
+                # 某一步超时，设备本身都是好好的。早期版本在这里写
+                #   status = 'online' if passed else 'offline'
+                # 结果每失败一次就把设备标成离线，跑几轮之后全部设备都变成
+                # offline，下拉里一台可选设备都没有了。
+                #
+                # 现在只有两种情况标 offline：
+                #   1) 设备连接彻底失败（连不上 WDA / 设备不在线）
+                #   2) 执行线程抛了异常（多半是通信层问题）
+                # 其余情况恢复 online 并刷新心跳。
+                _conn_failed = False
+                try:
+                    err_text = (execution_record.error_message or '')
+                    _conn_failed = any(k in err_text for k in (
+                        'connection', 'Connection', 'connect', 'timed out',
+                        'Timeout', 'refused', 'unreachable', 'WDA',
+                        'Failed to launch', 'device not found', 'Device not found',
+                    ))
+                except Exception:  # noqa: BLE001
+                    _conn_failed = False
+
+                try:
+                    _device.status = 'offline' if _conn_failed else 'online'
+                    if _device.status == 'online':
+                        _device.last_heartbeat = timezone.now()
+                    _device.save(update_fields=['status', 'last_heartbeat', 'updated_at'])
+                except Exception:  # noqa: BLE001
+                    pass
                 STOP_SIGNALS.pop(execution_record.id, None)
 
         thread = threading.Thread(target=run_task)
         thread.daemon = True
         thread.start()
 
-        return Response({
-            'message': 'Midscene 用例开始执行',
-            'execution_id': execution_record.id
-        })
+        return execution_record
 
     def _process_gif_recording(self, execution_record, history):
         """
@@ -5018,6 +5937,118 @@ class UiDashboardViewSet(viewsets.ViewSet):
 
 # ==================== App 自动化 ViewSet ====================
 
+class _StepsGenerationUnavailable(Exception):
+    """生成步骤所需的前置条件不满足（如没有可用模型配置）。
+
+    与「调用失败」区分开：这类问题返回 503 并告诉用户怎么修，
+    而不是丢一个 500 让人以为是平台坏了。
+    """
+
+
+def _probe_error_reason(exc):
+    """把底层网络异常翻译成用户能看懂的一句话（探活/发现设备共用）。
+
+    直接把 requests 的 `HTTPConnectionPool(... Max retries exceeded ...)`
+    丢给用户没有任何意义，这里只保留结论。
+    """
+    text = str(exc)
+    # 顺序有讲究：RemoteDisconnected / ConnectionReset 的原文较长，先匹配
+    if 'RemoteDisconnected' in text or 'Remote end closed connection' in text:
+        return '连接被对端关闭：端口有人监听但不是 WDA（多为端口转发已失效）'
+    if 'Connection reset' in text or 'ConnectionReset' in text:
+        return '连接被重置：端口转发异常，建议重跑 ios_wda_host.bat'
+    if 'Connection refused' in text or 'Errno 111' in text:
+        return '连接被拒绝：那台电脑上的 WDA 服务没在跑'
+    if 'timed out' in text.lower() or 'timeout' in text.lower():
+        return '连接超时：那台电脑不可达（检查 IP 是否正确、是否同一网段）'
+    if 'No route to host' in text or 'Errno 113' in text:
+        return '网络不可达：IP 写错或不在同一网段'
+    if 'Name or service not known' in text or 'getaddrinfo' in text:
+        return '主机名无法解析：请填 IP 而不是计算机名'
+    return text[:120] if text else '探测失败'
+
+
+def probe_device_reachable(device, timeout=5):
+    """真实探测一台设备当前是否可用，返回 (online: bool, detail: str)。
+
+    这是 `refresh_status` 的单设备版本，抽出来给「执行前预检」复用。
+
+    背景：`AppDevice.status` 只是一个会被写脏的缓存字段 —— 设备关机或
+    WDA 停掉之后没人去改它，列表就会一直显示「在线」。如果执行入口只看
+    这个字段，用户就会选到一台其实已经下线的设备，然后拿到一串毫无意义
+    的超时日志。所以执行前必须用真实探测兜底。
+
+    探测方式与 refresh_status 保持一致：
+      - iOS   ：GET http://<wda_host>:<wda_port>/status，value.ready 为真即在线
+      - Android：ADB_SERVER_SOCKET=tcp:<adb_host> 跑 `adb devices`，
+                 序列号存在且 state=device 即在线
+    """
+    import socket
+    import subprocess as _sp
+    import requests as _requests
+
+    platform = (device.platform or '').lower()
+
+    if platform == 'ios':
+        host = (device.wda_host or '').strip()
+        port = device.wda_port or 8100
+        if not host:
+            return False, '未配置 WDA 主机（请在设备编辑里填写手机所插电脑的 IP）'
+        try:
+            resp = _requests.get('http://%s:%s/status' % (host, port), timeout=timeout)
+            value = (resp.json() or {}).get('value') or {}
+            if value.get('ready'):
+                return True, 'WDA ready'
+            return False, 'WDA 可达但未就绪（ready=%s）' % value.get('ready')
+        except Exception as exc:  # noqa: BLE001
+            reason = _probe_error_reason(exc)
+            hint = '，请在该电脑上重跑 ios_wda_host.bat' if reason.startswith('连接被拒绝') else ''
+            return False, '%s（%s:%s）%s' % (reason, host, port, hint)
+
+    if platform == 'android':
+        host = (device.adb_host or '').strip()
+        # 兼容历史数据里写成 host:port 的形式
+        if host and host.count(':') == 1 and host.rsplit(':', 1)[1].isdigit():
+            host = host.rsplit(':', 1)[0]
+        if host:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.5)
+            try:
+                sock.connect((host, 5037))
+            except Exception as exc:  # noqa: BLE001
+                return False, 'adb 服务 %s 不可达（%s）' % (host, exc)
+            finally:
+                sock.close()
+        env = os.environ.copy()
+        if host:
+            env['ADB_SERVER_SOCKET'] = 'tcp:%s' % host
+        else:
+            env.pop('ADB_SERVER_SOCKET', None)
+        try:
+            proc = _sp.run(['adb', 'devices'], capture_output=True, text=True,
+                           timeout=10, env=env)
+        except _sp.TimeoutExpired:
+            return False, 'adb devices 超时（%s）' % (host or '本机')
+        except Exception as exc:  # noqa: BLE001
+            return False, 'adb 不可用：%s' % exc
+        states = {}
+        for line in (proc.stdout or '').splitlines():
+            line = line.strip()
+            if not line or line.startswith('List of devices') or line.startswith('*'):
+                continue
+            parts = [p for p in line.split('\t') if p.strip()]
+            if len(parts) >= 2:
+                states[parts[0].strip()] = parts[1].strip()
+        state = states.get(device.udid)
+        if state == 'device':
+            return True, 'adb state=device'
+        if state:
+            return False, 'adb state=%s（设备未授权或离线）' % state
+        return False, 'adb devices 中未找到该序列号（%s）' % device.udid
+
+    return False, '不支持的平台：%s' % (device.platform or '(空)')
+
+
 class AppDeviceViewSet(viewsets.ModelViewSet):
     """移动设备管理"""
     queryset = AppDevice.objects.all()
@@ -5030,7 +6061,7 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def heartbeat(self, request, pk=None):
-        """设备心跳上报"""
+        """设备心跳上报（设备端还活着才会调到这里）"""
         device = self.get_object()
         device.last_heartbeat = timezone.now()
         if device.status == 'offline':
@@ -5046,8 +6077,462 @@ class AppDeviceViewSet(viewsets.ModelViewSet):
         if new_status not in dict(AppDevice.STATUS_CHOICES):
             return Response({'error': '无效的状态值'}, status=status.HTTP_400_BAD_REQUEST)
         device.status = new_status
+        # 手设为在线等同于一次成功心跳，否则前端「最后心跳」会显示成很久以前
+        if new_status == 'online':
+            device.last_heartbeat = timezone.now()
         device.save()
         return Response(AppDeviceSerializer(device).data)
+
+    @action(detail=False, methods=['post'])
+    def refresh_status(self, request):
+        """实时探测设备可达性，修正 status / last_heartbeat。
+
+        背景：status 过去只在「扫描入库 / 设备端注册」时被写成 online，
+        设备关机或 WDA 停了之后没人改它，列表就永远显示「在线」。
+        这里做一次真实探测：
+          - Android：对该设备的 adb_host 跑 `adb devices`，序列号出现且 state=device 即在线
+          - iOS：GET http://<wda_host>:<wda_port>/status，ready 即在线
+        busy（用例执行中）的设备跳过，避免误降级。
+
+        参数：ids（可选，逗号分隔或列表）只刷新指定设备；不传则刷新全部。
+        """
+        import requests as _requests
+        from django.db.models import Q
+
+        qs = self.get_queryset()
+        raw_ids = request.data.get('ids') or request.query_params.get('ids')
+        if raw_ids:
+            if isinstance(raw_ids, str):
+                raw_ids = [i.strip() for i in raw_ids.split(',') if i.strip().isdigit()]
+            qs = qs.filter(id__in=raw_ids)
+
+        # busy 表示正在跑用例，探测会误报离线，直接跳过
+        qs = qs.exclude(status='busy')
+
+        # ---- Android：按 adb_host 分组，一次 adb devices 覆盖多台设备 ----
+        adb_cache = {}
+
+        def _adb_devices(host):
+            if host in adb_cache:
+                return adb_cache[host]
+            # 先用短超时探一下 adb 服务的 TCP 端口：主机不可达时直接判离线，
+            # 不必等 adb 自己超时（多台设备累计会拖到几十秒）。
+            if host:
+                host_only, _, port_str = host.partition(':')
+                probe_port = int(port_str) if port_str.isdigit() else 5037
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.5)
+                try:
+                    sock.connect((host_only, probe_port))
+                    reachable = True
+                except Exception as exc:  # noqa: BLE001
+                    reachable, err = False, 'adb 服务 %s 不可达（%s）' % (host, exc)
+                finally:
+                    sock.close()
+                if not reachable:
+                    adb_cache[host] = (None, err)
+                    return adb_cache[host]
+
+            env = os.environ.copy()
+            if host:
+                env['ADB_SERVER_SOCKET'] = 'tcp:%s' % host
+            else:
+                env.pop('ADB_SERVER_SOCKET', None)
+            try:
+                proc = subprocess.run(['adb', 'devices'], capture_output=True,
+                                      text=True, timeout=10, env=env)
+            except subprocess.TimeoutExpired:
+                adb_cache[host] = (None, 'adb devices 超时（%s）' % host)
+                return adb_cache[host]
+            except Exception as exc:  # noqa: BLE001
+                adb_cache[host] = (None, str(exc))
+                return adb_cache[host]
+            states = {}
+            for line in (proc.stdout or '').splitlines():
+                line = line.strip()
+                if not line or line.startswith('List of devices') or line.startswith('*'):
+                    continue
+                parts = [p for p in line.split('\t') if p.strip()]
+                if len(parts) >= 2:
+                    states[parts[0].strip()] = parts[1].strip()
+            adb_cache[host] = (states, (proc.stderr or '').strip() or None)
+            return adb_cache[host]
+
+        devices = list(qs.filter(Q(platform='android') | Q(platform='ios')))
+        changed = []
+        now = timezone.now()
+
+        # ---- iOS 地址冲突预判：同一个 host:port 只能对应一台真机 ----
+        # 一台手机插在一台电脑上，那台电脑只转发自己的 8100，所以
+        # 「两台 iOS 设备共用同一个 wda_host:wda_port」在物理上不可能同时成立，
+        # 必然有一条是残留数据（换电脑/换设备时没更新地址）。
+        # 但 /status 响应里【没有 UDID】（只有 os.version/sdkVersion/device），
+        # 无法用它反查是哪台设备 —— 只能按"谁最近上报过"来裁决：
+        # last_heartbeat 最新的那台赢，其余标记离线并说明「地址冲突」。
+        ios_addr_owner = {}
+        for device in devices:
+            if device.platform != 'ios':
+                continue
+            addr = ((device.wda_host or '').strip(), device.wda_port or 8100)
+            if not addr[0]:
+                continue
+            prev = ios_addr_owner.get(addr)
+            if prev is None:
+                ios_addr_owner[addr] = device
+            else:
+                # None 表示「从没成功上报过」，排在任何真实时间之前
+                cur_key = device.last_heartbeat
+                prev_key = prev.last_heartbeat
+                if cur_key and (prev_key is None or cur_key > prev_key):
+                    ios_addr_owner[addr] = device
+        ios_conflict_loser = {}
+        for device in devices:
+            if device.platform != 'ios':
+                continue
+            addr = ((device.wda_host or '').strip(), device.wda_port or 8100)
+            if not addr[0]:
+                continue
+            if ios_addr_owner.get(addr) is not None and ios_addr_owner[addr].id != device.id:
+                winner = ios_addr_owner[addr]
+                # 不要提示"手工改 IP"：地址是设备端上报时自动覆盖的
+                # （device_agent_register -> _upsert_app_device 按 UDID 无条件刷新 wda_host），
+                # 这台设备换到别的电脑后跑一次 ios_wda_host.bat 地址就会自己更新。
+                ios_conflict_loser[device.id] = (
+                    '当前记录的 %s:%s 上是「%s」的 WDA（该地址同一时间只能对应一台真机）；'
+                    '本机若已改插别的电脑，在该电脑上跑一次 ios_wda_host.bat，'
+                    '地址会自动更新为本机；若未接入任何电脑，则保持离线' % (
+                        addr[0], addr[1], winner.name))
+
+        for device in devices:
+            if device.id in ios_conflict_loser:
+                online, detail = False, ios_conflict_loser[device.id]
+                new_status = 'offline'
+                if device.status != new_status:
+                    device.status = new_status
+                # 冲突失败不推进心跳，保留最后一次真实成功时间
+                device.save(update_fields=['status', 'updated_at'])
+                changed.append({
+                    'id': device.id, 'name': device.name, 'platform': device.platform,
+                    'status': new_status, 'online': False, 'detail': detail,
+                    'last_heartbeat': device.last_heartbeat,
+                })
+                continue
+            if device.platform == 'android':
+                host = (device.adb_host or '').strip()
+                # 兼容历史数据里写成 host:port 的形式
+                if host and host.count(':') == 1 and host.rsplit(':', 1)[1].isdigit():
+                    host = host.rsplit(':', 1)[0]
+                states, err = _adb_devices(host)
+                if states is None:
+                    online, detail = False, 'adb 不可用：%s' % err
+                else:
+                    state = states.get(device.udid)
+                    online = state == 'device'
+                    detail = ('adb state=%s' % state) if state else 'adb devices 中未找到该序列号'
+            else:
+                host = (device.wda_host or '').strip()
+                port = device.wda_port or 8100
+                if not host:
+                    online, detail = False, '未配置 WDA 主机（请在编辑里填写手机USB所在电脑的 IP）'
+                else:
+                    try:
+                        resp = _requests.get('http://%s:%s/status' % (host, port), timeout=5)
+                        value = (resp.json() or {}).get('value') or {}
+                        online = bool(value.get('ready'))
+                        detail = 'WDA ready=%s' % value.get('ready')
+                    except Exception as exc:  # noqa: BLE001
+                        # 只给可读结论，不要把 requests 的 ConnectionError 原文抛给用户
+                        reason = _probe_error_reason(exc)
+                        online = False
+                        detail = '%s（%s:%s）%s' % (reason, host, port,
+                                                   '，请在该电脑上重跑 ios_wda_host.bat' if reason.startswith('连接被拒绝') else '')
+
+            new_status = 'online' if online else 'offline'
+            if device.status != new_status:
+                device.status = new_status
+            # 心跳只在探测成功时推新；探活失败保留上一次时间，便于判断「多久没成功了」
+            if online:
+                device.last_heartbeat = now
+            device.save(update_fields=['status', 'last_heartbeat', 'updated_at'])
+            changed.append({
+                'id': device.id, 'name': device.name, 'platform': device.platform,
+                'status': new_status, 'online': online, 'detail': detail,
+                'last_heartbeat': device.last_heartbeat,
+            })
+
+        online_count = sum(1 for c in changed if c['online'])
+        return Response({
+            'success': True,
+            'message': '已探测 %d 台设备，在线 %d 台' % (len(changed), online_count),
+            'total': len(changed),
+            'online': online_count,
+            'offline': len(changed) - online_count,
+            'results': changed,
+            'devices': [AppDeviceSerializer(d).data
+                        for d in AppDevice.objects.filter(id__in=[c['id'] for c in changed])],
+        })
+
+    @action(detail=False, methods=['post'])
+    def discover(self, request):
+        """按 IP 扫描远程设备并自动入库（无需手填 UDID）。
+
+        iOS：探测 http://<host>:<port>/status（WDA），ready 即建/更新设备。
+        Android：通过 ADB_SERVER_SOCKET=tcp:<host>:<port> 跑 `adb devices`。
+
+        设备以 UDID 为唯一身份：新设备新建，老设备只把 wda_host/adb_host 刷成
+        **本次扫描到的电脑**并置为在线，记录永不删除。
+        """
+        platform = (request.data.get('platform') or 'ios').strip().lower()
+        host = (request.data.get('host') or '').strip()
+        try:
+            port = int(request.data.get('port') or (8100 if platform == 'ios' else 5037))
+        except (TypeError, ValueError):
+            port = 8100 if platform == 'ios' else 5037
+
+        if not host:
+            return Response({'success': False, 'message': '请填写设备所在电脑的 IP'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if platform == 'android':
+            return self._discover_android(host, port)
+
+        # ---- iOS: probe WebDriverAgent ----
+        try:
+            import requests as _requests
+            resp = _requests.get('http://%s:%s/status' % (host, port), timeout=8)
+            value = (resp.json() or {}).get('value') or {}
+        except Exception as exc:  # noqa: BLE001
+            return Response({
+                'success': False,
+                'message': '连不上 %s:%s —— %s（确认那台电脑已跑 ios_wda_host.bat 且防火墙放行 %s 端口）'
+                           % (host, port, _probe_error_reason(exc), port),
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        if not value.get('ready'):
+            return Response({
+                'success': False,
+                'message': 'http://%s:%s 返回了响应但 WDA 未就绪（ready=%s）'
+                           % (host, port, value.get('ready')),
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        os_info = value.get('os') or {}
+        build = value.get('build') or {}
+        device, created = _upsert_app_device(
+            platform='ios',
+            wda_host=host,
+            wda_port=port,
+            platform_version=os_info.get('version') or '',
+            name='iPhone (%s)' % host,
+            notes='WDA %s · 由平台自动发现' % (build.get('version') or ''),
+        )
+        return Response({
+            'success': True,
+            'created': created,
+            'message': '%s设备「%s」' % ('新增' if created else '更新', device.name),
+            'data': AppDeviceSerializer(device).data,
+            'devices': [AppDeviceSerializer(device).data],
+        })
+
+    def _discover_android(self, host, port):
+        """通过远程 ADB 列出设备并入库"""
+        import subprocess
+
+        env = os.environ.copy()
+        env['ADB_SERVER_SOCKET'] = 'tcp:%s:%s' % (host, port)
+        try:
+            proc = subprocess.run(['adb', 'devices'], capture_output=True,
+                                  text=True, timeout=25, env=env)
+        except FileNotFoundError:
+            return Response({'success': False, 'message': '服务器未安装 adb，无法扫描 Android 设备'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except subprocess.TimeoutExpired:
+            return Response({
+                'success': False,
+                'message': '连接 tcp:%s:%s 超时（确认那台电脑已启动 adb -a -P %s nodaemon server 并放行端口）'
+                           % (host, port, port),
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        serials = []
+        for line in (proc.stdout or '').splitlines():
+            line = line.strip()
+            if not line or line.startswith('List of devices') or line.startswith('*'):
+                continue
+            parts = [p.strip() for p in line.split('\t') if p.strip()]
+            if len(parts) >= 2:
+                serials.append((parts[0], parts[1]))
+
+        if not serials:
+            return Response({
+                'success': False,
+                'message': 'adb 未列出任何设备。输出：%s %s'
+                           % ((proc.stdout or '').strip()[:200], (proc.stderr or '').strip()[:200]),
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        payload, offline = [], []
+        for serial, state in serials:
+            if state != 'device':
+                offline.append('%s(%s)' % (serial, state))
+                continue
+            device, created = _upsert_app_device(
+                platform='android',
+                udid=serial,
+                adb_host='%s:%s' % (host, port),
+                name='Android (%s)' % serial,
+            )
+            payload.append({'created': created, 'device': AppDeviceSerializer(device).data})
+
+        return Response({
+            'success': True,
+            'created': sum(1 for p in payload if p['created']),
+            'message': '发现 %d 台设备%s' % (len(payload), ('，忽略：' + ', '.join(offline)) if offline else ''),
+            'devices': [p['device'] for p in payload],
+            'data': payload[0]['device'] if payload else None,
+        })
+
+
+def _upsert_app_device(platform='ios', udid=None, wda_host=None, wda_port=None,
+                       adb_host=None, name=None, platform_version=None,
+                       device_type='real', notes=None, status='online'):
+    """定位或创建 AppDevice，返回 (device, created)。
+
+    **设备以 UDID 为唯一身份，记录只增不删；IP 随"插在哪台电脑上"实时更新。**
+
+    定位顺序：
+      1. 按 UDID 精确匹配 —— 命中就是同一台设备，刷新它的地址与状态
+      2. 没命中时，仅当能匹配到一条**占位记录**（平台扫描时造的 ios-<host>-<port>）
+         才复用并纠正 UDID（这是占位纠正，不是设备顶替）
+      3. 否则**新建一条**
+
+    ⚠️ 关键约束：**绝不允许"真实 UDID → 另一个真实 UDID"的改写**。
+    同一个 WDA 地址（同一台电脑）上插不同的手机是常态，
+    早期版本按 (platform, wda_host, wda_port) 无条件复用记录并改写 UDID，
+    导致"换设备 = 顶替老设备记录"，列表里永远只剩一条、老设备凭空消失。
+    """
+    platform = (platform or 'ios').lower()
+    wda_port = int(wda_port or 8100)
+    device = None
+
+    # ---- 1) 按 UDID 精确匹配（设备唯一身份）----
+    if udid:
+        device = AppDevice.objects.filter(udid=udid).first()
+
+    # ---- 2) 只允许"占位记录"被纠正为真实 UDID ----
+    if device is None and udid and wda_host:
+        placeholder = AppDevice.objects.filter(
+            platform=platform, wda_host=wda_host, wda_port=wda_port,
+            udid__startswith='ios-%s-%s' % (wda_host, wda_port),
+        ).first()
+        if placeholder is not None:
+            # 占位记录是平台扫描造的，没有真实身份，可以安全纠正
+            placeholder.udid = udid
+            device = placeholder
+            logger.info('[设备] 占位记录纠正为真实 UDID：%s -> %s', wda_host, udid)
+
+    # ---- 3) 没有 udid：平台扫描（WDA /status 拿不到真机 UDID）----
+    # 只复用**占位记录**（或该主机上的第一条占位），避免反复扫描越扫越多；
+    # **绝不认领真实 UDID 的记录** —— 那条记录属于某台具体设备，
+    # 扫描只是在探测"这台电脑上有台 iOS 设备"，不该冒名顶替任何已有设备。
+    if device is None and not udid and wda_host:
+        placeholder_udid = 'ios-%s-%s' % (wda_host, wda_port)
+        device = AppDevice.objects.filter(udid=placeholder_udid).first()
+
+    # ---- 4) 新建 ----
+    if device is None:
+        udid = udid or 'ios-%s-%s' % (wda_host or 'unknown', wda_port)
+        device = AppDevice(platform=platform, udid=udid,
+                           device_type=device_type or 'real')
+
+    created = device.pk is None
+
+    # 设备插在哪台电脑：实时覆盖为最新值，保证平台连的是当前主机
+    if wda_host:
+        device.wda_host = wda_host
+        device.wda_port = wda_port
+    if adb_host:
+        device.adb_host = adb_host
+    if platform_version and device.platform_version != platform_version:
+        device.platform_version = platform_version
+    # 设备名：显式传入的优先；否则按 UDID 尾号生成，换设备能一眼区分
+    if name and device.name != name:
+        device.name = name
+    if not device.name:
+        tail = (udid or 'unknown').replace('-', '')[-6:].upper()
+        device.name = 'iPhone %s' % tail if platform == 'ios' else 'Android %s' % tail
+    if notes:
+        device.notes = notes
+    device.status = status or 'online'
+    if device.status == 'online':
+        device.last_heartbeat = timezone.now()
+    device.save()
+    return device, created
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def device_agent_register(request):
+    """设备端 agent 自动注册 / 心跳 / 下线（免登录）。
+
+    scripts/ios_wda_host.bat 跑通 WDA 后调用此接口把设备登记上平台；
+    scripts/ios_device_stop.bat 停机时再调一次（status=offline）把状态推下来。
+
+    约定：**设备以 UDID 为唯一身份**
+      - 新设备（UDID 没见过）→ 新建一条
+      - 老设备（UDID 已存在）→ 只更新状态 + **最新连接电脑的 IP**
+        （换电脑时 wda_host/wda_port/adb_host 被覆盖为新值，不会产生第二条记录）
+      - 记录永不删除，设备拔掉后仍在列表里，只是状态变 offline
+
+    鉴权：settings.DEVICE_AGENT_TOKEN 非空时必须带同值 X-Device-Token 头。
+    """
+    expected = getattr(django_settings, 'DEVICE_AGENT_TOKEN', '') or ''
+    if expected:
+        provided = request.META.get('HTTP_X_DEVICE_TOKEN', '') or (request.data.get('token') or '')
+        if provided != expected:
+            return Response({'success': False, 'message': 'device agent token 无效'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+    platform = (request.data.get('platform') or 'ios').strip().lower()
+    udid = (request.data.get('udid') or '').strip()
+    wda_host = (request.data.get('wda_host') or '').strip()
+    try:
+        wda_port = int(request.data.get('wda_port') or 8100)
+    except (TypeError, ValueError):
+        wda_port = 8100
+    adb_host = (request.data.get('adb_host') or '').strip() or None
+
+    if not udid and not wda_host:
+        return Response({'success': False, 'message': 'udid 与 wda_host 至少需要提供一个'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    reported = (request.data.get('status') or '').strip().lower()
+    if reported not in ('online', 'offline'):
+        reported = 'online'
+
+    device, created = _upsert_app_device(
+        platform=platform,
+        udid=udid or None,
+        wda_host=wda_host or None,
+        wda_port=wda_port,
+        adb_host=adb_host,
+        name=(request.data.get('name') or '').strip() or None,
+        platform_version=(request.data.get('platform_version') or '').strip() or None,
+        device_type=(request.data.get('device_type') or 'real'),
+        notes=(request.data.get('notes') or '').strip() or None,
+        status=reported,
+    )
+    if created:
+        action = '新增'
+    elif reported == 'offline':
+        action = '标记离线'
+    else:
+        action = '更新'
+    return Response({
+        'success': True,
+        'created': created,
+        'online': reported == 'online',
+        'message': '%s设备「%s」' % (action, device.name),
+        'data': AppDeviceSerializer(device).data,
+    })
 
 
 class AppConfigViewSet(viewsets.ModelViewSet):
@@ -5991,6 +7476,101 @@ def import_airtest_script(request):
         'created_elements': created_elements,
         'parsed_steps': steps,
     })
+
+
+# ==================== LLM 用量统计代理 ====================
+#
+# midscene 内部把 LLM 响应吃掉了，usage 拿不到。这里提供一个 OpenAI 兼容的
+# 转发端点：把 midscene 的 base_url 指到它，所有请求经此转发，我们顺手把
+# usage 记到当前执行记录上。
+#
+# 用法：
+#   在 _prepare_engine_env 里把 MIDSCENE_MODEL_BASE_URL 改成
+#       http://127.0.0.1:<backend_port>/api/ui-automation/llm-proxy/<真实base64>
+#   或者更简单：请求头带 X-LLM-Upstream。
+#
+# 安全性：只允许转发到 AIModelConfig 里配置过的 base_url，避免变成任意
+# 请求转发器（SSRF）。
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def llm_proxy(request):
+    """OpenAI 兼容的 LLM 转发端点，顺带统计 token 用量。
+
+    上游地址按以下优先级解析：
+      1. 请求头 X-LLM-Upstream（执行时由后端注入）
+      2. 请求参数 upstream
+    只允许转发白名单内的地址（取自 AIModelConfig.base_url）。
+
+    统计是旁路：转发失败只记录日志，绝不影响模型调用本身。
+    """
+    import requests as _requests
+
+    upstream = (request.headers.get('X-LLM-Upstream')
+                or request.query_params.get('upstream') or '').strip()
+    if not upstream:
+        return Response({'error': '缺少上游地址（X-LLM-Upstream）'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    # ---- 白名单校验：只转发到系统里配置过的模型服务 ----
+    try:
+        from apps.requirement_analysis.models import AIModelConfig
+        allowed = set()
+        for cfg in AIModelConfig.objects.all():
+            base = (getattr(cfg, 'base_url', '') or '').strip()
+            if base:
+                allowed.add(base.rstrip('/'))
+        if allowed and not any(upstream.rstrip('/').startswith(a) for a in allowed):
+            logger.warning('[LLMProxy] 拒绝转发到未配置的地址: %s', upstream)
+            return Response({'error': '该上游地址不在系统配置中'}, status=403)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('[LLMProxy] 白名单校验失败，放行: %s', exc)
+
+    url = upstream.rstrip('/') + '/' + request.path.split('llm-proxy/', 1)[-1].lstrip('/') \
+        if 'llm-proxy/' in request.path else upstream
+    # 保留 querystring
+    if request.META.get('QUERY_STRING'):
+        clean_qs = '&'.join(
+            p for p in request.META['QUERY_STRING'].split('&')
+            if not p.startswith('upstream=')
+        )
+        if clean_qs:
+            url = url + ('&' if '?' in url else '?') + clean_qs
+
+    headers = {
+        'Content-Type': request.headers.get('Content-Type', 'application/json'),
+        'Authorization': request.headers.get('Authorization', ''),
+        'Accept': 'application/json',
+    }
+    headers = {k: v for k, v in headers.items() if v}
+
+    try:
+        resp = _requests.post(url, data=request.body, headers=headers, timeout=300)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('[LLMProxy] 转发失败: %s', exc)
+        return Response({'error': '上游请求失败: %s' % exc}, status=502)
+
+    # ---- 旁路统计 usage ----
+    try:
+        payload = resp.json()
+        usage = (payload or {}).get('usage') or {}
+        if usage:
+            from .llm_usage import record_usage
+            record_usage(
+                prompt_tokens=usage.get('prompt_tokens') or 0,
+                completion_tokens=usage.get('completion_tokens') or 0,
+                calls=1,
+                estimated=False,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug('[LLMProxy] 解析 usage 失败（忽略）: %s', exc)
+
+    return HttpResponse(
+        resp.content,
+        status=resp.status_code,
+        content_type=resp.headers.get('Content-Type', 'application/json'),
+    )
 
 
 

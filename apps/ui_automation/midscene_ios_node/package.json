@@ -1,0 +1,13 @@
+{
+  "name": "midscene-ios-service",
+  "version": "0.1.0",
+  "description": "JSON-RPC bridge service for Midscene iOS (WebDriverAgent), used by TestHub midscene_ios_engine",
+  "main": "service.js",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@midscene/ios": "1.12.6"
+  }
+}

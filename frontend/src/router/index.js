@@ -53,7 +53,31 @@ const routes = [
       {
         path: 'modao-skill',
         name: 'ModaoSkill',
-        component: () => import('@/views/requirement-analysis/ModaoSkillView.vue')
+        component: () => import('@/views/requirement-analysis/ModaoListView.vue')
+      },
+      {
+        path: 'modao-canvas/:id',
+        name: 'ModaoCanvas',
+        component: () => import('@/views/requirement-analysis/ModaoSkillView.vue'),
+        props: true
+      },
+      {
+        path: 'modao-board/:id',
+        name: 'ModaoCanvasBoard',
+        component: () => import('@/views/requirement-analysis/ModaoCanvasBoard.vue'),
+        props: true
+      },
+      {
+        path: 'modao-pipeline/:id',
+        name: 'CanvasPipelineView',
+        component: () => import('@/views/requirement-analysis/CanvasPipelineView.vue'),
+        props: true
+      },
+      {
+        path: 'modao-case-merge/:id',
+        name: 'CaseMergeView',
+        component: () => import('@/views/requirement-analysis/CaseMergeView.vue'),
+        props: true
       },
       {
         path: 'projects',
@@ -224,6 +248,26 @@ const routes = [
       }
     ]
   },
+  // 自动化测试（合并原 UI自动化 + App自动化 的入口）
+  // 只提供「模块首页」这一层：dashboard 复用 UI 自动化的看板，
+  // 其余功能页仍走原有的 /ui-automation/* 与 /app-automation/* 路由，
+  // 这样 20 处页面内跳转与用户旧书签都不用改。
+  {
+    path: '/automation',
+    component: Layout,
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        redirect: 'dashboard'
+      },
+      {
+        path: 'dashboard',
+        name: 'AutomationDashboard',
+        component: () => import('@/views/ui-automation/dashboard/Dashboard.vue')
+      }
+    ]
+  },
   {
     path: '/ui-automation',
     component: Layout,
@@ -287,6 +331,11 @@ const routes = [
         path: 'notification-logs',
         name: 'UiNotificationLogs',
         component: () => import('@/views/ui-automation/notification/NotificationLogs.vue')
+      },
+      {
+        path: 'app-devices',
+        name: 'UiAppDeviceList',
+        component: () => import('@/views/ui-automation/app/AppDeviceList.vue')
       },
       {
         path: 'app',
@@ -462,6 +511,11 @@ const routes = [
         path: 'midscene-playground',
         name: 'MidscenePlayground',
         component: () => import('@/views/ui-automation/ai/MidscenePlayground.vue')
+      },
+      {
+        path: 'midscene-web-playground',
+        name: 'WebMidscenePlayground',
+        component: () => import('@/views/ui-automation/ai/WebMidscenePlayground.vue')
       },
       {
         path: 'business-actions',

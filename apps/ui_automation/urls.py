@@ -35,6 +35,8 @@ from .views import (
     stop_recording,
     generate_recording_case,
     import_airtest_script,
+    device_agent_register,
+    llm_proxy,
 )
 from .views_config import EnvironmentConfigViewSet, AIIntelligentModeConfigViewSet
 from .pipeline_views import AppPipelineRunViewSet
@@ -85,6 +87,10 @@ urlpatterns = [
     path('recording/stop/', stop_recording, name='recording-stop'),
     path('recording/generate/', generate_recording_case, name='recording-generate'),
     path('airtest/import/', import_airtest_script, name='airtest-import'),
+    path('device-agent/register/', device_agent_register, name='device-agent-register'),
+    # LLM 用量统计代理：OpenAI 兼容转发，顺带把 usage 记到执行记录上
+    path('llm-proxy/', llm_proxy, name='llm-proxy'),
+    path('llm-proxy/<path:rest>', llm_proxy, name='llm-proxy-rest'),
 ]
 
 # 添加媒体文件路由

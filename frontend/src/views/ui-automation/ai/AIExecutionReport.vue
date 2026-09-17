@@ -34,6 +34,23 @@
           <el-icon><Download /></el-icon>
           导出报告
         </el-button>
+        <!-- 探索成功 → 固化成确定性脚本：后续执行按坐标回放，
+             不再调用视觉模型（省时且省钱）。 -->
+        <el-tooltip
+          content="把本次执行每一步的目标坐标固化成脚本。之后执行这个脚本不需要再调 AI，速度快很多；改了界面才会回退到 AI 重新定位。"
+          placement="bottom"
+        >
+          <el-button
+            type="warning"
+            size="small"
+            :loading="freezing"
+            :disabled="!props.recordId"
+            @click="handleFreeze"
+          >
+            <el-icon><MagicStick /></el-icon>
+            固化为脚本
+          </el-button>
+        </el-tooltip>
       </div>
 
       <!-- 摘要报告 -->
@@ -142,11 +159,33 @@
                 <div class="step-action">
                   <strong>操作:</strong> {{ step.action || '-' }}
                 </div>
+                <!-- 步骤说明：优先展示引擎给的 name（如"点击天气标签"），
+                     它比 action 名更能说明这一步在做什么 -->
                 <div v-if="step.element" class="step-element">
-                  <strong>元素:</strong> {{ step.element }}
+                  <strong>说明:</strong> {{ step.element }}
+                </div>
+                <div v-if="step.prompt" class="step-prompt">
+                  <strong>指令:</strong> {{ step.prompt }}
                 </div>
                 <div v-if="step.thinking" class="step-thinking">
                   <strong>思考:</strong> {{ step.thinking }}
+                </div>
+                <div v-if="step.error" class="step-error">
+                  <strong>失败原因:</strong> {{ step.error }}
+                </div>
+              </div>
+              <!-- 这一步的真机实拍截图（步骤 ↔ 画面一一对应） -->
+              <div v-if="step.screenshot" class="step-shot">
+                <el-image
+                  :src="step.screenshot"
+                  :preview-src-list="[step.screenshot]"
+                  :initial-index="0"
+                  fit="contain"
+                  class="step-shot-img"
+                  preview-teleported
+                />
+                <div class="step-shot-hint">
+                  {{ step.is_failure_shot ? '失败时截图' : '该步骤执行后截图' }}（点击可放大）
                 </div>
               </div>
             </el-card>
@@ -249,10 +288,12 @@
 
 <script setup>
 import { ref, watch, nextTick, computed } from 'vue'
-import { Loading, VideoPlay, Download } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { Loading, VideoPlay, Download, MagicStick } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
-import { getAIExecutionReport, exportAIExecutionReportPDF } from '@/api/ui_automation'
+import {
+  getAIExecutionReport, exportAIExecutionReportPDF, freezeCaseToScript
+} from '@/api/ui_automation'
 
 const props = defineProps({
   modelValue: {
@@ -518,6 +559,54 @@ const getStepStatusType = (status) => {
   return typeMap[status] || 'info'
 }
 
+// 固化为确定性脚本：把本次执行每步的目标坐标写成 TestCaseStep，
+// 之后回放走坐标点击，不再调用视觉模型。
+const freezing = ref(false)
+
+const handleFreeze = async () => {
+  if (!props.recordId) {
+    ElMessage.error('缺少执行记录 ID，无法固化')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '把本次执行每一步的坐标固化成脚本。\n\n' +
+      '固化后执行脚本不需要再调用 AI（快很多），只有界面改版导致点不到时才会回退 AI 重新定位。\n\n' +
+      '将新建一个「测试用例」，确定继续吗？',
+      '固化为脚本',
+      { confirmButtonText: '固化', cancelButtonText: '取消', type: 'info' }
+    )
+  } catch (e) {
+    return
+  }
+
+  freezing.value = true
+  try {
+    const res = await freezeCaseToScript({ execution_id: props.recordId })
+    const data = res.data || {}
+    if (!data.success) {
+      ElMessage.error(data.message || '固化失败')
+      return
+    }
+    ElMessage.success(data.message || '固化完成')
+    // 有跳过项时把原因说清楚，别让用户以为全固化了
+    if (data.skipped && data.skipped.length) {
+      const detail = data.skipped
+        .map((s) => `第 ${s.step} 步（${s.action}）：${s.reason}`)
+        .join('；')
+      ElMessageBox.alert(
+        `以下步骤没有坐标、未固化，需要时请在「测试用例」里手工补上：\n\n${detail}`,
+        '部分步骤被跳过',
+        { type: 'warning' }
+      )
+    }
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || '固化失败')
+  } finally {
+    freezing.value = false
+  }
+}
+
 // 导出报告
 const exportReport = async () => {
   if (!props.recordId) {
@@ -744,6 +833,38 @@ const handleClose = () => {
 .step-thinking {
   color: #909399;
   font-style: italic;
+}
+
+.step-prompt {
+  color: #606266;
+  word-break: break-all;
+}
+
+.step-error {
+  color: #f56c6c;
+  word-break: break-all;
+}
+
+/* 每步的真机实拍截图：限制高度避免一张图占满屏，点击可放大 */
+.step-shot {
+  margin-top: 10px;
+  border-top: 1px dashed #ebeef5;
+  padding-top: 10px;
+}
+
+.step-shot-img {
+  max-width: 260px;
+  max-height: 480px;
+  border: 1px solid #ebeef5;
+  border-radius: 4px;
+  cursor: zoom-in;
+  display: block;
+}
+
+.step-shot-hint {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 4px;
 }
 
 .performance-metrics {

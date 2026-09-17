@@ -180,6 +180,8 @@ for col, ddl in (
     # 画布所属文件夹（墨刀页面树层级），对应迁移 0016_modao_page_folder；
     # prod 的 manage.py migrate 不可用，必须在这里兜底，否则 modao_list 会因缺列 500。
     ('folder', "ALTER TABLE modao_page ADD COLUMN folder VARCHAR(500) NOT NULL DEFAULT ''"),
+    # 画布父级分组（2026-09-17 新增，用于层级展示）
+    ('parent_name', "ALTER TABLE modao_page ADD COLUMN parent_name VARCHAR(200) NOT NULL DEFAULT ''"),
 ):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
@@ -315,6 +317,36 @@ if not cur.fetchone():
 else:
     print('needs_review already exists')
 
+# 确保移动设备表有 wda_host / wda_port 列（iOS 远端 WDA：与 adb_host 对称，
+# 后端通过 http://<wda_host>:<wda_port> 驱动插在其它电脑上的 iPhone）
+for _col, _ddl in (
+    ('wda_host', "ALTER TABLE app_devices ADD COLUMN wda_host VARCHAR(50) NOT NULL DEFAULT ''"),
+    ('wda_port', 'ALTER TABLE app_devices ADD COLUMN wda_port INT NOT NULL DEFAULT 8100'),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'app_devices' AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute(_ddl)
+        print('ensured column %s on app_devices' % _col)
+    else:
+        print('%s already exists on app_devices' % _col)
+
+# 确保业务动作表有 category 列（公共步骤分类：前置准备/业务操作/数据提取/
+# 收尾清理/其他）。老库没有该列时列表接口会 500，故幂等补齐。
+cur.execute(
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = DATABASE() AND table_name = 'ui_business_actions' AND column_name = 'category'",
+)
+if not cur.fetchone():
+    cur.execute(
+        "ALTER TABLE ui_business_actions ADD COLUMN category VARCHAR(20) NOT NULL DEFAULT 'business'")
+    print('ensured column category on ui_business_actions')
+else:
+    print('category already exists on ui_business_actions')
+
 # 确保 AI 用例表的 app_config_id / device_id 允许为空。
 # 背景：该表是老表，部分环境建成了 NOT NULL DEFAULT 0，但模型 AICase.app_config / device
 # 均为 null=True。Django 插入时会显式写 NULL，在严格模式下直接报
@@ -336,6 +368,44 @@ for _col in ('app_config_id', 'device_id'):
         print('ensured column %s on ui_ai_cases is nullable' % _col)
     else:
         print('%s on ui_ai_cases already nullable' % _col)
+
+# 确保 AI 用例表有 auto_dismiss_popup / steps_frozen_at 列（弹窗自动处理 + 坐标回放）
+for _col, _ddl in (
+    ('auto_dismiss_popup',
+     'ALTER TABLE ui_ai_cases ADD COLUMN auto_dismiss_popup TINYINT(1) NOT NULL DEFAULT 1'),
+    ('steps_frozen_at',
+     'ALTER TABLE ui_ai_cases ADD COLUMN steps_frozen_at DATETIME NULL'),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute(_ddl)
+        print('ensured column %s on ui_ai_cases' % _col)
+    else:
+        print('%s already exists on ui_ai_cases' % _col)
+
+# 确保 AI 执行记录表有 token 统计 + error_message 列
+for _col, _ddl in (
+    ('model_calls', 'ALTER TABLE ui_ai_execution_record ADD COLUMN model_calls INT NOT NULL DEFAULT 0'),
+    ('prompt_tokens', 'ALTER TABLE ui_ai_execution_record ADD COLUMN prompt_tokens INT NOT NULL DEFAULT 0'),
+    ('completion_tokens', 'ALTER TABLE ui_ai_execution_record ADD COLUMN completion_tokens INT NOT NULL DEFAULT 0'),
+    ('tokens_estimated', 'ALTER TABLE ui_ai_execution_record ADD COLUMN tokens_estimated TINYINT(1) NOT NULL DEFAULT 0'),
+    ('replay_mode', 'ALTER TABLE ui_ai_execution_record ADD COLUMN replay_mode TINYINT(1) NOT NULL DEFAULT 0'),
+    ('error_message', "ALTER TABLE ui_ai_execution_record ADD COLUMN error_message LONGTEXT NOT NULL DEFAULT ('')"),
+):
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_execution_record' AND column_name = %s",
+        (_col,),
+    )
+    if not cur.fetchone():
+        cur.execute(_ddl)
+        print('ensured column %s on ui_ai_execution_record' % _col)
+    else:
+        print('%s already exists on ui_ai_execution_record' % _col)
 
 # ui_ai_cases.steps 在老库是 text（上限 64KB，且无法做 JSON 查询），迁移后应为 json。
 # 只有现存数据全部是合法 JSON 时才转换，避免 ALTER 失败阻断启动。

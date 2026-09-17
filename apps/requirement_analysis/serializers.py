@@ -1,4 +1,5 @@
-from rest_framework import serializers
+﻿from rest_framework import serializers
+import json
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig, TestCaseGenerationTask,
@@ -387,13 +388,30 @@ class ClarificationQuestionSerializer(serializers.ModelSerializer):
 
 
 class ModaoPageSerializer(serializers.ModelSerializer):
-    """墨刀单页提取结果序列化器（含 A2-b 画布级流水线状态）"""
+    """墨刀单页提取结果序列化器（含 A2-c 画布级流水线产物）"""
+    screenshot_segments = serializers.SerializerMethodField()
+
+    def get_screenshot_segments(self, obj):
+        raw = getattr(obj, 'screenshot_segments', '') or ''
+        if isinstance(raw, str):
+            try:
+                val = json.loads(raw)
+            except Exception:
+                val = []
+        else:
+            val = raw or []
+        return [s for s in val if isinstance(s, str) and s] if isinstance(val, list) else []
+
     class Meta:
         model = ModaoPage
         fields = [
             'id', 'page_no', 'page_name', 'text', 'annotations', 'screenshot',
-            'selected', 'recognition_note',
+            'screenshot_segments',
+            'selected', 'recognition_note', 'parent_name',
+            'folder',
             'current_stage', 'stage_status', 'work_log', 'error_message', 'rerun_stages',
+            'page_summary', 'page_clarification', 'page_testpoints_json',
+            'page_testcases_json', 'page_smoke_json', 'page_approved',
         ]
 
 
@@ -415,6 +433,7 @@ class ModaoPrototypeSerializer(serializers.ModelSerializer):
             'dedup_audit_json', 'smoke_json', 'quality_report_json', 'excel_path', 'stage4_decision',
             'error_message', 'work_log', 'qa_log', 'project', 'project_name', 'created_by_name', 'created_at', 'updated_at',
             'pages', 'confirmations', 'feature_module_info', 'generation_gate',
+            'merged_testcases_json', 'merged_smoke_json',
         ]
         read_only_fields = [
             'id', 'uuid', 'status', 'current_stage', 'extracted_json', 'requirement_summary',
@@ -422,6 +441,7 @@ class ModaoPrototypeSerializer(serializers.ModelSerializer):
             'final_testpoints_json', 'dedup_audit_json', 'testcases_json', 'smoke_json', 'quality_report_json',
             'excel_path', 'stage4_decision', 'error_message', 'work_log', 'qa_log', 'created_by_name',
             'created_at', 'updated_at', 'pages', 'confirmations', 'generation_gate',
+            'merged_testcases_json', 'merged_smoke_json',
         ]
 
     def get_confirmations(self, obj):

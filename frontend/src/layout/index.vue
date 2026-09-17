@@ -101,117 +101,108 @@
             </el-menu-item>
           </template>
 
-          <!-- UI自动化测试模块菜单 -->
-          <template v-else-if="currentModule === 'ui-automation'">
-            <el-menu-item index="/ui-automation/dashboard">
+          <!-- 自动化测试模块菜单（原「UI自动化测试」+「App自动化测试」合并）
+               分组原则：通用的放前面（看板/项目/设备/应用），
+               平台独有的各自归类（Web 端 / 真机端），结果类的放最后。
+               路由前缀保持原样，只是入口合并，页面地址不变。 -->
+          <template v-else-if="currentModule === 'automation'">
+            <!-- 通用 -->
+            <el-menu-item index="/automation/dashboard">
               <el-icon><Odometer /></el-icon>
               <span>数据看板</span>
             </el-menu-item>
-            <el-menu-item index="/ui-automation/projects">
-              <el-icon><Folder /></el-icon>
-              <span>项目管理</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/elements-enhanced">
-              <el-icon><Aim /></el-icon>
-              <span>元素管理</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/test-cases">
-              <el-icon><Document /></el-icon>
-              <span>用例管理</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/scripts-enhanced">
-              <el-icon><Edit /></el-icon>
-              <span>脚本生成</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/scripts">
-              <el-icon><DocumentCopy /></el-icon>
-              <span>脚本列表</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/suites">
-              <el-icon><Collection /></el-icon>
-              <span>套件管理</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/executions">
-              <el-icon><VideoPlay /></el-icon>
-              <span>执行记录</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/reports">
-              <el-icon><DataAnalysis /></el-icon>
-              <span>测试报告</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/scheduled-tasks">
-              <el-icon><AlarmClock /></el-icon>
-              <span>定时任务</span>
-            </el-menu-item>
-            <el-menu-item index="/ui-automation/notification-logs">
-              <el-icon><Bell /></el-icon>
-              <span>通知列表</span>
+            <el-menu-item index="/ui-automation/app-devices">
+              <el-icon><Iphone /></el-icon>
+              <span>设备管理</span>
             </el-menu-item>
             <el-menu-item index="/ui-automation/app">
               <el-icon><Cellphone /></el-icon>
               <span>应用配置</span>
             </el-menu-item>
+
+            <el-menu-item-group title="Web 端">
+              <el-menu-item index="/ui-automation/projects">
+                <el-icon><Folder /></el-icon>
+                <span>项目管理</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/elements-enhanced">
+                <el-icon><Aim /></el-icon>
+                <span>元素管理</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/test-cases">
+                <el-icon><Document /></el-icon>
+                <span>用例管理</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/scripts-enhanced">
+                <el-icon><Edit /></el-icon>
+                <span>脚本生成</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/scripts">
+                <el-icon><DocumentCopy /></el-icon>
+                <span>脚本列表</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/suites">
+                <el-icon><Collection /></el-icon>
+                <span>套件管理</span>
+              </el-menu-item>
+            </el-menu-item-group>
+
+            <el-menu-item-group title="真机 App">
+              <el-menu-item index="/app-automation/devices">
+                <el-icon><Iphone /></el-icon>
+                <span>App 设备（独立）</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/recorder">
+                <el-icon><Monitor /></el-icon>
+                <span>真机录制</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/test-cases">
+                <el-icon><Document /></el-icon>
+                <span>用例管理</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/elements">
+                <el-icon><Aim /></el-icon>
+                <span>元素管理</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/suites">
+                <el-icon><Collection /></el-icon>
+                <span>套件管理</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/pipeline">
+                <el-icon><MagicStick /></el-icon>
+                <span>流水线运行</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/packages">
+                <el-icon><Box /></el-icon>
+                <span>安装包管理</span>
+              </el-menu-item>
+              <el-menu-item index="/app-automation/settings">
+                <el-icon><Setting /></el-icon>
+                <span>系统设置</span>
+              </el-menu-item>
+            </el-menu-item-group>
+
+            <!-- 结果 -->
+            <el-menu-item-group title="结果">
+              <el-menu-item index="/ui-automation/executions">
+                <el-icon><VideoPlay /></el-icon>
+                <span>执行记录</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/reports">
+                <el-icon><DataAnalysis /></el-icon>
+                <span>测试报告</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/scheduled-tasks">
+                <el-icon><AlarmClock /></el-icon>
+                <span>定时任务</span>
+              </el-menu-item>
+              <el-menu-item index="/ui-automation/notification-logs">
+                <el-icon><Bell /></el-icon>
+                <span>通知列表</span>
+              </el-menu-item>
+            </el-menu-item-group>
           </template>
 
-          <!-- App自动化测试模块菜单 -->
-          <template v-else-if="currentModule === 'app-automation'">
-            <el-menu-item index="/app-automation/dashboard">
-              <el-icon><Odometer /></el-icon>
-              <span>数据看板</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/devices">
-              <el-icon><Iphone /></el-icon>
-              <span>设备管理</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/projects">
-              <el-icon><Folder /></el-icon>
-              <span>项目管理</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/suites">
-              <el-icon><Collection /></el-icon>
-              <span>套件管理</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/test-cases">
-              <el-icon><Document /></el-icon>
-              <span>用例管理</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/recorder">
-              <el-icon><Monitor /></el-icon>
-              <span>真机录制</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/elements">
-              <el-icon><Aim /></el-icon>
-              <span>元素管理</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/executions">
-              <el-icon><VideoPlay /></el-icon>
-              <span>执行记录</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/pipeline">
-              <el-icon><MagicStick /></el-icon>
-              <span>流水线运行</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/reports">
-              <el-icon><DataAnalysis /></el-icon>
-              <span>测试报告</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/scheduled-tasks">
-              <el-icon><AlarmClock /></el-icon>
-              <span>定时任务</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/packages">
-              <el-icon><Box /></el-icon>
-              <span>安装包管理</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/settings">
-              <el-icon><Setting /></el-icon>
-              <span>系统设置</span>
-            </el-menu-item>
-            <el-menu-item index="/app-automation/notification">
-              <el-icon><Bell /></el-icon>
-              <span>通知日志</span>
-            </el-menu-item>
-          </template>
 
           <!-- 缺陷管理模块菜单 -->
           <template v-else-if="currentModule === 'defects'">
@@ -251,9 +242,17 @@
               <el-icon><Document /></el-icon>
               <span>AI 用例管理</span>
             </el-menu-item>
+            <el-menu-item index="/ai-intelligent-mode/business-actions">
+              <el-icon><Collection /></el-icon>
+              <span>公共步骤库</span>
+            </el-menu-item>
             <el-menu-item index="/ai-intelligent-mode/midscene-playground">
               <el-icon><MagicStick /></el-icon>
               <span>Midscene Playground</span>
+            </el-menu-item>
+            <el-menu-item index="/ai-intelligent-mode/midscene-web-playground">
+              <el-icon><Monitor /></el-icon>
+              <span>Midscene Web Playground</span>
             </el-menu-item>
             <el-menu-item index="/ai-intelligent-mode/execution-records">
               <el-icon><Timer /></el-icon>
@@ -365,8 +364,12 @@ const userStore = useUserStore()
 const currentModule = computed(() => {
   if (route.path.startsWith('/ai-generation')) return 'ai-generation'
   if (route.path.startsWith('/api-testing')) return 'api-testing'
-  if (route.path.startsWith('/ui-automation')) return 'ui-automation'
-  if (route.path.startsWith('/app-automation')) return 'app-automation'
+  // UI / App 自动化已合并为一个模块：三个前缀都归 automation，
+  // 这样无论从首页卡片的 /automation 还是旧书签的 /ui-automation 进来，
+  // 左侧都会渲染同一套（分组）菜单。
+  if (route.path.startsWith('/automation')) return 'automation'
+  if (route.path.startsWith('/ui-automation')) return 'automation'
+  if (route.path.startsWith('/app-automation')) return 'automation'
   if (route.path.startsWith('/defects')) return 'defects'
   if (route.path.startsWith('/data-factory')) return 'data-factory'
   if (route.path.startsWith('/ai-intelligent-mode')) return 'ai-intelligent-mode'
@@ -378,8 +381,7 @@ const moduleName = computed(() => {
   const map = {
     'ai-generation': 'AI用例生成',
     'api-testing': '接口测试',
-    'ui-automation': 'UI自动化测试',
-    'app-automation': 'App自动化测试',
+    'automation': '自动化测试',
     'defects': '缺陷管理',
     'data-factory': '数据工厂',
     'ai-intelligent-mode': 'AI 智能模式',
@@ -392,8 +394,7 @@ const moduleHomePath = computed(() => {
   const map = {
     'ai-generation': '/ai-generation/requirement-analysis',
     'api-testing': '/api-testing',
-    'ui-automation': '/ui-automation',
-    'app-automation': '/app-automation',
+    'automation': '/automation/dashboard',
     'defects': '/defects',
     'data-factory': '/data-factory',
     'ai-intelligent-mode': '/ai-intelligent-mode',
@@ -429,7 +430,8 @@ const breadcrumbTitle = computed(() => {
     '/api-testing/scheduled-tasks': '定时任务',
     '/api-testing/notification-logs': '通知列表',
     
-    // UI自动化测试
+    // 自动化测试（UI / App 合并）
+    '/automation/dashboard': '数据看板',
     '/ui-automation/dashboard': '数据看板',
     '/ui-automation/projects': '项目管理',
     '/ui-automation/elements-enhanced': '元素管理',
@@ -441,6 +443,7 @@ const breadcrumbTitle = computed(() => {
     '/ui-automation/reports': '测试报告',
     '/ui-automation/scheduled-tasks': '定时任务',
     '/ui-automation/notification-logs': '通知列表',
+    '/ui-automation/app-devices': '设备管理',
     
     // App自动化测试
     '/app-automation/dashboard': '数据看板',
@@ -469,7 +472,9 @@ const breadcrumbTitle = computed(() => {
     // AI 智能模式
     '/ai-intelligent-mode/testing': 'AI 智能测试',
     '/ai-intelligent-mode/cases': 'AI 用例管理',
+    '/ai-intelligent-mode/business-actions': '公共步骤库',
     '/ai-intelligent-mode/midscene-playground': 'Midscene Playground',
+    '/ai-intelligent-mode/midscene-web-playground': 'Midscene Web Playground',
     '/ai-intelligent-mode/execution-records': 'AI 测试报告',
 
     

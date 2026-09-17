@@ -20,10 +20,18 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
+from .popup_handler import dismiss_popups, PopupAdapter
+
 logger = logging.getLogger(__name__)
 
 # ${{key}} 模板占位符正则
 CONTEXT_VAR_PATTERN = re.compile(r"\$\{\{(\s*[\w.-]+\s*)\}\}")
+
+# 随机弹窗（权限请求 / 隐私协议 / 开屏广告 ……）的自动处理。
+# 开关：设 POPUP_AUTO_DISMISS=0 可关闭，方便那些"专门测弹窗"的用例。
+POPUP_AUTO_DISMISS = os.environ.get('POPUP_AUTO_DISMISS', '1') not in ('0', 'false', 'False', '')
+# 某一步失败后，最多"关弹窗 + 重试"几次
+POPUP_RETRY_LIMIT = int(os.environ.get('POPUP_RETRY_LIMIT', '2') or 2)
 
 # 坐标/像素写法护栏：用例必须用语义描述，禁止写死坐标，否则换机型必错位
 # 命中规则（兼顾 midscene bbox=[x,y,x,y] 与单点 [x,y]，但尽量不误伤业务数字）：
@@ -87,7 +95,9 @@ class MidsceneAppEngine:
     }
 
     def __init__(self, app_config, device, model_config: Optional[dict] = None,
-                 launch_wait_ms: int = 6000, workspace: Optional[str] = None):
+                 launch_wait_ms: int = 6000, workspace: Optional[str] = None,
+                 auto_dismiss_popup: Optional[bool] = None,
+                 replay_mode: bool = False):
         """
         Args:
             app_config: AppConfig 实例（含 package_name / app_activity）
@@ -96,6 +106,10 @@ class MidsceneAppEngine:
                           为空时从 AIModelConfig(role='midscene_vision') 读取
             launch_wait_ms: 启动 APP 后等待毫秒
             workspace: 截图/日志工作目录
+            auto_dismiss_popup: 弹窗自动处理。None=用全局默认（环境变量），
+                                True/False=用例配置优先
+            replay_mode: 纯坐标回放。用例已固化时开启，每步直接按坐标点，
+                         不调用视觉模型。
         """
         self.app_config = app_config
         self.device = device
@@ -103,6 +117,10 @@ class MidsceneAppEngine:
         self.workspace = workspace or os.path.join('media', 'midscene')
         os.makedirs(self.workspace, exist_ok=True)
 
+        self.auto_dismiss_popup = (
+            POPUP_AUTO_DISMISS if auto_dismiss_popup is None else bool(auto_dismiss_popup)
+        )
+        self.replay_mode = bool(replay_mode)
         self.model_config = model_config or self._load_model_config()
         # 运行期对象（lazy init）
         self._page = None  # Midscene AndroidPage 实例
@@ -278,17 +296,39 @@ class MidsceneAppEngine:
             if not isinstance(s, dict):
                 resolved.append(s)
                 continue
-            ref = s.get('ref')
-            if ref and 'action' not in s:
+            # A step carrying "ref" is a REFERENCE and gets expanded.
+            # The old condition also required "action" to be absent, which
+            # silently kept a half-filled step (ref + leftover action) as-is
+            # and executed nothing at all - hard to notice, harder to debug.
+            ref = (s.get('ref') or '').strip() if isinstance(s.get('ref'), str) else s.get('ref')
+            if ref:
                 try:
                     action_obj = BusinessAction.objects.get(name=ref)
-                    merged = action_obj.to_step()
-                    # 允许内联覆盖（ref 之外传入的字段）
-                    merged.update({k: v for k, v in s.items() if k != 'ref'})
-                    resolved.append(merged)
                 except BusinessAction.DoesNotExist:
-                    self._log("[警告] 业务动作 %s 不存在，跳过", ref)
+                    self._log("[警告] 公共步骤「%s」不存在，该步已跳过", ref)
+                    resolved.append({
+                        'name': '引用公共步骤 %s' % ref,
+                        'action': 'screenshot',
+                        'prompt': ref,
+                        '_ref_missing': ref,
+                        '_status': 'failed',
+                        '_error': '公共步骤「%s」不存在' % ref,
+                    })
                     continue
+
+                merged = action_obj.to_step()
+                # 允许内联覆盖（ref 之外传入的字段）
+                overrides = [k for k in s.keys() if k not in ('ref',)]
+                merged.update({k: v for k, v in s.items() if k not in ('ref',)})
+                # 日志里展开引用内容，否则失败时不知道是哪个公共步骤的问题
+                self._log("引用公共步骤「%s」-> %s: %s",
+                          ref, merged.get('action'),
+                          (merged.get('prompt') or '')[:120])
+                if overrides:
+                    self._log("  覆盖字段: %s", ', '.join(overrides))
+                merged['_ref'] = ref
+                merged['name'] = merged.get('name') or ref
+                resolved.append(merged)
             else:
                 resolved.append(s)
         return resolved
@@ -299,6 +339,23 @@ class MidsceneAppEngine:
             self.connect()
         # 展开业务动作引用（Prompt 与代码分离）
         steps = self._resolve_business_refs(steps)
+        # 空步骤必须显式失败：以前 action 会兜底成 aiAct、prompt 兜底成空串，
+        # 拿着空提示词问视觉模型，模型随便点一下也返回成功 ——
+        # 用例其实什么都没配，执行却显示「通过」。
+        empty = [i for i, s in enumerate(steps)
+                 if isinstance(s, dict) and not self._step_has_content(s)]
+        if empty:
+            bad = empty[0]
+            msg = ('第 %d 个步骤是空的：既没有 action 也没有 prompt。'
+                   '请到「用例编辑」里补全该步骤（或删除它）' % (bad + 1))
+            self._log('%s', msg)
+            return {
+                'status': 'failed',
+                'steps': [{'index': bad, 'name': '步骤%d' % (bad + 1),
+                           'action': '', 'status': 'failed', 'error': msg}],
+                'context': self.context,
+                'error': msg,
+            }
         result = {
             'status': 'passed',
             'steps': [],
@@ -315,6 +372,25 @@ class MidsceneAppEngine:
 
         for idx, step in enumerate(steps):
             step_result = self._run_step(step, idx)
+
+            # 随机弹窗（权限请求 / 隐私协议 / 开屏广告 ……）随时可能冒出来，
+            # 一旦挡住目标元素这一步就会失败。这里做「关弹窗 + 重试」，
+            # 正常路径（没弹窗）零额外开销。
+            try_count = 0
+            while (step_result.get('status') == 'failed'
+                   and self.auto_dismiss_popup
+                   and try_count < POPUP_RETRY_LIMIT):
+                try_count += 1
+                self._log('[步骤 %d] 失败，检测是否为弹窗干扰（第 %d/%d 次重试）...',
+                          idx + 1, try_count, POPUP_RETRY_LIMIT)
+                if dismiss_popups(self._popup_adapter()) == 0:
+                    self._log('[步骤 %d] 未发现弹窗，不再重试', idx + 1)
+                    break
+                step_result = self._run_step(step, idx)
+                if step_result.get('status') != 'failed':
+                    self._log('[步骤 %d] 关闭弹窗后重试成功', idx + 1)
+                    break
+
             result['steps'].append(step_result)
             if step_result.get('status') == 'failed':
                 result['status'] = 'failed'
@@ -323,6 +399,20 @@ class MidsceneAppEngine:
 
         result['context'] = self.context
         return result
+
+    def _popup_adapter(self):
+        """把本引擎的能力包成 popup_handler 需要的接口。"""
+        page = self._page
+        return _AndroidPopupAdapter(page, self._log)
+
+    @staticmethod
+    def _step_has_content(step: dict) -> bool:
+        """步骤是否可执行：引用步骤看 ref，内联步骤看 action/prompt。"""
+        if str(step.get('ref') or '').strip():
+            return True
+        if str(step.get('action') or '').strip():
+            return True
+        return bool(str(step.get('prompt') or '').strip())
 
     def _run_step(self, step: dict, idx: int) -> Dict[str, Any]:
         action = step.get('action', 'aiAct')
@@ -362,16 +452,30 @@ class MidsceneAppEngine:
             elif action == 'wait':
                 time.sleep(wait_ms / 1000.0)
             elif action == 'aiTap':
-                # 确定性点击：target 来自 selector_hint 或 prompt
-                target = step.get('selector_hint') or prompt
-                self._page.ai_tap(target)
+                # 纯坐标回放：直接用固化坐标点，不调模型
+                if self.replay_mode and self._step_has_coords(step):
+                    self._replay_tap(step)
+                else:
+                    # 确定性点击：target 来自 selector_hint 或 prompt
+                    target = step.get('selector_hint') or prompt
+                    self._page.ai_tap(target)
+                    self._count_model_use(prompt)
             elif action == 'aiInput':
-                self._page.ai_input(step.get('selector_hint') or prompt, value)
+                if self.replay_mode and self._step_has_coords(step):
+                    self._replay_input(step, value)
+                else:
+                    self._page.ai_input(step.get('selector_hint') or prompt, value)
+                    self._count_model_use(prompt)
             elif action == 'aiAct':
-                self._page.ai_action(prompt)
+                if self.replay_mode and self._step_has_coords(step):
+                    self._replay_tap(step)
+                else:
+                    self._page.ai_action(prompt)
+                    self._count_model_use(prompt)
             elif action == 'aiQuery':
                 # 纯查询（不改动页面），结果存入 extract 或返回
                 data = self._page.ai_query(prompt)
+                self._count_model_use(prompt)
                 step_result['extract']['_query'] = data
             elif action == 'assert':
                 ok = self._do_assert(step)
@@ -397,6 +501,14 @@ class MidsceneAppEngine:
             if wait_ms and action not in ('wait',):
                 time.sleep(wait_ms / 1000.0)
 
+            # 每步都留一张实拍截图，报告里才能"步骤 ↔ 画面"一一对应。
+            # 之前只有显式 screenshot 动作才截、失败才截，成功用例报告里一张图都没有。
+            if action != 'screenshot':
+                try:
+                    step_result['screenshot'] = self._page.get_screenshot()
+                except Exception as exc:  # noqa: BLE001
+                    self._log("[步骤 %d] 截图失败: %s", idx + 1, exc)
+
         except Exception as e:
             step_result['status'] = 'failed'
             step_result['error'] = str(e)
@@ -408,6 +520,63 @@ class MidsceneAppEngine:
                 pass
 
         return step_result
+
+    @staticmethod
+    def _step_has_coords(step: dict) -> bool:
+        """该步是否已经固化过坐标。"""
+        if not isinstance(step, dict):
+            return False
+        cx, cy = step.get('center_x'), step.get('center_y')
+        if cx is None or cy is None:
+            return False
+        try:
+            int(cx), int(cy)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _count_model_use(prompt: str = ''):
+        """估算并累加一次模型调用的 token。
+
+        真实 usage 由 LLM 代理记录；这里只是兜底，保证即使代理没生效，
+        "这次执行花了多少"也有个可比的数字。
+        """
+        try:
+            from .llm_usage import record_step_estimate
+            record_step_estimate(prompt=prompt)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _replay_tap(self, step: dict):
+        """纯坐标点击：不经过视觉模型。"""
+        cx = int(step['center_x'])
+        cy = int(step['center_y'])
+        self._log('[回放] tap -> (%d, %d)  [零模型]', cx, cy)
+        page = self._page
+        # midscene 的 page 对象暴露的坐标点击入口随版本略有差异，按优先级尝试
+        for name in ('tap', 'click', 'tap_point', 'click_point'):
+            fn = getattr(page, name, None)
+            if callable(fn):
+                fn(cx, cy)
+                return
+        # 兜底：走 adb 的 input tap（完全绕开模型）
+        self._page.run_adb_shell('input tap %d %d' % (cx, cy))
+
+    def _replay_input(self, step: dict, value: str):
+        """点输入框（坐标）后输入文本，不经过视觉模型。"""
+        self._replay_tap(step)
+        time.sleep(0.4)
+        page = self._page
+        for name in ('input_text', 'inputText'):
+            fn = getattr(page, name, None)
+            if callable(fn):
+                fn(value or '')
+                return
+        # 兜底：adb 文本输入（注意 adb input text 不支持中文/空格，需要时由
+        # 使用者改用 aiInput 的 AI 路径）
+        safe = (value or '').replace(' ', '%s')
+        self._page.run_adb_shell('input text "%s"' % safe)
 
     def _do_extract(self, extract_list: List[dict]) -> Dict[str, Any]:
         """调用 ai_query 提取结构化业务数据，按 type 解析后返回 {key: value}。"""
@@ -466,3 +635,20 @@ class MidsceneAppEngine:
         line = "[%s] %s" % (ts, msg)
         self.logs.append(line)
         logger.info("[Midscene] %s", msg)
+
+
+class _AndroidPopupAdapter(PopupAdapter):
+    """把 midscene 的 page 对象适配成 popup_handler 的接口。"""
+
+    def __init__(self, page, log_func):
+        self._page = page
+        self._log_func = log_func
+
+    def query(self, prompt: str):
+        return self._page.ai_query(prompt)
+
+    def tap(self, target: str) -> None:
+        self._page.ai_tap(target)
+
+    def log(self, msg: str) -> None:
+        self._log_func('%s', msg)

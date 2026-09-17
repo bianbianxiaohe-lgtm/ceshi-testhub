@@ -3580,10 +3580,10 @@ export default {
     startStreamingProgress() {
       // 使用SSE进行流式进度获取
       // 注意：EventSource不使用axios代理，需要直接指向后端服务器
-      // 完整的URL路径: /api/requirement-analysis/api/testcase-generation/{task_id}/stream_progress/
+      // 完整的URL路径: /requirement-analysis/api/testcase-generation/{task_id}/stream_progress/
       const isDev = import.meta.env.DEV
       const baseUrl = isDev ? 'http://127.0.0.1:8000' : ''
-      const apiUrl = `${baseUrl}/api/requirement-analysis/api/testcase-generation/${this.currentTaskId}/stream_progress/`
+      const apiUrl = `${baseUrl}/requirement-analysis/api/testcase-generation/${this.currentTaskId}/stream_progress/`
 
       console.log('SSE连接URL:', apiUrl)
 

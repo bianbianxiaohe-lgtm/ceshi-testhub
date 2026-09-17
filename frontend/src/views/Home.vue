@@ -37,23 +37,15 @@
           <p>高效的接口自动化测试与管理</p>
         </div>
 
-        <!-- UI自动化测试（Web） -->
-        <div class="nav-card" @click="handleNavigate('ui')" role="button" tabindex="0">
+        <!-- 自动化测试（Web UI + 真机 App 合并入口，具体分类在左侧菜单里） -->
+        <div class="nav-card" @click="handleNavigate('automation')" role="button" tabindex="0">
           <div class="card-icon ui-icon">
             <el-icon><Monitor /></el-icon>
           </div>
-          <h3>UI自动化测试</h3>
-          <p>可视化的Web UI自动化测试</p>
+          <h3>自动化测试</h3>
+          <p>Web UI 与真机 App 自动化测试统一入口</p>
         </div>
 
-        <!-- App自动化测试 -->
-        <div class="nav-card" @click="handleNavigate('app')" role="button" tabindex="0">
-          <div class="card-icon app-icon">
-            <el-icon><Iphone /></el-icon>
-          </div>
-          <h3>App自动化测试</h3>
-          <p>真机/模拟器App自动化录制与执行</p>
-        </div>
 
         <!-- 数据工厂 -->
         <div class="nav-card" @click="handleNavigate('data')" role="button" tabindex="0">
@@ -123,8 +115,8 @@ const handleNavigate = (type) => {
   const routes = {
     'ai': '/ai-generation/requirement-analysis',
     'api': '/api-testing/dashboard',
-    'ui': '/ui-automation/dashboard',
-    'app': '/app-automation/devices',
+    // UI / App 已合并为一个入口，默认进「自动化测试」首页
+    'automation': '/automation/dashboard',
     'ai-intelligent': '/ai-intelligent-mode/testing',
     'assistant': '/ai-generation/assistant',
     'config': '/configuration/ai-model'

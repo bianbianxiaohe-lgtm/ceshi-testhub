@@ -83,6 +83,42 @@
       </el-collapse>
     </div>
 
+    <!-- 功能点清单折叠卡片（AI 生成依据，用例均挂 F 编号） -->
+    <div v-if="featurePointsText" class="review-feedback-card">
+      <el-collapse>
+        <el-collapse-item name="featurePoints">
+          <template #title>
+            <div class="collapse-title">
+              <span class="title-icon">🧭</span>
+              <span class="title-text">功能点清单</span>
+              <span class="title-hint">（AI 识别的功能点依据，建议先审清单再审用例）</span>
+            </div>
+          </template>
+          <div class="review-content">
+            <div class="review-text" v-html="formatReviewMarkdown(featurePointsText)"></div>
+          </div>
+        </el-collapse-item>
+      </el-collapse>
+    </div>
+
+    <!-- 建议补充 · 无需求依据（AI 脑补隔离区，供人工取舍） -->
+    <div v-if="suggestionText" class="review-feedback-card">
+      <el-collapse>
+        <el-collapse-item name="suggestions">
+          <template #title>
+            <div class="collapse-title">
+              <span class="title-icon">⚠️</span>
+              <span class="title-text">建议补充 · 无需求依据</span>
+              <span class="title-hint">（AI 认为有风险但需求未提及的场景，未进入正式用例，供人工取舍）</span>
+            </div>
+          </template>
+          <div class="review-content">
+            <div class="review-text" v-html="formatReviewMarkdown(suggestionText)"></div>
+          </div>
+        </el-collapse-item>
+      </el-collapse>
+    </div>
+
     <!-- AI评审报告折叠卡片 -->
     <div v-if="task.review_feedback" class="review-feedback-card">
       <el-collapse v-model="activeCollapse">
@@ -815,6 +851,20 @@ export default {
   },
 
   computed: {
+    featurePointsText() {
+      // 从模型原始输出中截取【功能点清单】段（旧任务无此段则不显示卡片）
+      return this.extractSection(this.task?.generated_test_cases || '', '【功能点清单】', [
+        /第[二两三]步/, /【/, /生成要求/, /\n\s*\d{1,4}[\.、)]/, /\n\s*\|/, /\n-{3,}/,
+      ])
+    },
+
+    suggestionText() {
+      // 从模型原始输出中截取【建议补充·无需求依据】隔离区
+      return this.extractSection(this.task?.generated_test_cases || '', '【建议补充', [
+        /【/, /\n\s*\d{1,4}[\.、)]/, /\n\s*\|/, /\n-{3,}/,
+      ])
+    },
+
     isAllSelected() {
       return this.testCases.length > 0 && this.selectedCases.length === this.testCases.length
     },
@@ -897,6 +947,19 @@ export default {
   },
 
   methods: {
+    /** 从原文中截取指定标记开始的段落，遇到任一结束模式即止 */
+    extractSection(src, startMarker, endPatterns) {
+      if (!src) return ''
+      const s = src.indexOf(startMarker)
+      if (s === -1) return ''
+      const rest = src.slice(s + startMarker.length)
+      let end = rest.length
+      for (const re of endPatterns) {
+        const m = re.exec(rest)
+        if (m && m.index < end) end = m.index
+      }
+      return rest.slice(0, end).trim()
+    },
     /** 返回用例记录列表 */
     goBack() {
       if (window.history.length > 1) {

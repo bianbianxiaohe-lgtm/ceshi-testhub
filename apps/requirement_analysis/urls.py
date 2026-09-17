@@ -25,12 +25,14 @@ from .views import (
 from .modao_views import (
     modao_list, modao_create, modao_extract, modao_reset, modao_terminate, modao_struct, modao_clarify, modao_design,
     modao_update_pages,
-    modao_generate_cases, modao_approve_case_generation,
-    modao_confirm, modao_smoke, modao_detail, modao_excel,     modao_edit, modao_ask, modao_adopt,
+    modao_generate_cases, modao_approve_case_generation, modao_approve_pages,
+    modao_confirm, modao_smoke, modao_detail, modao_excel,     modao_edit,
+    modao_page_edit, modao_ask, modao_adopt,
     modao_adopt_single,
     modao_log_viewer, modao_log_raw,
     modao_export_xmind, modao_import_xmind,
     modao_page_reset,
+    modao_folders, modao_select_by_folder,
 )
 
 # 创建DRF路由器
@@ -73,13 +75,18 @@ urlpatterns = [
     path('api/modao/<int:pk>/struct/', modao_struct, name='modao-struct'),
     path('api/modao/<int:pk>/update-pages/', modao_update_pages, name='modao-update-pages'),
     path('api/modao/<int:pk>/page-reset/', modao_page_reset, name='modao-page-reset'),
+    path('api/modao/<int:pk>/folders/', modao_folders, name='modao-folders'),
+    path('api/modao/<int:pk>/select-by-folder/', modao_select_by_folder, name='modao-select-by-folder'),
     path('api/modao/<int:pk>/clarify/', modao_clarify, name='modao-clarify'),
     path('api/modao/<int:pk>/design/', modao_design, name='modao-design'),
     path('api/modao/<int:pk>/generate-cases/', modao_generate_cases, name='modao-generate-cases'),
     path('api/modao/<int:pk>/approve-case-generation/', modao_approve_case_generation, name='modao-approve-case-generation'),
+    path('api/modao/<int:pk>/approve-pages/', modao_approve_pages, name='modao-approve-pages'),
     path('api/modao/<int:pk>/confirm/', modao_confirm, name='modao-confirm'),
     path('api/modao/<int:pk>/smoke/', modao_smoke, name='modao-smoke'),
     path('api/modao/<int:pk>/edit/', modao_edit, name='modao-edit'),
+    # 画布级产物人工编辑（A2-c：单个画布独立分支）
+    path('api/modao/<int:pk>/pages/<int:page_id>/edit/', modao_page_edit, name='modao-page-edit'),
     path('api/modao/<int:pk>/ask/', modao_ask, name='modao-ask'),
     path('api/modao/<int:pk>/', modao_detail, name='modao-detail'),
     path('api/modao/<int:pk>/export-xmind/', modao_export_xmind, name='modao-export-xmind'),

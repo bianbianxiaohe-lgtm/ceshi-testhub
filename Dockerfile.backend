@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -28,9 +29,13 @@ RUN (wget -q https://dl.google.com/android/repository/platform-tools-latest-linu
     && ln -sf /opt/platform-tools/adb /usr/local/bin/adb) \
     || echo "adb install skipped (getevent 实时监听将不可用，录制仍可走镜像点击)"
 
-# 安装Python依赖（使用清华镜像加速）
-COPY requirements.txt .
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+# 安装Python依赖（2026-09-03 起使用阿里云镜像；清华 pypi.tuna.tsinghua.edu.cn 在当前网络下极慢/易超时，如需回退改回该源）
+# 2026-09-03 起安装 requirements.lock.txt（全量钉死版本）：requirements.txt 的宽约束组合会让 pip
+# resolver 回溯 20 万轮 ResolutionTooDeep 失败；lock 文件源自 prod 容器实测自洽解，零回溯。
+# 注意：不能带 --no-cache-dir（否则 pip 不读写缓存目录），依赖缓存在宿主 docker 持久化；
+# 效果：lock 未变→整层命中跳过；lock 变更→只增量下载，不全量重下
+COPY requirements.lock.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.lock.txt
 
 # 安装 Playwright Chromium（墨刀读取 / UI自动化 需要浏览器引擎）
 RUN playwright install chromium && playwright install-deps chromium || echo "playwright browser install partial"

@@ -2,10 +2,29 @@
   <div class="page-container">
     <div class="page-header">
       <h1 class="page-title">设备管理</h1>
-      <el-button type="primary" @click="showCreateDialog = true">
-        <el-icon><Plus /></el-icon>
-        添加设备
-      </el-button>
+      <div style="display: flex; gap: 8px; align-items: center">
+        <el-tooltip content="进入页面时自动探测各设备是否可达（只跑一次）" placement="bottom">
+          <el-switch
+            v-model="autoProbe"
+            size="small"
+            active-text="自动探活"
+            inline-prompt
+            style="--el-switch-on-color: #67c23a"
+          />
+        </el-tooltip>
+        <el-button :loading="refreshing" @click="handleRefreshStatus()">
+          <el-icon><Refresh /></el-icon>
+          刷新状态
+        </el-button>
+        <el-button @click="showDiscoverDialog = true">
+          <el-icon><Search /></el-icon>
+          扫描设备
+        </el-button>
+        <el-button type="primary" @click="showCreateDialog = true">
+          <el-icon><Plus /></el-icon>
+          添加设备
+        </el-button>
+      </div>
     </div>
 
     <div class="card-container">
@@ -66,6 +85,12 @@
             <el-tag v-else size="small" type="info">本机</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="WDA地址" width="150">
+          <template #default="{ row }">
+            <span v-if="row.wda_host">{{ row.wda_host }}:{{ row.wda_port || 8100 }}</span>
+            <span v-else class="text-muted">-</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag
@@ -79,15 +104,22 @@
         </el-table-column>
         <el-table-column prop="resolution" label="分辨率" width="110" />
         <el-table-column prop="appium_server_url" label="Appium Server" min-width="180" show-overflow-tooltip />
-        <el-table-column prop="last_heartbeat" label="最后心跳" width="160">
+        <el-table-column label="最后心跳" width="190">
           <template #default="{ row }">
-            <span v-if="row.last_heartbeat">{{ formatTime(row.last_heartbeat) }}</span>
+            <template v-if="row.last_heartbeat">
+              <div>{{ formatTime(row.last_heartbeat) }}</div>
+              <div class="form-hint" style="margin-top: 0">
+                {{ heartbeatAge(row.last_heartbeat) }}
+                <span v-if="isStaleHeartbeat(row.last_heartbeat)" class="stale-warn">· 已过期</span>
+              </div>
+            </template>
             <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="handleEdit(row)">编辑</el-button>
+            <el-button link type="success" size="small" :loading="probingId === row.id" @click="handleRefreshStatus(row)">探活</el-button>
             <el-button link type="warning" size="small" @click="handleSetStatus(row)">状态</el-button>
             <el-popconfirm title="确定删除该设备?" @confirm="handleDelete(row.id)">
               <template #reference>
@@ -144,6 +176,13 @@
           <el-input v-model="form.adb_host" placeholder="手机USB所在电脑的IP，如 192.168.8.71（留空则用本机）" />
           <div class="form-hint">多人使用时必填：填你电脑的 IP，平台通过你电脑的 ADB 服务控制手机</div>
         </el-form-item>
+        <el-form-item v-if="form.platform === 'ios'" label="WDA主机(IP)" prop="wda_host">
+          <el-input v-model="form.wda_host" placeholder="手机USB所在电脑的IP，如 192.168.8.71" />
+          <div class="form-hint">iOS 专用：那台电脑上需已跑通 WDA（ios_wda_host.bat）并放行 8100 端口</div>
+        </el-form-item>
+        <el-form-item v-if="form.platform === 'ios'" label="WDA端口" prop="wda_port">
+          <el-input v-model="form.wda_port" placeholder="8100" />
+        </el-form-item>
         <el-form-item label="服务地址" prop="appium_server_url">
           <el-input
             v-model="form.appium_server_url"
@@ -198,16 +237,44 @@
         <el-button type="primary" @click="handleStatusChange" :loading="statusSubmitting">确定</el-button>
       </template>
     </el-dialog>
+
+    <!-- 扫描设备（自动入库） -->
+    <el-dialog v-model="showDiscoverDialog" title="扫描设备" width="500px">
+      <el-form label-width="110px">
+        <el-form-item label="平台">
+          <el-select v-model="discoverForm.platform" style="width: 180px">
+            <el-option label="iOS（WDA）" value="ios" />
+            <el-option label="Android（adb）" value="android" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="电脑IP">
+          <el-input v-model="discoverForm.host" placeholder="手机USB所在电脑的IP，如 192.168.8.71" />
+          <div class="form-hint">iOS：那台电脑需已跑通 ios_wda_host.bat 并放行 8100 端口</div>
+          <div class="form-hint">Android：那台电脑需已启动 adb -a -P 5037 nodaemon server</div>
+        </el-form-item>
+        <el-form-item label="端口">
+          <el-input v-model.number="discoverForm.port" placeholder="8100" style="width: 180px" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showDiscoverDialog = false">取消</el-button>
+        <el-button type="primary" @click="handleDiscover" :loading="discovering">开始扫描</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
-  getAppDevices, createAppDevice, updateAppDevice, deleteAppDevice, setDeviceStatus
+  getAppDevices, createAppDevice, updateAppDevice, deleteAppDevice, setDeviceStatus,
+  discoverAppDevice, refreshDeviceStatus
 } from '@/api/ui_automation'
 import dayjs from 'dayjs'
+
+// 心跳超过该时长即视为过期（status 可能是历史遗留的 online，不能只看状态字段）
+const HEARTBEAT_STALE_MINUTES = 15
 
 // 列表数据
 const devices = ref([])
@@ -233,6 +300,8 @@ const defaultForm = {
   device_type: 'real',
   udid: '',
   adb_host: '',
+  wda_host: '',
+  wda_port: 8100,
   appium_server_url: 'http://localhost:4723',
   resolution: '',
   capabilities: {},
@@ -255,6 +324,29 @@ const currentDevice = ref(null)
 const newStatus = ref('')
 const statusSubmitting = ref(false)
 
+// 扫描设备（按 IP 探测，自动写入设备表）
+const showDiscoverDialog = ref(false)
+const discovering = ref(false)
+const discoverForm = reactive({ platform: 'ios', host: '', port: 8100 })
+
+// 实时探活
+const refreshing = ref(false)
+const probingId = ref(null)
+// 进页面自动探活（可关闭，记住选择）。探测要真的去连设备，会花几秒，
+// 所以只在首次进入 / 距上次探测超过 cooldown 时才自动跑一次。
+const AUTO_PROBE_KEY = 'testhub.deviceAutoProbe'
+const AUTO_PROBE_COOLDOWN_MS = 60 * 1000
+const autoProbe = ref(localStorage.getItem(AUTO_PROBE_KEY) !== '0')
+const autoProbed = ref(false)
+
+watch(autoProbe, (on) => {
+  localStorage.setItem(AUTO_PROBE_KEY, on ? '1' : '0')
+})
+
+watch(() => discoverForm.platform, (p) => {
+  discoverForm.port = p === 'ios' ? 8100 : 5037
+})
+
 const statusTagType = (status) => {
   const map = { online: 'success', offline: 'info', busy: 'warning', error: 'danger' }
   return map[status] || 'info'
@@ -262,6 +354,63 @@ const statusTagType = (status) => {
 
 const formatTime = (time) => {
   return time ? dayjs(time).format('YYYY-MM-DD HH:mm:ss') : '-'
+}
+
+// 心跳距今多久（用于提示「状态是历史遗留」）
+const heartbeatAge = (time) => {
+  if (!time) return ''
+  const mins = dayjs().diff(dayjs(time), 'minute')
+  if (mins < 1) return '刚刚'
+  if (mins < 60) return `${mins} 分钟前`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
+}
+
+const isStaleHeartbeat = (time) => {
+  if (!time) return true
+  return dayjs().diff(dayjs(time), 'minute') > HEARTBEAT_STALE_MINUTES
+}
+
+// 实时探活：不传 row 刷新全部，传 row 只刷这一台。
+// silent=true 用于进页面自动探测（不弹成功提示，只把结果反映到列表上）。
+const handleRefreshStatus = async (row, { silent = false } = {}) => {
+  if (row) probingId.value = row.id
+  else refreshing.value = true
+  try {
+    const res = await refreshDeviceStatus(row ? [row.id] : [])
+    const data = res.data || {}
+    if (row) {
+      const detail = (data.results || [])[0]
+      if (detail?.online) {
+        if (!silent) ElMessage.success(`${row.name} 在线（${detail.detail}）`)
+        else ElMessage.success(`${row.name} 已连接`)
+      } else {
+        ElMessage.warning(`${row.name} 离线：${detail?.detail || '探测失败'}`)
+      }
+    } else if (!silent) {
+      ElMessage.success(data.message || '状态已刷新')
+    }
+    await loadDevices()
+    return data
+  } catch (error) {
+    if (!silent) ElMessage.error(error?.response?.data?.message || '刷新状态失败')
+    return null
+  } finally {
+    probingId.value = null
+    refreshing.value = false
+  }
+}
+
+// 进页面自动探活：让列表反映"此刻"的真实状态，而不是上次写入的历史值。
+// 探测要真的去连设备（可能花几秒），所以：① 只跑一次；② 距上次探测 < 1 分钟时跳过。
+const maybeAutoProbe = async () => {
+  if (!autoProbe.value || autoProbed.value) return
+  autoProbed.value = true
+  const last = Number(sessionStorage.getItem('testhub.deviceProbeAt') || 0)
+  if (Date.now() - last < AUTO_PROBE_COOLDOWN_MS) return
+  sessionStorage.setItem('testhub.deviceProbeAt', String(Date.now()))
+  await handleRefreshStatus(null, { silent: true })
 }
 
 const loadDevices = async () => {
@@ -303,6 +452,8 @@ const handleEdit = (row) => {
     device_type: row.device_type || 'real',
     udid: row.udid,
     adb_host: row.adb_host || '',
+    wda_host: row.wda_host || '',
+    wda_port: row.wda_port || 8100,
     appium_server_url: row.appium_server_url,
     resolution: row.resolution || '',
     capabilities: row.capabilities || {},
@@ -354,6 +505,34 @@ const handleDelete = async (id) => {
   }
 }
 
+const handleDiscover = async () => {
+  const host = (discoverForm.host || '').trim()
+  if (!host) {
+    ElMessage.warning('请填写设备所在电脑的 IP')
+    return
+  }
+  discovering.value = true
+  try {
+    const res = await discoverAppDevice({
+      platform: discoverForm.platform,
+      host,
+      port: discoverForm.port || (discoverForm.platform === 'ios' ? 8100 : 5037)
+    })
+    const data = res.data || {}
+    if (data.success) {
+      ElMessage.success(data.message || '扫描完成，设备已入库')
+      showDiscoverDialog.value = false
+      await loadDevices()
+    } else {
+      ElMessage.error(data.message || '未发现设备')
+    }
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || '扫描失败')
+  } finally {
+    discovering.value = false
+  }
+}
+
 const handleSetStatus = (row) => {
   currentDevice.value = row
   newStatus.value = row.status
@@ -375,9 +554,12 @@ const handleStatusChange = async () => {
   }
 }
 
-onMounted(() => {
-  loadDevices()
+onMounted(async () => {
+  await loadDevices()
+  // 列表先出来，再在后台探活刷新（不阻塞首屏）
+  maybeAutoProbe()
 })
+
 </script>
 
 <style scoped>
@@ -429,5 +611,9 @@ onMounted(() => {
   color: #909399;
   line-height: 1.4;
   margin-top: 4px;
+}
+
+.stale-warn {
+  color: #e6a23c;
 }
 </style>
