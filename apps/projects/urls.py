@@ -1,5 +1,10 @@
 from django.urls import path
+from rest_framework.routers import DefaultRouter
 from . import views, project_list_views
+
+# 项目角色（组织级组）：仅管理员可增删改，所有人可读（项目表单要选角色）
+_role_router = DefaultRouter()
+_role_router.register(r'roles', views.ProjectRoleViewSet, basename='project-role')
 
 urlpatterns = [
     path('', views.ProjectListCreateView.as_view(), name='project-list'),
@@ -20,4 +25,4 @@ urlpatterns = [
     path('<int:project_id>/knowledge/fs/create/', views.knowledge_fs_file_create, name='knowledge-fs-file-create'),
     path('<int:project_id>/knowledge/fs/file/', views.knowledge_fs_file, name='knowledge-fs-file-root'),
     path('<int:project_id>/knowledge/fs/file/<path:file_path>/', views.knowledge_fs_file, name='knowledge-fs-file'),
-]
+] + _role_router.urls

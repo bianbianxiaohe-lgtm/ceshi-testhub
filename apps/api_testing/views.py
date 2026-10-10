@@ -61,7 +61,15 @@ class StandardPagination(PageNumberPagination):
     max_page_size = 1000
 
 
-class ApiProjectViewSet(OwnerOrMemberMixin, viewsets.ModelViewSet):
+class ApiProjectViewSet(viewsets.ModelViewSet):
+    """
+    接口测试项目 CRUD。
+
+    2026-09-20 用户要求「每个人都能查看别人创建的项目，只是不能删除」：
+      - list/retrieve 查看：全员可见
+      - update          ：负责人 / 成员 / 管理员
+      - destroy 删除     ：仅负责人 + 管理员
+    """
     queryset = ApiProject.objects.all()
     serializer_class = ApiProjectSerializer
     permission_classes = [IsAuthenticated]
@@ -70,7 +78,45 @@ class ApiProjectViewSet(OwnerOrMemberMixin, viewsets.ModelViewSet):
     search_fields = ['name', 'description']
     ordering_fields = ['created_at', 'name', 'start_date']
     ordering = ['-created_at']
-    
+
+    def get_queryset(self):
+        # 查看放开：所有登录用户可见全部接口项目
+        qs = super().get_queryset()
+        user = getattr(self.request, 'user', None)
+        if user is None or not user.is_authenticated:
+            return qs.none()
+        return qs.distinct()
+
+    def _deny_if_not_manageable(self, obj):
+        if can_manage_project(self.request.user, obj):
+            return None
+        return Response(
+            {'error': '只有项目负责人、项目成员或管理员可以修改该项目'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
+    def update(self, request, *args, **kwargs):
+        denied = self._deny_if_not_manageable(self.get_object())
+        if denied:
+            return denied
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        denied = self._deny_if_not_manageable(self.get_object())
+        if denied:
+            return denied
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        obj = self.get_object()
+        # 删除从严：仅负责人 + 管理员
+        if not can_delete_project(request.user, obj):
+            return Response(
+                {'error': '只有项目负责人或管理员可以删除项目'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().destroy(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         """创建项目时记录日志"""
         instance = serializer.save()

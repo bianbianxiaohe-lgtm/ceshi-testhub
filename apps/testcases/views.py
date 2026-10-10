@@ -89,9 +89,36 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
         serializer.save(author=user, project=project)
 
 class TestCaseDetailView(ProjectScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    用例详情 / 编辑 / 删除。
+
+    2026-09-20：查看放开（全员可见），但**改/删**仍限"我负责或参与的项目"。
+    """
     queryset = TestCase.objects.all()
     permission_classes = [permissions.IsAuthenticated]
-    
+
+    def _deny_if_not_writable(self, instance):
+        """用例所属项目必须是我能写的（负责人/成员/管理员）。"""
+        writable = self.get_accessible_projects()   # = 可写项目集合
+        if not writable.filter(id=instance.project_id).exists():
+            return Response(
+                {'error': '只有用例所属项目的负责人、项目成员或管理员可以修改/删除该用例'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return None
+
+    def update(self, request, *args, **kwargs):
+        denied = self._deny_if_not_writable(self.get_object())
+        if denied:
+            return denied
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        denied = self._deny_if_not_writable(self.get_object())
+        if denied:
+            return denied
+        return super().destroy(request, *args, **kwargs)
+
     def get_serializer_class(self):
         if self.request.method in ['PUT', 'PATCH']:
             return TestCaseUpdateSerializer

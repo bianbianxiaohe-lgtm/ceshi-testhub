@@ -246,6 +246,10 @@
               <el-icon><Collection /></el-icon>
               <span>公共步骤库</span>
             </el-menu-item>
+            <el-menu-item index="/ai-intelligent-mode/element-picker">
+              <el-icon><Aim /></el-icon>
+              <span>元素拾取器</span>
+            </el-menu-item>
             <el-menu-item index="/ai-intelligent-mode/midscene-playground">
               <el-icon><MagicStick /></el-icon>
               <span>Midscene Playground</span>
@@ -473,6 +477,7 @@ const breadcrumbTitle = computed(() => {
     '/ai-intelligent-mode/testing': 'AI 智能测试',
     '/ai-intelligent-mode/cases': 'AI 用例管理',
     '/ai-intelligent-mode/business-actions': '公共步骤库',
+    '/ai-intelligent-mode/element-picker': '元素拾取器',
     '/ai-intelligent-mode/midscene-playground': 'Midscene Playground',
     '/ai-intelligent-mode/midscene-web-playground': 'Midscene Web Playground',
     '/ai-intelligent-mode/execution-records': 'AI 测试报告',

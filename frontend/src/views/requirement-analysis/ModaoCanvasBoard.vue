@@ -36,16 +36,25 @@
                   {{ fg.path || '未分组' }} ({{ fg.pages.length }})
                 </el-checkbox>
               </div>
-              <div class="folder-actions">
-                <el-button size="mini" type="primary" :disabled="!fg.selectedCount" @click="onFolderBatchAction(fg, 'clarify')">
+              <!-- 批量按钮的语义：作用于「本文件夹下被勾选的画布」。
+                   一个都没勾时按钮整体隐藏（而不是置灰）：置灰的彩色按钮仍会被
+                   误读成"点这一块＝执行这一块"，而实际执行范围取决于勾选，
+                   隐藏能让"要执行就先勾画布"这件事变得没有歧义。
+                   按钮上的数字就是本次会执行的画布数量，动手前即可核对。 -->
+              <div class="folder-actions" v-if="fg.selectedCount">
+                <span class="action-scope">将对勾选的 {{ fg.selectedCount }} 个画布执行：</span>
+                <el-button size="mini" type="primary" @click="onFolderBatchAction(fg, 'clarify')">
                   🔍 澄清 ({{ fg.selectedCount }})
                 </el-button>
-                <el-button size="mini" type="success" :disabled="!fg.selectedCount" @click="onFolderBatchAction(fg, 'design')">
-                  📐 测试设计
+                <el-button size="mini" type="success" @click="onFolderBatchAction(fg, 'design')">
+                  📐 测试设计 ({{ fg.selectedCount }})
                 </el-button>
-                <el-button size="mini" type="warning" :disabled="!fg.selectedCount" @click="onFolderBatchAction(fg, 'generate-cases')">
-                  📋 用例
+                <el-button size="mini" type="warning" @click="onFolderBatchAction(fg, 'generate-cases')">
+                  📋 用例 ({{ fg.selectedCount }})
                 </el-button>
+              </div>
+              <div class="folder-actions folder-actions--hint" v-else>
+                <span class="action-scope action-scope--muted">勾选画布后可批量执行（当前未勾选）</span>
               </div>
             </div>
             <div class="canvas-grid">
@@ -226,6 +235,10 @@ export default {
       caseGroups: '',
       pollTimer: null,
       folderFilter: '',
+      // 待写回服务端的勾选变更 {pageId: bool}；合并成一次请求。
+      // 同时用于 loadDetail 时"不被轮询覆盖"，见 loadDetail 里的注释。
+      pendingSelection: {},
+      _selTimer: null,
     }
   },
   computed: {
@@ -318,9 +331,24 @@ export default {
   },
   beforeDestroy() {
     this.stopPoll()
+    // 防抖没到点就离开页面时，必须补一次写回，否则最后一次勾选会丢
+    if (this._selTimer) {
+      clearTimeout(this._selTimer)
+      this._selTimer = null
+      this.flushSelectionSave()
+    }
   },
   methods: {
     base() {
+      // ⚠️ 必须带 `/api` 前缀。后端真实路由是 `path('api/requirement-analysis/', ...)`，
+      // 不带 /api 的形态**只有 log-viewer / log-raw 两个别名**，其余接口一律 404。
+      //
+      // 实测（容器内带鉴权，排除 SPA 兜底干扰）：
+      //   /requirement-analysis/api/modao/80/clarify/      -> 404
+      //   /api/requirement-analysis/api/modao/80/clarify/  -> 200  ← 正确
+      //
+      // ⚠️ 别用 `curl` 看不带 /api 的地址来判断"通不通"：nginx 对 GET 会返回
+      // SPA 兜底（200 + index.html），看起来是通的，其实是假的。POST 才会露出 404。
       return '/requirement-analysis/api/modao'
     },
     shotUrl(rel) {
@@ -376,12 +404,54 @@ export default {
       try {
         const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
         this.proto = res.data
-        this.pages = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
+        const incoming = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
+        // 勾选状态以服务端为准（它已持久化），但用户刚点、还没写回完成的改动
+        // 不能被轮询结果覆盖 —— 否则会出现"勾了又被弹回去"的抖动。
+        const pending = this.pendingSelection
+        this.pages = incoming.map(p => {
+          if (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) {
+            return { ...p, selected: pending[p.id] }
+          }
+          return p
+        })
         if (this.isRunning) this.startPoll()
       } catch (e) {
         this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
       } finally {
         this.loading = false
+      }
+    },
+    /**
+     * 把勾选结果写回服务端。
+     *
+     * 为什么要持久化：勾选状态原本只活在当前页面的内存里，
+     * 一旦刷新/重新进入，旧的勾选被丢弃、全部回到默认值，
+     * 用户每次都要重新取消一遍不需要的画布。
+     *
+     * 合并写：用 300ms 防抖 + 累积变更集，连点多个画布只发一次请求，
+     * 避免逐个点击打出一串请求。
+     */
+    queueSelectionSave(id, selected) {
+      this.pendingSelection[id] = selected
+      if (this._selTimer) clearTimeout(this._selTimer)
+      this._selTimer = setTimeout(() => this.flushSelectionSave(), 300)
+    },
+    async flushSelectionSave() {
+      this._selTimer = null
+      const items = Object.entries(this.pendingSelection)
+        .map(([id, selected]) => ({ id: Number(id), selected }))
+      if (!items.length) return
+      // 先清空待写集合：写入期间的再次点击会进入新的批次
+      this.pendingSelection = {}
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/update-pages/`,
+          method: 'post',
+          data: { pages: items },
+        })
+      } catch (e) {
+        this.$message.error('画布勾选状态保存失败：'
+          + (e.response?.data?.detail || e.message))
       }
     },
     openCanvas(p) {
@@ -401,6 +471,7 @@ export default {
       const selected = fg.allSelected
       for (const p of fg.pages) {
         p.selected = selected
+        this.queueSelectionSave(p.id, selected)
       }
     },
     onCanvasSelect(p, fg) {
@@ -408,6 +479,8 @@ export default {
       fg.selectedCount = selected
       fg.allSelected = selected === fg.pages.length && fg.pages.length > 0
       fg.indeterminate = selected > 0 && selected < fg.pages.length
+      // 单画布勾选也要落库：这是"下次进来记住上次选择"的关键一步
+      this.queueSelectionSave(p.id, !!p.selected)
     },
     async onFolderBatchAction(fg, action) {
       const selectedPages = fg.pages.filter(p => p.selected)
@@ -434,14 +507,24 @@ export default {
             type: 'info',
           }
         )
-        await this.runCanvasStage(action, { id: selectedPages.map(p => p.id) })
-        this.$message.success(`已为文件夹「${fg.path || '未分组'}」的 ${selectedPages.length} 个画布提交【${actionLabel}】，请稍候`)
-      } catch (action) {
-        if (action === 'cancel') {
-          for (const p of selectedPages) {
-            await this.runCanvasStage(action, p)
-          }
+        const ok = await this.runCanvasStage(action, { id: selectedPages.map(p => p.id) })
+        // 只有接口真的成功才提示"已提交"，失败时 runCanvasStage 已弹过具体错误
+        if (ok) {
           this.$message.success(`已为文件夹「${fg.path || '未分组'}」的 ${selectedPages.length} 个画布提交【${actionLabel}】，请稍候`)
+        }
+      } catch (err) {
+        // 点「取消 / 关闭」确认框 = 什么都不做。
+        //
+        // ⚠️ 这里曾有两个 bug，都会造成"点了取消反而继续执行"：
+        //   1) 形参命名为 action，遮蔽了外层入参 → 传下去的是 'cancel' → 拼出
+        //      `.../80/cancel/` → 每台设备 404；
+        //   2) 更严重的是**取消了还逐个画布发请求**（原意是想"退化成逐个执行"）——
+        //      点「取消」的语义就是中止，绝不能再发任何执行请求。
+        //      Element Plus 的 $confirm 在 distinguishCancelAndClose 下
+        //      取消会 reject 出字符串 'cancel'，这里必须直接忽略。
+        if (err !== 'cancel' && err !== 'close') {
+          // 非取消类异常（极少见）才提示，避免静默失败
+          this.$message.warning(`批量提交未执行：${err && err.message ? err.message : err}`)
         }
       }
     },
@@ -484,8 +567,13 @@ export default {
           this.$message.success(`已为画布「${this.canvasLabel(page)}」提交${this.stageMeta(page.current_stage, page.stage_status).label}的运行请求`)
         }
         this.startPoll()
+        // 返回成功标志：调用方（onFolderBatchAction）据此决定要不要提示"已提交"。
+        // 之前这里把异常吞在内部，调用方照样弹"提交成功"，接口其实已经失败 →
+        // 同屏出现"提交失败 404"和"提交成功"两条互相矛盾的消息，误导极强。
+        return true
       } catch (e) {
         this.$message.error('提交失败：' + (e.response?.data?.detail || e.message))
+        return false
       } finally {
         this.busy = false
       }
@@ -636,6 +724,22 @@ export default {
     .folder-actions {
       display: flex;
       gap: 8px;
+      align-items: center;
+      // Element Plus 会给相邻按钮加 margin-left，与 gap 叠加会把这一行撑破，
+      // 导致后面的按钮换行/被裁掉。这里清零，只保留 gap。
+      :deep(.el-button + .el-button) {
+        margin-left: 0;
+      }
+    }
+    // 「本次将执行 N 个画布」的说明文字：把执行范围写在按钮旁边，
+    // 避免用户误以为"点这一块 = 执行这一块画布"。
+    .action-scope {
+      font-size: 12px;
+      color: #606266;
+      margin-right: 4px;
+      &--muted {
+        color: #c0c4cc;
+      }
     }
   }
 }

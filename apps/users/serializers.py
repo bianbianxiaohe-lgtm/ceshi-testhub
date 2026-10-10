@@ -8,12 +8,30 @@ class UserSimpleSerializer(serializers.ModelSerializer):
         fields = ('id', 'username', 'email', 'avatar')
 
 class UserSerializer(serializers.ModelSerializer):
+    """
+    用户序列化器（用户管理页列表/详情用）。
+
+    2026-09-20 新增 `roles` / `role_names`：**只读**展示该用户所属的项目角色。
+    角色的成员在「用户管理 → 角色」里维护，这里只负责"看得见"，不在这里改
+    （用户明确要求："用户管理可以看到所属角色 只是不支持修改"）。
+    依赖 ProjectRole.members 的 related_name='project_roles'。
+    """
+    roles = serializers.SerializerMethodField()
+    role_names = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'first_name', 'last_name', 
                  'avatar', 'phone', 'department', 'position', 'is_active',
-                 'date_joined', 'created_at', 'updated_at']
+                 'date_joined', 'created_at', 'updated_at',
+                 'roles', 'role_names']
         read_only_fields = ['id', 'date_joined', 'created_at', 'updated_at']
+
+    def get_roles(self, obj):
+        return [{'id': r.id, 'name': r.name} for r in obj.project_roles.all()]
+
+    def get_role_names(self, obj):
+        return [r.name for r in obj.project_roles.all()]
 
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=6)

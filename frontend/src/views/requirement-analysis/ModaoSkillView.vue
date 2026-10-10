@@ -1388,6 +1388,8 @@ export default {
         this.recomputeFlatPciItems()
       }
     },
+    // ⚠️ 必须带 `/api` 前缀（后端真实路由为 `api/requirement-analysis/`，
+    // 不带 /api 的形态只有 log-viewer / log-raw 两个别名，其余接口 404）。
     base() { return '/requirement-analysis/api/modao' },
     statusLabel(s) {
       const m = { pending: '待处理', extracting: '读取中', extracted: '已读取', partial: '部分读取', structuring: '结构化中', clarifying: '澄清中', designing: '用例设计中', done: '已完成', failed: '失败' }

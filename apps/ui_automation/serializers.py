@@ -893,9 +893,25 @@ class AIExecutionRecordSerializer(serializers.ModelSerializer):
             'task_description',
             'execution_mode', 'status', 'start_time', 'end_time', 'duration',
             'logs', 'steps_completed', 'planned_tasks', 'executed_by', 'executed_by_name',
-            'gif_path', 'screenshots_sequence'
+            'gif_path', 'screenshots_sequence',
+            # ⚠️ 以下 5 个字段**必须暴露**：报告页靠它们展示「执行方式 / 模型消耗」。
+            # 曾经漏掉 → 前端拿到 undefined →
+            #   「执行方式」永远显示"AI 探索"（不区分脚本回放）、
+            #   「模型消耗」永远显示"0 模型调用"（即使实际调用 11 次 / 29k tokens）。
+            # 这是**会误导决策的显示错误**（用户以为没花钱）。
+            'model_calls', 'prompt_tokens', 'completion_tokens',
+            'tokens_estimated', 'replay_mode',
+            # 回放失败降级（2026-09-22）：报告要能区分「纯回放 / 回放失败降级 /
+            # 全新 AI 探索」——旧代码降级时只置 replay_mode=False，
+            # 报告只剩「AI 探索」，用户误判固化没生效。
+            'replay_degraded', 'replay_fail_reason',
         ]
-        read_only_fields = ('start_time', 'end_time', 'duration', 'executed_by', 'gif_path', 'screenshots_sequence')
+        read_only_fields = ('start_time', 'end_time', 'duration', 'executed_by', 'gif_path',
+                            'screenshots_sequence',
+                            # 统计字段由引擎/代理写入，不允许客户端篡改
+                            'model_calls', 'prompt_tokens', 'completion_tokens',
+                            'tokens_estimated', 'replay_mode',
+                            'replay_degraded', 'replay_fail_reason')
 
 
 

@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 POPUP_AUTO_DISMISS = os.environ.get('POPUP_AUTO_DISMISS', '1') not in ('0', 'false', 'False', '')
 POPUP_RETRY_LIMIT = int(os.environ.get('POPUP_RETRY_LIMIT', '2') or 2)
 
+#: 断言的弹窗重试次数比操作类多一些（见 execute_steps 中的说明）。
+ASSERT_POPUP_RETRY_LIMIT = int(
+    os.environ.get('ASSERT_POPUP_RETRY_LIMIT', '3') or 3)
+
+#: 逻辑点屏幕尺寸兜底（iPhone 15 Pro 393x852）。
+#: 仅用于「采样坐标是否越界」的护栏，取不到真实尺寸时也不会误杀。
+SCREEN_SIZE_FALLBACK = (393, 852)
+
 #: Node 服务目录（容器内路径，/root/.midscene 已挂卷持久化）
 SERVICE_DIR = os.environ.get(
     'MIDSCENE_IOS_SERVICE_DIR', '/root/.midscene/ios/node_service')
@@ -97,12 +105,30 @@ class MidsceneIOSEngine:
     SUPPORTED_ACTIONS = {
         'aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'aiWaitFor',
         'launch', 'wait', 'screenshot',
+        # 系统级动作（不走视觉模型）。
+        # ⚠️ 曾经漏了这两个：前端把 back/home 当作「无提示词动作」提供给用户，
+        #    Android 引擎支持而 iOS 不支持 → 用户在 iOS 用例里加"返回"步骤，
+        #    执行到那步直接报「不支持的 action: back」整条用例失败。
+        #    iOS 的等价实现见 service.js：back = 左边缘右滑手势，home = WDA home。
+        'back', 'home',
+        # ⚠️ 命名兼容：前端的动作下拉里断言写的是 **`assert`**（Android 引擎用
+        #    `assert`），而本引擎内部与 RPC 方法叫 `aiAssert`。两边不一致导致
+        #    iOS 用例加「断言」步骤同样报「不支持的 action: assert」。
+        #    这里把 `assert` 也纳入白名单，并在分派时映射到 aiAssert。
+        'assert',
     }
 
+    #: 前端动作名 → 本引擎/RPC 内部方法名的映射（目前只有断言这一处不一致）
+    ACTION_ALIASES = {'assert': 'aiAssert'}
+
     #: 回放模式下能用纯坐标完成、不需要模型的动作。
-    #: aiAssert / aiQuery 是有意排除的 —— 断言和取值本质上是语义判断，
-    #: 坐标固化不了，必须继续调模型（这是刻意的取舍，不是遗漏）。
+    #: aiAssert / aiQuery / aiWaitFor 是有意排除的 —— 断言、取值、条件等待
+    #: 本质上是语义判断，坐标固化不了，必须继续调模型（刻意的取舍，不是遗漏）。
     REPLAY_ACTIONS = {'aiTap', 'aiAct', 'aiInput'}
+
+    #: 条件等待默认超时（毫秒）。aiWaitFor 要等到条件成立才返回，必须有上限，
+    #: 否则页面一直不出现目标元素就会长时间卡住（可用步骤的 timeout_ms 覆盖）。
+    DEFAULT_WAIT_FOR_TIMEOUT_MS = 15000
 
     def __init__(self, wda_host='', wda_port=8100, model_config=None,
                  ai_action_context='', default_bundle_id='',
@@ -127,6 +153,10 @@ class MidsceneIOSEngine:
         self.logs = []
         self._session_id = None
         self._port = None
+        # 逻辑点屏幕尺寸：采样坐标越界时用来丢弃明显错误的固化数据。
+        # 默认按 iPhone 15 Pro（393x852）兜底，start() 拿到真实尺寸后会覆盖。
+        self.SCREEN_W, self.SCREEN_H = SCREEN_SIZE_FALLBACK
+        self._screen_size_known = False
 
     # ---------------- 基础设施：Node 服务 ----------------
     def _log(self, fmt, *args):
@@ -278,7 +308,21 @@ class MidsceneIOSEngine:
         })
         self._session_id = res.get('sessionId')
         self._log('iOS 会话已建立: %s', self._session_id)
+        self._load_screen_size()
         return self._session_id
+
+    def _load_screen_size(self):
+        """记录本机逻辑点屏幕尺寸（仅用于采样坐标的越界护栏，失败不阻断）。"""
+        try:
+            res = self._rpc('screenSize', {'sessionId': self._session_id}, timeout=30)
+            w, h = int(res.get('width') or 0), int(res.get('height') or 0)
+            if w > 0 and h > 0:
+                self.SCREEN_W, self.SCREEN_H = w, h
+                self._screen_size_known = True
+                self._log('屏幕逻辑尺寸: %dx%d（坐标采样越界护栏）', w, h)
+        except Exception as exc:  # noqa: BLE001
+            self._log('取屏幕尺寸失败，按 %dx%d 兜底: %s',
+                      self.SCREEN_W, self.SCREEN_H, str(exc)[:120])
 
     def close(self):
         if not self._session_id:
@@ -340,6 +384,55 @@ class MidsceneIOSEngine:
         self._rpc('launch', {'sessionId': self._session_id, 'uri': target}, timeout=180)
         self._log('已启动: %s', target)
 
+    def reset_to_home(self, bundle_id=''):
+        """把 App 复位到一致起点（探索与回放都用，保证"采样起点 == 回放起点"）。
+
+        目的（2026-09-22 生产实测，用例 73）：
+          回放按**固化时采到的绝对坐标**点击，隐含假设
+          「执行起点页面 == 固化采样时的起点页面」。
+          若探索时从"任意残留状态"采样、回放时从另一起点开始，
+          两边页面不同 → 坐标整体偏掉 → 回放失败 → 降级烧 token
+          → 用户以为"固化从没生效、永远省不了 token"。
+          所以**探索和回放都必须先复位到同一起点**。
+
+        ⚠️⚠️ **复位只做「重新拉起 App」，绝不主动 `home` 回桌面**
+        （2026-09-22 踩坑后定型）：
+          最初实现是 `home` + `launch`，以为能拿到"最干净的首启状态"。
+          但实测这个 App（万年历）**冷启动默认落在一个叫「日记本」的页面，
+          该页既没有底部主 tab 栏、也没有任何返回按钮**（`back` 手势连点
+          两次元素树完全不变）→ 它成了一个**死路页**：
+          首步固化坐标 (40,794)（原本是底部 tab）在此页会落到「前一天」按钮上，
+          后续步骤必然连锁失败。**等于把 App 推进了比原残留状态更糟的地方。**
+
+          改为只用 `launch`：App 已在前台时它通常只是"唤到前台"、保留原导航栈，
+          App 不在前台则冷启动。两种情况下**都不由我们决定落在哪一页**，
+          起点一致性交给用户用例自己保证（用例应从它期望的页面开始）。
+
+          注意：**不能改用「杀进程」来强制冷启动** —— 杀进程恰恰会落到
+          那个「日记本」死路页，与上面实测的坏结果等价。
+
+        失败不抛异常：复位失败只是"起点可能不一致"，
+        不能因为复位本身报错把用例直接搞挂。
+        """
+        target = ''
+        try:
+            target = self.resolve_launch_target(bundle_id)
+        except Exception as exc:  # noqa: BLE001
+            self._log('[复位] 解析被测应用失败（跳过复位）: %s', str(exc)[:160])
+            return
+        if not target:
+            self._log('[复位] 未配置被测应用，跳过复位（起点可能不一致）')
+            return
+        try:
+            self._rpc('launch', {'sessionId': self._session_id, 'uri': target},
+                      timeout=180)
+            # 等界面稳定，否则紧接着的坐标点击会落在启动过渡画面上
+            time.sleep(2.0)
+            self._log('[复位] 已拉起 %s（不重建导航栈，起点由用例自身保证）', target)
+        except Exception as exc:  # noqa: BLE001
+            self._log('[复位] 复位失败（不影响执行，起点可能不一致）: %s',
+                      str(exc)[:160])
+
     def screenshot(self) -> str:
         res = self._rpc('screenshot', {'sessionId': self._session_id}, timeout=120)
         return _to_data_url(res.get('base64') or '')
@@ -380,13 +473,23 @@ class MidsceneIOSEngine:
                 # 随机弹窗（权限请求 / 隐私协议 / 开屏广告 ……）随时可能冒出来，
                 # 挡住目标元素就会让这一步失败。这里做「关弹窗 + 重试」，
                 # 正常路径（没弹窗）零额外开销。Android 侧同一套逻辑。
+                #
+                # ⚠️ 断言步骤的重试上限单独放宽（2026-09-22 生产实测）：
+                #   弹窗检测与断言**各自调一次视觉模型**，两者结论可能矛盾 ——
+                #   检测器认为"没有弹窗"（大广告页它常判成"普通页面"），
+                #   断言却明确说"页面上全是广告"。此时若沿用 2 次上限，
+                #   第 2 次照样报"未发现弹窗"就放弃，用户看到的就是
+                #   "你说会自动关弹窗，结果没关"。断言多试几次成本很低
+                #   （一次 aiQuery），换来的是广告页能自愈。
+                limit = (ASSERT_POPUP_RETRY_LIMIT
+                         if step.get('action') == 'assert' else POPUP_RETRY_LIMIT)
                 try_count = 0
                 while (sr['status'] == 'failed'
                        and self.auto_dismiss_popup
-                       and try_count < POPUP_RETRY_LIMIT):
+                       and try_count < limit):
                     try_count += 1
                     self._log('[步骤 %d] 失败，检测是否为弹窗干扰（第 %d/%d 次重试）...',
-                              idx + 1, try_count, POPUP_RETRY_LIMIT)
+                              idx + 1, try_count, limit)
                     if dismiss_popups(self._popup_adapter()) == 0:
                         self._log('[步骤 %d] 未发现弹窗，不再重试', idx + 1)
                         break
@@ -420,8 +523,126 @@ class MidsceneIOSEngine:
             return True
         return bool(str(step.get('prompt') or '').strip())
 
+    def _execute_by_text(self, step, action_impl, sr, prompt, value):
+        """精确定位路径：按文本查 WDA 元素树拿坐标，再点击/输入。
+
+        与视觉定位（aiTap 让模型看图猜）的区别是**确定性**：
+          - 命中失败会**明确报错并列出页面上实际有的文案**，不会静默点错；
+          - 命中成功使用元素自身的精确坐标，不受模型视觉偏差影响。
+
+        文本来源：优先 selector_hint（定位字段），没填才用 prompt。
+        **传的是完整描述**（如「底部导航栏从左数第1个「万年历」图标」），
+        由 Node 侧 extractTextCandidates() 提取候选文案逐个试 ——
+        因为元素树里按钮的 name 往往只是「万年历」，整句去匹配必然找不到。
+
+        region 可选（bottom/top/lowest/highest），用于页面存在同名元素时
+        （如顶部按钮与底部 tab 同名）消歧。
+        """
+        text = (step.get('selector_hint') or '').strip() or (prompt or '').strip()
+        if not text:
+            raise ValueError(
+                '没有可用于定位的文本：请在「定位」或「提示词」里'
+                '填写元素上的文字（如：万年历）'
+            )
+        params = {
+            'sessionId': self._session_id,
+            'text': text,
+            'index': int(step.get('locate_index') or 0),
+            'region': (step.get('locate_region') or '').strip(),
+        }
+
+        if action_impl == 'aiTap':
+            res = self._rpc('tapByText', params, timeout=120)
+            center = res.get('center') or []
+            self._log('[步骤] 精确定位命中「%s」→ 点击 (%s)',
+                      text, ','.join(str(c) for c in center))
+            sr['location'] = {
+                'center': center, 'rect': res.get('rect'),
+                'dpr': 1, 'target': text,
+                'matchedBy': res.get('matchedBy') or 'text',
+            }
+            return
+
+        # aiInput：先按文本把焦点定位到输入框并点一下，再输入
+        res = self._rpc('findByText', params, timeout=120)
+        center = res.get('center') or []
+        self._rpc('tapPoint',
+                  {'sessionId': self._session_id,
+                   'x': center[0], 'y': center[1]}, timeout=60)
+        self._rpc('inputText',
+                  {'sessionId': self._session_id, 'text': value or ''}, timeout=120)
+        self._log('[步骤] 精确定位命中输入框「%s」→ 点击 (%s) 并输入',
+                  text, ','.join(str(c) for c in center))
+        sr['location'] = {
+            'center': center, 'rect': res.get('rect'),
+            'dpr': 1, 'target': text,
+            'matchedBy': res.get('matchedBy') or 'text',
+        }
+
+    def _capture_location(self, action_impl, sr, prompt, step, rpc_params):
+        """视觉模型操作**之前**采一次坐标，写进 sr['location']（供固化用）。
+
+        背景（2026-09-22）：
+          用户的核心诉求是"首次探索跑通后自动转成可复用脚本"（零模型回放）。
+          但 `_freeze_case_steps` 取坐标的来源是 `steps_completed[i].location`，
+          而**只有元素树路径会写它**；视觉模型路径的 `aiTap` 返回 void，
+          于是 17 步里 12 步 location=null → 一条缺坐标就整体不固化 →
+          每次重跑都重新烧 29k tokens，固化形同虚设。
+
+        为什么用 aiLocate 而不是让 aiTap 返回坐标：
+          `agent.aiTap()` 是 SDK 的 void 方法，内部定位结果不对外暴露；
+          `agent.aiLocate()` 是同一套视觉定位的"纯查询"入口，返回 {center, rect}。
+
+        代价与边界（都是刻意的）：
+          - 每步多一次视觉定位请求 —— **只发生在首次探索**，
+            固化后走 replay 分支不会进来，所以常态开销为 0。
+          - 失败**绝不抛异常**：采不到坐标只是"这次固化不了"，
+            不能因此把本来能跑通的用例搞失败。
+        """
+        text = (step.get('selector_hint') or '').strip() or (prompt or '').strip()
+        if not text:
+            return
+        try:
+            res = self._rpc('aiLocate',
+                            {'sessionId': self._session_id, 'prompt': text},
+                            timeout=180)
+        except Exception as exc:  # noqa: BLE001
+            self._log('[步骤] 坐标采样失败（不影响执行）: %s', str(exc)[:160])
+            return
+
+        if not (isinstance(res, dict) and res.get('ok') and res.get('center')):
+            self._log('[步骤] 坐标采样未命中（不影响执行）: %s',
+                      str((res or {}).get('error') or '')[:160])
+            return
+
+        center = res.get('center') or []
+        # 采到的坐标必须在屏幕内，否则固化下来回放必然点空。
+        # 2026-09-22 实测：不校验时会把「万年历」采成 (590,1280)，超出 393x852。
+        try:
+            cx, cy = int(center[0]), int(center[1])
+        except (TypeError, ValueError, IndexError):
+            self._log('[步骤] 坐标采样结果非法（不影响执行）: %s', center)
+            return
+        if cx < 0 or cy < 0 or cx > self.SCREEN_W or cy > self.SCREEN_H:
+            self._log('[步骤] 采样坐标 (%d,%d) 超出屏幕 %dx%d，丢弃（不固化该步）',
+                      cx, cy, self.SCREEN_W, self.SCREEN_H)
+            return
+
+        sr['location'] = {
+            'center': [cx, cy],
+            'rect': res.get('rect'),
+            'dpr': res.get('dpr') or 1,
+            'target': text,
+            'matchedBy': 'aiLocate',
+        }
+        self._log('[步骤] 已采样坐标 %d,%d（用「%s」，用于固化为脚本）',
+                  cx, cy, res.get('usedText') or text)
+
     def _execute_step(self, idx, step):
         action = step.get('action', 'aiAct')
+        # 前端动作名 → 内部方法名（assert → aiAssert）。保留原始名用于日志与
+        # 报告展示，避免用户看到自己没写过的动作名。
+        action_impl = self.ACTION_ALIASES.get(action, action)
         prompt = step.get('prompt', '') or ''
         value = step.get('value', '') or ''
         name = step.get('name', 'Step %d' % (idx + 1))
@@ -432,25 +653,76 @@ class MidsceneIOSEngine:
         try:
             # 需要视觉模型的动作必须有 prompt，否则是在"盲操作"，
             # 必须报错而不是让模型瞎猜后返回成功。
-            if action in ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'aiWaitFor') \
+            if action_impl in ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'aiAssert', 'aiWaitFor') \
                     and not str(prompt).strip():
                 raise ValueError(
                     '步骤 %d（%s）没有填写提示词 prompt，无法执行' % (idx + 1, action)
                 )
             if action == 'launch':
                 self.launch_app(prompt or value)
+            elif action == 'back':
+                # iOS 无全局返回键 → Node 侧用「左边缘右滑」系统返回手势实现
+                self._rpc('back', {'sessionId': self._session_id}, timeout=60)
+                self._log('[步骤 %d] 已执行返回（左边缘右滑手势）', idx + 1)
+            elif action == 'home':
+                self._rpc('home', {'sessionId': self._session_id}, timeout=60)
+                self._log('[步骤 %d] 已回到桌面', idx + 1)
             elif action == 'screenshot':
                 sr['screenshot'] = self.screenshot()
             elif action == 'wait':
                 time.sleep(wait_ms / 1000.0 if wait_ms else 1)
-            elif action in self.SUPPORTED_ACTIONS:
+            elif action_impl in self.SUPPORTED_ACTIONS:
                 # ---- 纯坐标回放 ----
                 # steps_frozen_at 非空表示这条用例已经固化过，每步都带着
                 # 上次成功执行时采到的坐标。用坐标直接点，完全不经过视觉
                 # 模型（也不用跑定位采样），这是"重复跑零 token"的关键路径。
-                if self.replay_mode and self._step_has_coords(step) and action in self.REPLAY_ACTIONS:
-                    self._replay_step(action, step, prompt, value)
+                if self.replay_mode and self._step_has_coords(step) \
+                        and action_impl in self.REPLAY_ACTIONS:
+                    self._replay_step(action_impl, step, prompt, value)
                     return sr
+
+                # ⭐⭐ 回放模式下本步没有可用坐标 → **必须报错，绝不能回退视觉模型**
+                #
+                # 2026-09-22 生产实测（用例 id=73 / 记录 #53）：
+                #   回放模式第 1 步正常点了 (40,794)，第 2 步 assert 失败 → 触发
+                #   "回放失败降级 AI 重跑" → 用户看到报告是「AI 探索」，
+                #   误以为**回放从来没生效过**，反复重跑都"省不了 token"。
+                #
+                # 更隐蔽的坑：回放模式下若某定位步骤**恰好没坐标**，旧逻辑会继续往下走，
+                # 落进"元素树 → 视觉模型"分支 —— 于是"纯回放"的用例里
+                # **悄悄又烧起了模型**，且没有任何日志提示这次不是零 token。
+                # 现在明确判失败，由调用方走"降级重跑"这条唯一出口，
+                # 保证"走了回放"和"烧了 token"不会同时发生、不会互相掩盖。
+                if self.replay_mode and action_impl in self.REPLAY_ACTIONS:
+                    raise ValueError(
+                        '回放模式但第 %d 步（%s）没有可用坐标：'
+                        '该步未采到坐标或被清除固化。请重新执行一次 AI 探索以补齐坐标。'
+                        % (idx + 1, action)
+                    )
+
+                # ---- 精确定位（元素树）----
+                # 依据：WDA /source 的 accessibility 树里有每个元素的精确坐标。
+                # 在底部这种 79px 一个的密集图标条上，让视觉模型"看图猜坐标"
+                # 会猜偏（实测「万年历」被点到相邻的「黄历」，中心仅差 78px）。
+                #
+                # ⚠️⚠️ 只要步骤是 aiTap/aiInput，就**一律先试元素树**，命中就用精确
+                #    坐标，没命中才回退视觉模型。
+                #    这里**故意不看 locate_by_text 的值**（2026-09-21 第二次踩坑）：
+                #    前端 checkbox 未勾选时保存的就是 `false`，与"新步骤默认值"无法区分，
+                #    于是 `is not False` 判断把用户的步骤**静默降级成视觉定位** ——
+                #    表现是"有时准有时不准"，极难排查。
+                #    ⇒ 语义简化为：元素树能命中就命中，命中不了自然会回退，不需要开关。
+                #      locate_by_text 字段保留仅用于**报告标记**，不参与分支。
+                if action_impl in ('aiTap', 'aiInput'):
+                    try:
+                        self._execute_by_text(step, action_impl, sr, prompt, value)
+                        return sr
+                    except Exception as exc:  # noqa: BLE001
+                        # 元素树没命中/元素不可见等 → 回退视觉模型，保证旧用例仍能跑。
+                        self._log('[步骤 %d] 元素定位未命中，回退 AI 视觉定位: %s',
+                                  idx + 1, str(exc)[:200])
+
+
 
                 rpc_params = {
                     'sessionId': self._session_id,
@@ -458,7 +730,23 @@ class MidsceneIOSEngine:
                     'value': value,
                     'locate': step.get('selector_hint') or '',
                 }
-                res = self._rpc(action, rpc_params)
+                # 条件等待：SDK 的 aiWaitFor 要等到条件成立才返回，必须带超时，
+                # 否则页面一直不出现目标元素就会长时间挂住。Android/Web 侧同语义。
+                if action_impl == 'aiWaitFor':
+                    rpc_params['timeoutMs'] = self._wait_for_timeout(step)
+                    self._log('[步骤 %d] 等待元素「%s」出现（超时 %dms）',
+                              idx + 1, prompt, rpc_params['timeoutMs'])
+
+                # ⭐⭐ 采坐标：视觉模型路径要"固化为可复用脚本"就必须留下坐标。
+                #    `aiTap` 返回 void，拿不到"点到哪了"，所以这里额外调一次
+                #    `aiLocate`（纯定位、不点击）。**只在非回放路径发生**，
+                #    固化后走 replay 分支根本不会到这里，所以不会增加常态开销。
+                #    ❗ 必须在**操作之前**采：点击可能切页，之后坐标就没意义了。
+                if not self.replay_mode and action_impl in ('aiTap', 'aiAct', 'aiInput'):
+                    self._capture_location(action_impl, sr, prompt, step, rpc_params)
+
+                # 用内部方法名调 RPC（Node 服务只认 aiAssert，不认前端的 assert）
+                res = self._rpc(action_impl, rpc_params)
                 # 真实 usage 由 LLM 代理记录；代理没生效时按截图尺寸估算，
                 # 保证"这次执行花了多少"永远有数字可看。
                 try:
@@ -466,12 +754,12 @@ class MidsceneIOSEngine:
                     record_step_estimate(prompt=prompt)
                 except Exception:  # noqa: BLE001
                     pass
-                if action == 'aiQuery':
+                if action_impl == 'aiQuery':
                     sr['extract']['_query'] = res.get('result')
-                elif action in ('aiAssert',):
+                elif action_impl in ('aiAssert',):
                     sr['assert'] = {'pass': True, 'reason': ''}
 
-                # 采到的定位结果（坐标）留下来，供「固化为脚本」使用
+                # Node 侧若在操作结果里直接带了坐标（tapByText 之类），优先用它
                 loc = res.get('location') or {}
                 if loc.get('ok') and loc.get('center'):
                     sr['location'] = {
@@ -486,10 +774,10 @@ class MidsceneIOSEngine:
             else:
                 raise ValueError('不支持的 action: %s' % action)
 
-            if action == 'aiAssert':
+            if action_impl == 'aiAssert':
                 sr['assert'] = {'pass': True, 'reason': ''}
 
-            if wait_ms and action != 'wait':
+            if wait_ms and action_impl != 'wait':
                 time.sleep(wait_ms / 1000.0)
 
             # 每步执行后都留一张实拍截图：报告里要能"步骤 ↔ 画面"一一对应。
@@ -546,6 +834,14 @@ class MidsceneIOSEngine:
         wait_ms = int(step.get('wait_ms') or 0)
         if wait_ms:
             time.sleep(wait_ms / 1000.0)
+
+    def _wait_for_timeout(self, step):
+        """取本步条件等待的超时（毫秒）：优先步骤的 timeout_ms，否则用默认值。"""
+        try:
+            val = int(step.get('timeout_ms') or 0)
+        except (TypeError, ValueError):
+            val = 0
+        return val or self.DEFAULT_WAIT_FOR_TIMEOUT_MS
 
     def _popup_adapter(self):
         """把本引擎的能力包成 popup_handler 需要的接口。"""

@@ -71,12 +71,24 @@
             <span v-else style="color: #c0c4cc;">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="执行方式" width="110" align="center">
+        <el-table-column label="执行方式" width="130" align="center">
           <template #default="{ row }">
-            <!-- 第一次用自然语言跑通后会自动固化坐标，之后走纯坐标回放、不调模型 -->
+            <!-- 第一次用自然语言跑通后会自动固化坐标，之后走纯坐标回放、不调模型。
+                 固化是在执行结束、结果落库后才写入的 —— 执行后这里会自动轮询刷新，
+                 期间显示「固化中…」提示用户"还没轮到固化"，避免误判固化失效。 -->
             <el-tag v-if="row.steps_frozen_at" type="success" size="small" effect="plain">
               脚本回放
             </el-tag>
+            <el-tooltip
+              v-else-if="isFrozenPolling(row)"
+              content="首次执行跑通后会自动固化为脚本回放，正在自动刷新状态…"
+              placement="top"
+            >
+              <el-tag type="warning" size="small" effect="plain">
+                <el-icon class="is-loading"><Loading /></el-icon>
+                固化中…
+              </el-tag>
+            </el-tooltip>
             <el-tag v-else-if="row.execution_mode === 'midscene'" type="warning" size="small" effect="plain">
               AI 探索
             </el-tag>
@@ -305,13 +317,43 @@
 
               <div class="steps-toolbar">
                 <el-button size="small" type="primary" @click="addStep">+ 新增步骤</el-button>
+                <el-button
+                  size="small"
+                  type="warning"
+                  plain
+                  :loading="matching"
+                  @click="handleMatchElements"
+                >
+                  用元素库校正定位
+                </el-button>
+                <el-checkbox v-model="matchOverwrite" size="small" style="margin-left: 4px">
+                  重新匹配（覆盖已填定位）
+                </el-checkbox>
                 <span class="hint">使用自然语言描述操作，如“点击登录按钮”“在搜索框输入关键词”</span>
+              </div>
+
+              <div v-if="matchSummary" class="match-summary">
+                <el-tag size="small" type="success" effect="plain">已补上 {{ matchSummary.matched }}</el-tag>
+                <el-tag v-if="matchSummary.ambiguous" size="small" type="warning" effect="plain" style="margin-left: 6px">
+                  同名待选 {{ matchSummary.ambiguous }}
+                </el-tag>
+                <el-tag v-if="matchSummary.not_found" size="small" type="danger" effect="plain" style="margin-left: 6px">
+                  库里没有 {{ matchSummary.not_found }}
+                </el-tag>
+                <el-tag v-if="matchSummary.skipped" size="small" type="info" effect="plain" style="margin-left: 6px">
+                  跳过 {{ matchSummary.skipped }}
+                </el-tag>
               </div>
 
               <div v-for="(step, index) in editForm.steps" :key="index" class="step-card">
                 <div class="step-head">
                   <span class="step-no">步骤 {{ index + 1 }}</span>
-                  <el-button size="small" type="danger" @click="removeStep(index)">删除</el-button>
+                  <div class="step-ops">
+                    <el-button size="small" text :disabled="index === 0" title="与上一步交换位置" @click="moveStepUp(index)">上移</el-button>
+                    <el-button size="small" text :disabled="index === editForm.steps.length - 1" title="与下一步交换位置" @click="moveStepDown(index)">下移</el-button>
+                    <el-button size="small" text type="primary" title="在这一步后面插入一个新步骤" @click="insertStepAfter(index)">＋ 在此后插入</el-button>
+                    <el-button size="small" type="danger" @click="removeStep(index)">删除</el-button>
+                  </div>
                 </div>
 
                 <el-row :gutter="10">
@@ -322,6 +364,7 @@
                         <el-option value="aiTap" label="aiTap（点击）" />
                         <el-option value="aiInput" label="aiInput（输入）" />
                         <el-option value="aiQuery" label="aiQuery（提取）" />
+                        <el-option value="aiWaitFor" label="aiWaitFor（等待元素出现）" />
                       </el-select>
                     </el-form-item>
                   </el-col>
@@ -333,11 +376,87 @@
                 </el-row>
 
                 <el-form-item label="自然语言指令">
-                  <el-input v-model="step.prompt" type="textarea" :rows="2" placeholder="用语义描述，禁止写坐标" />
+                  <el-input v-model="step.prompt" type="textarea" :rows="2" :placeholder="stepPromptPlaceholder(step)" />
+                </el-form-item>
+
+                <!-- 定位元素（selector_hint）：与「自然语言指令」分工 —— 这里只管
+                     「点哪里/在哪输入」，指令管「要做什么」。引擎取值 target =
+                     selector_hint || prompt，所以填了它就以它为准。
+                     ⚠️ 以前用例编辑器没有这个输入框（只有公共步骤库/Playground 有），
+                     导致「点击底部万年历标签」这类描述只能靠模型自由定位，
+                     实测会点到相邻的「天气」tab 且**不报错**（status=success）。 -->
+                <el-form-item v-if="supportsLocator(step.action)" label="定位元素">
+                  <el-input v-model="step.selector_hint" placeholder="可选。填了就以它为准，如：底部导航栏从左数第1个「万年历」" />
+                  <span class="form-hint">
+                    定位不准时填这个：用<b>屏幕上能看到的特征</b>描述位置（图标文字、所在区域、从左/右数第几个），
+                    比写「点击XX」更能命中。
+                  </span>
+                  <!-- 元素库校正结论：告诉用户这条到底补上了没有、没补的原因是什么 -->
+                  <div v-if="step._match" class="match-line">
+                    <el-tag size="small" :type="matchType(step)" effect="plain">
+                      {{ matchLabel(step) }}
+                    </el-tag>
+                  </div>
+                  <!-- 同名歧义：把候选项摊开让用户点选。
+                       ⚠️ 必须给出"人能做决定"的依据（可见文字/控件类型/位置/页面），
+                       只列 id 和定位表达式等于没给选择（本次修的正是这个问题）。 -->
+                  <div
+                    v-if="step._match && step._match.status === 'ambiguous'"
+                    class="cand-list"
+                  >
+                    <div
+                      v-for="cand in step._match.candidates"
+                      :key="cand.id"
+                      class="cand-row"
+                      :class="{ 'cand-row--disabled': cand.cross_device === false }"
+                      @click="pickCandidate(index, cand)"
+                    >
+                      <div class="cand-main">
+                        <span class="cand-page">{{ cand.page_label }}</span>
+                        <span class="cand-hint">{{ candidateHint(cand) }}</span>
+                        <!-- 坐标类元素：看得见但选不了。必须说明原因，
+                             否则用户会以为界面坏了 -->
+                        <el-tag v-if="cand.cross_device === false" size="small" type="danger" effect="plain">
+                          换设备会错位，不可用
+                        </el-tag>
+                      </div>
+                      <div class="cand-value mono">{{ cand.value }}</div>
+                      <div v-if="cand.cross_device === false" class="cand-warn">
+                        {{ cand.unusable_reason }}
+                      </div>
+                    </div>
+                    <div class="cand-tip">
+                      点一行即选中；也可以先把 App 操作到目标页、回「元素拾取器」重抓一次，
+                      元素库里就会带上那一页的信息
+                    </div>
+                  </div>
+
+                  <!-- 未命中：给"名字相近"的线索，用户往往只是写法不同（如拼音 id） -->
+                  <div
+                    v-else-if="step._match && step._match.near && step._match.near.length"
+                    class="cand-tip"
+                  >
+                    元素库里名字相近的有：
+                    <span v-for="(n, ni) in step._match.near" :key="n.id">
+                      <span class="near-name">{{ n.name }}</span><span v-if="ni < step._match.near.length - 1">、</span>
+                    </span>
+                  </div>
+                  <div v-if="isIOSMode" class="locate-exact" style="margin-top: 6px">
+                    <span class="form-hint">
+                      iOS 会自动优先按元素文字精确定位，找不到则回退 AI。
+                    </span>
+                  </div>
                 </el-form-item>
 
                 <el-form-item v-if="step.action === 'aiInput'" label="输入值">
                   <el-input v-model="step.value" placeholder="要输入的内容" />
+                </el-form-item>
+
+                <!-- aiWaitFor：等到条件成立才继续，必须有上限，否则页面一直不出现
+                     目标元素会长时间挂住。0 = 用引擎默认（15 秒）。 -->
+                <el-form-item v-if="step.action === 'aiWaitFor'" label="超时(ms)">
+                  <el-input-number v-model="step.timeout_ms" :min="0" :step="1000" controls-position="right" />
+                  <span class="form-hint" style="margin-left: 10px">最多等这么久；0 = 默认 15 秒</span>
                 </el-form-item>
               </div>
 
@@ -424,14 +543,53 @@
               <div class="steps-toolbar">
                 <el-button size="small" @click="loadNeutralExample">载入中性示例</el-button>
                 <el-button size="small" type="primary" @click="addStep">+ 新增步骤</el-button>
+                <el-button size="small" type="success" plain @click="insertLaunchFirst">
+                  + 插入「启动应用」
+                </el-button>
+                <!-- 用元素库校正定位：AI 生成的步骤只有描述、定位靠模型猜，
+                     这里把它对上元素库里实测的 locator（iOS=元素文案、Android=xpath） -->
+                <el-button
+                  size="small"
+                  type="warning"
+                  plain
+                  :loading="matching"
+                  @click="handleMatchElements"
+                >
+                  用元素库校正定位
+                </el-button>
+                <el-checkbox v-model="matchOverwrite" size="small" style="margin-left: 4px">
+                  重新匹配（覆盖已填定位）
+                </el-checkbox>
                 <span class="hint">业务无关：步骤里的 extract 可提取任意数据写入上下文，后续步骤用 <code>${{ '{' }}key{{ '}' }}</code> 引用</span>
+              </div>
+
+              <!-- 校正结果摘要：不隐藏任何一类结果，用户才知道下一步该改什么 -->
+              <div v-if="matchSummary" class="match-summary">
+                <el-tag size="small" type="success" effect="plain">已补上 {{ matchSummary.matched }}</el-tag>
+                <el-tag v-if="matchSummary.ambiguous" size="small" type="warning" effect="plain" style="margin-left: 6px">
+                  同名待选 {{ matchSummary.ambiguous }}
+                </el-tag>
+                <el-tag v-if="matchSummary.not_found" size="small" type="danger" effect="plain" style="margin-left: 6px">
+                  库里没有 {{ matchSummary.not_found }}
+                </el-tag>
+                <el-tag v-if="matchSummary.skipped" size="small" type="info" effect="plain" style="margin-left: 6px">
+                  跳过 {{ matchSummary.skipped }}
+                </el-tag>
+                <span class="hint" style="margin-left: 8px">
+                  未命中的步骤会自动回退 AI 定位，不影响执行；想命中请先在「元素拾取器」抓取该页面元素
+                </span>
               </div>
 
               <div v-for="(step, idx) in editForm.steps" :key="idx" class="step-card" :class="{ 'step-card--ref': stepSource(step) === 'ref' }">
                 <div class="step-head">
                   <span class="step-no">步骤 {{ idx + 1 }}</span>
                   <el-tag v-if="stepSource(step) === 'ref'" size="small" type="warning" style="margin-left: 8px">引用公共步骤</el-tag>
-                  <el-button size="small" type="danger" text @click="removeStep(idx)">删除</el-button>
+                  <div class="step-ops">
+                    <el-button size="small" text :disabled="idx === 0" title="与上一步交换位置" @click="moveStepUp(idx)">上移</el-button>
+                    <el-button size="small" text :disabled="idx === editForm.steps.length - 1" title="与下一步交换位置" @click="moveStepDown(idx)">下移</el-button>
+                    <el-button size="small" text type="primary" title="在这一步后面插入一个新步骤" @click="insertStepAfter(idx)">＋ 在此后插入</el-button>
+                    <el-button size="small" type="danger" text @click="removeStep(idx)">删除</el-button>
+                  </div>
                 </div>
 
                 <!-- 步骤来源：直接操作 / 引用公共步骤
@@ -507,6 +665,7 @@
                           <el-option label="aiInput 输入" value="aiInput" />
                           <el-option label="aiAct 操作" value="aiAct" />
                           <el-option label="aiQuery 查询" value="aiQuery" />
+                          <el-option label="aiWaitFor 等待元素出现" value="aiWaitFor" />
                           <el-option label="assert 断言" value="assert" />
                           <el-option label="launch 启动" value="launch" />
                           <el-option label="back 返回" value="back" />
@@ -523,7 +682,83 @@
                     </el-col>
                   </el-row>
                   <el-form-item label="提示词" :prop="`steps.${idx}.prompt`" label-width="50px" :required="!['launch','back','home','wait','screenshot'].includes(step.action)">
-                    <el-input v-model="step.prompt" type="textarea" :rows="2" placeholder="如：点击右下角的“我的”标签；支持 ${{ '{' }}key{{ '}' }} 引用上下文" />
+                    <el-input v-model="step.prompt" type="textarea" :rows="2" :placeholder="stepPromptPlaceholder(step)" />
+                  </el-form-item>
+                  <!-- 定位元素（selector_hint）：见上方 Web 分支的同名注释。
+                       与「提示词」分工：这里管「点哪里/在哪输入」，提示词管「要做什么」。
+                       引擎 target = selector_hint || prompt，填了就以它为准。 -->
+                  <el-form-item v-if="supportsLocator(step.action)" label="定位" label-width="50px">
+                    <el-input v-model="step.selector_hint" placeholder="可选。定位不准时填，如：底部导航栏从左数第1个「万年历」" />
+                    <div class="form-hint">
+                      用<b>屏幕上能看到的特征</b>描述位置（图标文字、所在区域、从左/右数第几个）。
+                      元素密集时（如底部图标条）建议填写，否则模型可能点到旁边的元素且不报错。
+                    </div>
+                    <!-- 元素库校正结论：这条到底补上了没有、没补的原因 -->
+                    <div v-if="step._match" class="match-line">
+                      <el-tag size="small" :type="matchType(step)" effect="plain">
+                        {{ matchLabel(step) }}
+                      </el-tag>
+                    </div>
+                    <!-- 同名歧义：摊开候选项让用户点选（同 Web 分支） -->
+                    <div
+                      v-if="step._match && step._match.status === 'ambiguous'"
+                      class="cand-list"
+                    >
+                      <div
+                        v-for="cand in step._match.candidates"
+                        :key="cand.id"
+                        class="cand-row"
+                        :class="{ 'cand-row--disabled': cand.cross_device === false }"
+                        @click="pickCandidate(idx, cand)"
+                      >
+                        <div class="cand-main">
+                          <span class="cand-page">{{ cand.page_label }}</span>
+                          <span class="cand-hint">{{ candidateHint(cand) }}</span>
+                          <el-tag v-if="cand.cross_device === false" size="small" type="danger" effect="plain">
+                            换设备会错位，不可用
+                          </el-tag>
+                        </div>
+                        <div class="cand-value mono">{{ cand.value }}</div>
+                        <div v-if="cand.cross_device === false" class="cand-warn">
+                          {{ cand.unusable_reason }}
+                        </div>
+                      </div>
+                      <div class="cand-tip">
+                        点一行即选中；也可以先把 App 操作到目标页、回「元素拾取器」重抓一次，
+                        元素库里就会带上那一页的信息
+                      </div>
+                    </div>
+                    <div
+                      v-else-if="step._match && step._match.near && step._match.near.length"
+                      class="cand-tip"
+                    >
+                      元素库里名字相近的有：
+                      <span v-for="(n, ni) in step._match.near" :key="n.id">
+                        <span class="near-name">{{ n.name }}</span><span v-if="ni < step._match.near.length - 1">、</span>
+                      </span>
+                    </div>
+                    <!-- 精确定位：iOS 上自动生效（不走视觉模型，直接查 WDA 元素树按文本取坐标）。
+                         ⚠️ 这里**不再提供开关** —— 曾经用 checkbox 控制，但未勾选时保存的是
+                         false，与"新步骤默认值"无法区分，导致步骤被静默降级成视觉定位
+                         （表现"有时准有时不准"，极难排查）。现在一律先试元素树，
+                         命中不了自动回退 AI，无需用户干预。 -->
+                    <div v-if="isIOSMode" class="locate-exact">
+                      <span class="form-hint">
+                        iOS 会<b>自动优先按元素文字精确定位</b>（不走 AI 看图）：上面填的文字会先在
+                        页面元素树里精确查找，命中就用元素自身坐标点击，<b>找不到则自动回退 AI 定位</b>。
+                      </span>
+                      <div class="exact-extra">
+                        <el-select v-model="step.locate_region" size="small" style="width: 150px" clearable placeholder="同名元素取哪个（可选）">
+                          <el-option label="最下方（底部按钮）" value="lowest" />
+                          <el-option label="最上方" value="highest" />
+                          <el-option label="下半屏" value="bottom" />
+                          <el-option label="上半屏" value="top" />
+                        </el-select>
+                        <span class="form-hint">
+                          页面有同名元素时用（如顶部与底部都有「黄历」）；句子含「底部/导航栏」会自动推断
+                        </span>
+                      </div>
+                    </div>
                   </el-form-item>
                   <el-row :gutter="12">
                     <el-col :span="12">
@@ -537,6 +772,13 @@
                       </el-form-item>
                     </el-col>
                   </el-row>
+
+                  <!-- aiWaitFor：等到条件成立才继续，必须有上限，否则页面一直不出现
+                       目标元素会长时间挂住。0 = 用引擎默认（15 秒）。 -->
+                  <el-form-item v-if="step.action === 'aiWaitFor'" label="超时(ms)" label-width="70px">
+                    <el-input-number v-model="step.timeout_ms" :min="0" :step="1000" controls-position="right" />
+                    <span class="form-hint" style="margin-left: 10px">最多等这么久；0 = 默认 15 秒</span>
+                  </el-form-item>
 
                   <!-- extract：提取业务数据到上下文 -->
                   <el-form-item label="提取" label-width="50px">
@@ -583,9 +825,11 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Search, VideoPlay, Edit, Delete, Plus, MagicStick } from '@element-plus/icons-vue'
+import {
+  Search, VideoPlay, Edit, Delete, Plus, MagicStick, Loading
+} from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import {
   getAICases,
@@ -599,6 +843,7 @@ import {
   generateCaseSteps,
   refreshDeviceStatus
 } from '@/api/ui_automation'
+import { matchStepsToElements } from '@/api/element-picker'
 import { useUnifiedProjects } from '@/utils/useUnifiedProjects'
 
 const router = useRouter()
@@ -734,6 +979,7 @@ const switchStepSource = (step, source) => {
     if (step.prompt === undefined) step.prompt = ''
     if (step.value === undefined) step.value = ''
     if (step.wait_ms === undefined) step.wait_ms = 0
+    if (step.timeout_ms === undefined) step.timeout_ms = 0
     if (!step.extract) step.extract = []
     if (!step.assert) step.assert = { prompt: '', expect: '' }
   }
@@ -825,8 +1071,9 @@ const handleProjectChange = () => {
 }
 
 // 加载用例列表
-const loadCases = async () => {
-  loading.value = true
+// silent=true 用于轮询刷新：不显示 loading、不弹错误（后台静默更新「执行方式」标签）。
+const loadCases = async (silent = false) => {
+  if (!silent) loading.value = true
   try {
     const response = await getAICases({
       page: pagination.currentPage,
@@ -838,11 +1085,84 @@ const loadCases = async () => {
     total.value = response.data.count || 0
   } catch (error) {
     console.error('获取用例列表失败:', error)
-    ElMessage.error('获取用例列表失败')
+    if (!silent) ElMessage.error('获取用例列表失败')
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
+
+// ---- 执行后自动刷新「执行方式」标签 ----
+//
+// 背景（2026-09-22 实测暴露）：固化（steps_frozen_at）是在**执行结束、结果落库之后**
+// 才写入的，而「执行方式」标签读的就是 steps_frozen_at。
+// 旧实现里点完「执行」直接 router.push 跳到执行记录页，列表根本没重新拉过
+// → 用户跑通后回到列表，看到的仍是「AI 探索」，**无法判断到底固化成功没有**，
+//   甚至误以为固化没生效（实际只是前端没刷新）。
+//
+// 现在的行为：执行开始后**在后台轮询**用例列表（默认 5s 一次，最多 40 次 ≈ 3.3 分钟，
+// 覆盖大部分 APP 用例的执行时长）。一旦发现 steps_frozen_at 由空变非空，
+// 立刻停轮询并提示「已固化为脚本回放」，用户切回列表就能看到最新状态。
+const POLL_INTERVAL_MS = 5000
+const POLL_MAX_TRIES = 40
+const frozenPolling = ref(false)
+let pollTimer = null
+
+const stopFrozenPolling = () => {
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+  frozenPolling.value = false
+}
+
+// 记录轮询开始时「还没固化」的用例 id，只有它们才值得等固化结果。
+const pollPendingIds = ref([])
+
+const startFrozenPolling = (caseIds) => {
+  stopFrozenPolling()
+  const ids = (caseIds || []).filter(Boolean)
+  if (!ids.length) return
+
+  // 只盯「当前还没固化」的用例；已固化的不需要等
+  pollPendingIds.value = cases.value
+    .filter((c) => ids.includes(c.id) && !c.steps_frozen_at)
+    .map((c) => c.id)
+  if (!pollPendingIds.value.length) return
+
+  frozenPolling.value = true
+  let tries = 0
+  const tick = async () => {
+    if (!frozenPolling.value) return
+    tries += 1
+    await loadCases(true)
+
+    const nowFrozen = cases.value.filter(
+      (c) => pollPendingIds.value.includes(c.id) && c.steps_frozen_at
+    )
+    if (nowFrozen.length) {
+      stopFrozenPolling()
+      ElMessage.success(
+        `「${nowFrozen.map((c) => c.name).join('、')}」已固化为脚本回放，` +
+        '之后重复执行不再消耗模型 token'
+      )
+      return
+    }
+    if (tries >= POLL_MAX_TRIES) {
+      stopFrozenPolling()
+      return
+    }
+    pollTimer = setTimeout(tick, POLL_INTERVAL_MS)
+  }
+  pollTimer = setTimeout(tick, POLL_INTERVAL_MS)
+}
+
+// 该行是否正处于"等待固化"的自动轮询中（用于把标签显示成「固化中…」）
+const isFrozenPolling = (row) =>
+  frozenPolling.value && pollPendingIds.value.includes(row.id)
+
+onUnmounted(() => {
+  stopFrozenPolling()
+})
 
 const handleSearch = () => {
   pagination.currentPage = 1
@@ -862,17 +1182,111 @@ const resetSteps = () => {
   editForm.steps = []
 }
 
+// 新建一个空白步骤（结构与 addStep 一致，抽出来供「末尾追加」和「插入到指定位置」共用）
+// 提示词的 placeholder：aiWaitFor 的语义是"等什么出现"，跟其他动作不一样，
+// 文案写不对用户会以为要描述操作。这里统一给两个编辑器分支共用。
+const stepPromptPlaceholder = (step) => (
+  step && step.action === 'aiWaitFor'
+    ? '要等什么出现，如：首页的搜索框出现'
+    : '如：点击右下角的「我的」标签；支持 ${key} 引用上下文'
+)
+
+// 哪些动作支持「定位元素」(selector_hint)。
+// 引擎侧只有 aiTap / aiInput 会消费它（target = selector_hint || prompt），
+// 所以只在需要"落到具体元素上"的动作显示，避免给 aiAct/aiQuery 用户造成误解。
+const LOCATOR_ACTIONS = ['aiTap', 'aiInput']
+const supportsLocator = (action) => LOCATOR_ACTIONS.includes(action)
+
+// 「精确定位」（locate_by_text）目前只有 iOS 可用：
+// iOS 侧走 WDA /source 的元素树按文本取坐标；Android 侧尚无该通道，
+// 所以开关只在被测应用是 iOS 时显示，避免给 Android 用户一个点了没用的选项。
+const isIOSMode = computed(() => {
+  const cfg = appConfigs.value.find((c) => c.id === editForm.app_config)
+  return !!cfg && String(cfg.platform || '').toLowerCase() === 'ios'
+})
+
+const newStep = () => ({
+  _src: 'inline',
+  action: 'aiTap',
+  name: '',
+  prompt: '',
+  // 定位元素：与提示词分工，管"点哪里/在哪输入"（引擎 target = hint || prompt）
+  selector_hint: '',
+  // 用户手动选定的元素库元素 id。**要落库**：下次打开用例时用它把
+  // 已选元素还原成"已命中"，否则用户每次都要重新在候选项里挑一遍。
+  // 引擎不消费该字段，纯做来源记录。
+  locate_element_id: null,
+  // 精确定位（仅 iOS）：走 WDA 元素树按文本取坐标，不走视觉模型。
+  // locate_region/index 用于页面存在同名元素时消歧。
+  locate_by_text: false,
+  locate_region: '',
+  locate_index: 0,
+  // 元素库校正结论（仅界面展示，保存时会被剔除）：
+  // matched/ambiguous/not_found/skipped + reason
+  _match: null,
+  value: '',
+  wait_ms: 0,
+  // aiWaitFor 的等待上限（0 = 用引擎默认 15 秒）；其他动作忽略该字段
+  timeout_ms: 0,
+  extract: [],
+  assert: { prompt: '', expect: '' }
+})
+
 const addStep = () => {
-  editForm.steps.push({
-    _src: 'inline',
-    action: 'aiTap',
-    name: '',
-    prompt: '',
-    value: '',
-    wait_ms: 0,
-    extract: [],
-    assert: { prompt: '', expect: '' }
-  })
+  editForm.steps.push(newStep())
+}
+
+// 在第 idx 步【之后】插入一个新步骤。idx 传 -1 表示插到最前面。
+// 用途：不必先追加到末尾再一路往上挪，想插哪就插哪。
+const insertStepAfter = (idx) => {
+  editForm.steps.splice(idx + 1, 0, newStep())
+}
+
+// 一键在最前面插入「启动应用」步骤。
+//
+// 背景：用例执行时如果被测应用不在前台（被杀掉、手机停在系统桌面、
+// 或上一次执行跳到了别的 App），后面每一步都会在“错误的页面”上找元素，
+// 报 failed to locate element —— 用户看到的是「找不到某个按钮」，
+// 很难联想到根因是应用压根没启动。开头放一个 launch 是标准前置。
+//
+// prompt 填「包名/Bundle ID」而不是应用名：
+//   * Android 引擎内部直接用 app_config.package_name，不看 prompt；
+//   * iOS 引擎会把人名回退到用例绑定的 bundle id（也是 app_config）。
+// 填包名两边都能精确命中，且万一用户改了应用配置也仍然对得上。
+const insertLaunchFirst = () => {
+  const cfg = appConfigs.value.find(c => c.id === editForm.app_config)
+  if (!cfg) {
+    ElMessage.warning('请先在上方选择「应用配置」，再插入启动步骤')
+    return
+  }
+  // 已经有启动步骤就别重复插（用户可能只是想确认一下）
+  const first = editForm.steps[0]
+  if (first && stepSource(first) === 'inline' && first.action === 'launch') {
+    ElMessage.info('第一个步骤已经是「launch 启动」，无需重复插入')
+    return
+  }
+  const step = newStep()
+  step.action = 'launch'
+  step.name = '启动应用'
+  step.prompt = cfg.package_name || cfg.name || ''
+  editForm.steps.unshift(step)
+  ElMessage.success(
+    `已在最前面插入「启动应用」（${step.prompt || '未配置包名'}），记得保存`
+  )
+}
+
+// 上移/下移：与相邻步骤交换。边界由模板里的 :disabled 兜住，
+// 这里再做一次保护，避免快速连点时越界。
+const moveStepUp = (idx) => {
+  if (idx <= 0 || idx >= editForm.steps.length) return
+  const arr = editForm.steps
+  ;[arr[idx - 1], arr[idx]] = [arr[idx], arr[idx - 1]]
+}
+
+const moveStepDown = (idx) => {
+  if (idx < 0 || idx >= editForm.steps.length - 1) return
+  const arr = editForm.steps
+  ;[arr[idx], arr[idx + 1]] = [arr[idx + 1], arr[idx]]
 }
 
 const removeStep = (idx) => {
@@ -898,6 +1312,175 @@ const loadNeutralExample = () => {
 const nlText = ref('')
 const nlGenerating = ref(false)
 
+// ---- 用元素库校正定位（selector_hint）----
+// 背景：自然语言生成的步骤只有 prompt，定位仍靠视觉模型看图猜坐标 ——
+// 密集图标条上必然点不准，而且点错不报错。元素库里已经有设备实测的精确
+// locator（iOS = 元素文案、Android = xpath），这里负责把两者接上。
+// 刻意做成"显式点一下"而不是全自动：匹配结果决定点哪里，必须看得见、能改。
+const matching = ref(false)
+const matchOverwrite = ref(false)
+// 匹配结果摘要，展示在 nl-box 下方（matched / ambiguous / not_found 计数）
+const matchSummary = ref(null)
+
+// 用户对歧义步骤的显式选择：{ 步骤下标: element_id }。
+// 需要保存：① 点「校正」重跑时要带上去（否则选择丢失）；
+//          ② 保存用例时把它落库（见 confirmEdit），这样下次打开不用再选一遍。
+const matchPicks = ref({})
+
+const resetMatchSummary = () => {
+  matchSummary.value = null
+  editForm.steps.forEach((s) => { if (s) delete s._match })
+}
+
+const resetMatchState = () => {
+  resetMatchSummary()
+  matchPicks.value = {}
+}
+
+// 歧义步骤：从候选中选一个。选中即写入定位，并记下选择。
+const pickCandidate = (index, cand) => {
+  const step = editForm.steps[index]
+  if (!step || !cand) return
+  // 坐标类元素不能选：它的定位值换设备就失效，写进用例必然错位，
+  // 而且引擎的坐标护栏会把它拦成 failed。后端也拦了一道，这里先给可读提示。
+  if (cand.cross_device === false) {
+    ElMessage.warning(cand.unusable_reason || '这条元素是设备相关的定位（坐标类），换设备会错位，不能选中')
+    return
+  }
+  step.selector_hint = cand.value
+  // 落库字段（引擎不消费，仅记录"这个定位是人从元素库里挑的哪一条"）
+  step.locate_element_id = cand.id
+  matchPicks.value = { ...matchPicks.value, [index]: cand.id }
+  step._match = {
+    status: 'matched',
+    how: 'picked',
+    from: '手动选择',
+    element_id: cand.id,
+    element_name: cand.name,
+    page: cand.page || '',
+    strategy: cand.strategy,
+    value: cand.value
+  }
+  // 选完刷新摘要计数，否则标签还显示"同名待选 1"，看起来像没生效
+  recomputeMatchSummary()
+}
+
+const recomputeMatchSummary = () => {
+  const buckets = { matched: 0, ambiguous: 0, not_found: 0, no_candidate: 0, skipped: 0 }
+  editForm.steps.forEach((s) => {
+    const st = s && s._match && s._match.status
+    if (st && buckets[st] !== undefined) buckets[st] += 1
+  })
+  matchSummary.value = buckets
+}
+
+// 候选摘要行：后端已算好 hint（可见文字/控件类型/位置），
+// 历史数据没有这些信息时退化显示描述或定位值，不留空白。
+const candidateHint = (cand) => {
+  if (!cand) return ''
+  if (cand.hint) return cand.hint
+  return cand.description || cand.value || ''
+}
+
+// 把「统一项目 id」转成元素库能用的真实 UiProject id。
+// ⚠️ 前端项目选择器用的是统一项目源，id 形如 `ui_9` / `proj_2`，
+//    而元素库的 project 外键是真实整数 id —— 直接传前缀 id 后端会
+//    ValueError -> 500（生产实测踩到）。统一项目对象上带有 real_id。
+const resolveElementProjectId = (projectId) => {
+  if (!projectId) return { id: null, error: '请先选择「所属项目」—— 元素库是按项目存的' }
+  const raw = String(projectId)
+  // 已是纯数字：直接用
+  if (/^\d+$/.test(raw)) return { id: Number(raw), error: '' }
+  // proj_ 前缀 = AI 用例生成项目，不在元素库支持范围内
+  if (/^proj_/i.test(raw)) {
+    return { id: null, error: '这是 AI 用例生成项目，元素库只支持 UI 自动化项目。请在「UI自动化 → 项目管理」里选择或创建一个 UI 项目' }
+  }
+  // ui_ 前缀：优先用统一项目对象上的 real_id
+  const item = allProjects.value.find((p) => String(p.id) === raw)
+  if (item && item.real_id) return { id: Number(item.real_id), error: '' }
+  const m = raw.match(/(\d+)$/)
+  return m ? { id: Number(m[1]), error: '' } : { id: null, error: '项目 id 无法识别: ' + raw }
+}
+
+const handleMatchElements = async () => {
+  resetMatchSummary()
+  if (!editForm.steps.length) {
+    ElMessage.warning('还没有步骤，先用「AI 生成步骤」或「+ 新增步骤」')
+    return
+  }
+  const resolved = resolveElementProjectId(editForm.project)
+  if (resolved.error) {
+    ElMessage.warning(resolved.error)
+    return
+  }
+  // 平台：优先按被测应用推导（元素库按平台隔离，iOS 与 Android 的 locator 不通用）
+  const cfg = appConfigs.value.find((c) => c.id === editForm.app_config)
+  const platform = cfg && cfg.platform ? String(cfg.platform).toLowerCase() : ''
+
+  matching.value = true
+  try {
+    const res = await matchStepsToElements({
+      project_id: resolved.id,
+      platform: platform || undefined,
+      overwrite: matchOverwrite.value,
+      // 带上用户之前的选择：人的判断永远优先于匹配规则，
+      // 而且不带上就会"点一下校正、刚选好的又变回歧义"。
+      picks: matchPicks.value,
+      steps: editForm.steps.map((s) => ({
+        action: s.action || '',
+        prompt: s.prompt || '',
+        selector_hint: s.selector_hint || ''
+      }))
+    })
+    const data = res.data || {}
+    if (data.error) {
+      ElMessage.warning(data.error)
+      return
+    }
+    // 只回填 selector_hint 与匹配结论，其余字段保持编辑器中用户已改的内容
+    const steps = Array.isArray(data.steps) ? data.steps : []
+    editForm.steps.forEach((s, i) => {
+      if (!steps[i]) return
+      if (steps[i].selector_hint) s.selector_hint = steps[i].selector_hint
+      s._match = steps[i]._match || null
+    })
+    recomputeMatchSummary()
+    const buckets = matchSummary.value || {}
+    if (buckets.matched) {
+      ElMessage.success(`已用元素库补上 ${buckets.matched} 个定位，请逐条确认后保存`)
+    } else {
+      ElMessage.warning('没有可自动补上的定位，请看每条步骤下方的说明，或先在「元素拾取器」里抓取元素')
+    }
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.error || '校正失败，请检查元素库是否有该项目的元素')
+  } finally {
+    matching.value = false
+  }
+}
+
+// 匹配结论 → 界面文案。刻意把"为什么没命中"说清楚：
+// 用户点了按钮看到 0 命中却没有任何解释时，只会以为功能坏了。
+const matchLabel = (step) => {
+  const m = step && step._match
+  if (!m) return ''
+  if (m.status === 'matched') {
+    return `已用元素库定位：${m.element_name}${m.page ? '（' + m.page + '）' : ''}`
+  }
+  if (m.status === 'ambiguous') return m.reason || '元素库里有多个同名元素，请手动选择'
+  if (m.status === 'not_found') return m.reason || '元素库里没找到对应元素'
+  if (m.status === 'no_candidate') return m.reason || '没能从描述里提取出元素名'
+  return m.reason || ''
+}
+
+const matchType = (step) => {
+  const st = step && step._match && step._match.status
+  if (st === 'matched') return 'success'
+  if (st === 'ambiguous') return 'warning'
+  if (st === 'not_found' || st === 'no_candidate') return 'danger'
+  return 'info'
+}
+
+
 const handleGenerateSteps = async () => {
   const text = (nlText.value || '').trim()
   if (!text) {
@@ -917,6 +1500,8 @@ const handleGenerateSteps = async () => {
   }
 
   nlGenerating.value = true
+  // 步骤整体被替换了，上一次的元素库校正结论与选择随之作废
+  resetMatchState()
   try {
     const res = await generateCaseSteps({
       text,
@@ -937,8 +1522,14 @@ const handleGenerateSteps = async () => {
       action: s.action || 'aiAct',
       name: s.name || '',
       prompt: s.prompt || '',
+      // LLM 生成时可能带回定位描述；带上以免"界面填了保存却丢字段"
+      selector_hint: s.selector_hint || '',
+      locate_by_text: !!s.locate_by_text,
+      locate_region: s.locate_region || '',
+      locate_index: s.locate_index || 0,
       value: s.value || '',
       wait_ms: s.wait_ms || 0,
+      timeout_ms: s.timeout_ms || 0,
       extract: (s.extract || []).map((e) => ({ ...e })),
       assert: {
         prompt: (s.assert && s.assert.prompt) || '',
@@ -956,6 +1547,7 @@ const handleGenerateSteps = async () => {
 // 新建用例：打开空白对话框
 const openCreate = () => {
   currentCaseId.value = null
+  resetMatchState()
   editForm.name = ''
   editForm.description = ''
   editForm.execution_mode = 'text'
@@ -971,6 +1563,9 @@ const openCreate = () => {
 // 编辑用例
 const editCase = (row) => {
   currentCaseId.value = row.id
+  // 上一次会话的元素库校正结论不能跨用例残留，否则用户会看到
+  // 上一个用例的"已命中"提示，误以为这条也校正过了。
+  resetMatchState()
   editForm.name = row.name
   editForm.description = row.description
   editForm.execution_mode = row.execution_mode || 'text'
@@ -1005,13 +1600,36 @@ const editCase = (row) => {
           action: s.action || '',
           name: s.name || '',
           prompt: s.prompt || '',
+          // 回填必须带上，否则编辑历史用例时定位框是空的、一保存就把库里的值覆盖没了
+          selector_hint: s.selector_hint || '',
+          // 之前手动选过的元素：回填时还原成"已命中"，并恢复选择记录，
+          // 这样"重新匹配"不会把用户的选择又变回歧义
+          locate_element_id: s.locate_element_id || null,
+          locate_by_text: !!s.locate_by_text,
+          locate_region: s.locate_region || '',
+          locate_index: s.locate_index || 0,
           value: s.value || '',
           wait_ms: s.wait_ms || 0,
+          timeout_ms: s.timeout_ms || 0,
           extract: (s.extract || []).map(e => ({ ...e })),
           assert: { prompt: (s.assert && s.assert.prompt) || '', expect: (s.assert && s.assert.expect) || '' }
         }
       })
     : []
+  // 恢复"手动从元素库选过"的步骤：把选择灌回 matchPicks，
+  // 并标记成已命中 —— 否则用户重开用例点一次「校正」，
+  // 之前精心选好的元素又变成"同名待选"了。
+  const restored = {}
+  editForm.steps.forEach((s, i) => {
+    if (s && s.locate_element_id) {
+      restored[i] = s.locate_element_id
+      s._match = { status: 'matched', how: 'picked', from: '手动选择',
+                   element_name: s.selector_hint || ('元素 #' + s.locate_element_id),
+                   value: s.selector_hint || '' }
+    }
+  })
+  matchPicks.value = restored
+  if (Object.keys(restored).length) recomputeMatchSummary()
   showEditDialog.value = true
 }
 
@@ -1095,8 +1713,19 @@ const confirmEdit = async () => {
               action: s.action,
               name: s.name,
               prompt: s.prompt,
+              // ⚠️ 定位元素必须显式带上：这里是逐字段重建（不是直存 raw），
+              // 漏了就是"界面填了、保存后静默消失"（timeout_ms 曾栽过同样的坑）。
+              selector_hint: s.selector_hint || '',
+              // 手动从元素库选定的元素 id：带上才能在下次打开时直接还原成"已选中"，
+              // 不用让用户重复在候选项里挑一遍。
+              locate_element_id: s.locate_element_id || null,
+              // 精确定位三件套同样必须显式带（否则勾了保存后失效）
+              locate_by_text: !!s.locate_by_text,
+              locate_region: s.locate_region || '',
+              locate_index: s.locate_index || 0,
               value: s.value,
               wait_ms: s.wait_ms || 0,
+              timeout_ms: s.timeout_ms || 0,
               extract: (s.extract || []).filter(e => e.key && e.prompt),
               assert: (s.assert && s.assert.prompt)
                 ? { prompt: s.assert.prompt, expect: s.assert.expect }
@@ -1216,6 +1845,7 @@ const runCase = async (row) => {
     try {
       await runAICase(row.id)
       ElMessage.success('用例开始执行')
+      startFrozenPolling([row.id])
       router.push('/ai-intelligent-mode/execution-records')
     } catch (error) {
       console.error('执行失败:', error)
@@ -1305,14 +1935,18 @@ const confirmRun = async () => {
   }
 
   runSubmitting.value = true
+  const ranCaseId = runTargetCase.value.id
   try {
-    await runAICase(runTargetCase.value.id, picked.map((d) => d.id))
+    await runAICase(ranCaseId, picked.map((d) => d.id))
     showRunDialog.value = false
     if (picked.length > 1) {
       ElMessage.success(`已在 ${picked.length} 台设备上并行开始执行`)
     } else {
       ElMessage.success(`已在「${picked[0].name}」上开始执行`)
     }
+    // 后台轮询：跑通并落库后会自动把「执行方式」刷成「脚本回放」，
+    // 用户切回列表即可看到，不必手动刷新。
+    startFrozenPolling([ranCaseId])
     router.push('/ai-intelligent-mode/execution-records')
   } catch (error) {
     console.error('执行失败:', error)
@@ -1417,6 +2051,104 @@ onMounted(() => {
     color: #e6a23c;
   }
 
+  /* 元素库校正：结果摘要 + 每条步骤的匹配结论。
+     用一条浅色提示条把结果和说明放在一起，避免用户点了按钮
+     只看到"0 条命中"却不知道下一步该做什么。 */
+  .match-summary {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: -4px 0 12px;
+    padding: 8px 10px;
+    background: #fdf6ec;
+    border: 1px solid #faecd8;
+    border-radius: 4px;
+  }
+
+  .match-line {
+    margin-top: 6px;
+  }
+
+  /* 同名歧义候选：可点选的行。
+     每行必须给出"人能做决定"的依据（页面 / 可见文字 / 控件类型 / 位置），
+     只显示 id 和定位表达式等于没给选择 —— 那是本次修的问题。 */
+  .cand-list {
+    margin-top: 8px;
+    border: 1px solid #ebeef5;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .cand-row {
+    padding: 6px 10px;
+    cursor: pointer;
+    background: #fff;
+    border-bottom: 1px solid #f5f7fa;
+
+    &:hover {
+      background: #ecf5ff;
+    }
+
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+
+  /* 坐标类元素：看得见但不可选。
+     不隐藏它 —— 用户需要知道"元素库里确实有这条，只是不能用"，
+     否则会以为拾取器漏抓了。 */
+  .cand-row--disabled {
+    cursor: not-allowed;
+    background: #fef0f0;
+
+    &:hover {
+      background: #fef0f0;
+    }
+  }
+
+  .cand-warn {
+    font-size: 12px;
+    color: #f56c6c;
+    margin-top: 2px;
+  }
+
+  .cand-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .cand-page {
+    flex: none;
+    font-size: 12px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: #f4f4f5;
+    color: #606266;
+  }
+
+  .cand-hint {
+    font-size: 12px;
+    color: #303133;
+  }
+
+  .cand-value {
+    font-size: 12px;
+    color: #909399;
+    word-break: break-all;
+  }
+
+  .cand-tip {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #909399;
+    line-height: 1.6;
+  }
+
+  .near-name {
+    color: #409eff;
+  }
+
   .step-card {
     border: 1px solid #ebeef5;
     border-radius: 6px;
@@ -1440,6 +2172,21 @@ onMounted(() => {
       .step-no {
         font-weight: 600;
         color: #409eff;
+      }
+
+      // 步骤操作区（上移/下移/在此后插入/删除）。
+      // el-button 默认会给相邻按钮加 margin-left:12px，配合 flex gap 会叠加，
+      // 导致按钮挤出卡片 —— 必须显式清零（该坑在 MEMORY.md 里有记录）。
+      .step-ops {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        margin-left: auto;
+        flex-shrink: 0;
+
+        :deep(.el-button + .el-button) {
+          margin-left: 0;
+        }
       }
     }
   }

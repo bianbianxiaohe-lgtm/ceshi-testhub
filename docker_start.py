@@ -111,6 +111,64 @@ CREATE TABLE IF NOT EXISTS clarification_questions (
 ''')
 print('ensured table clarification_questions')
 
+# 确保「项目角色」（组织级组）表 —— 2026-09-20 新增。
+# 一个角色下有若干人；项目挂到角色后，该角色全员自动获得该项目的编辑权限（不含删除）。
+# 迁移 0009_projectrole_project_role 用 RunSQL 也做了同样的事，这里是启动期兜底，
+# 保证老环境（迁移状态漂移）也能正常起来。
+cur.execute('''
+CREATE TABLE IF NOT EXISTS project_roles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    description LONGTEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE KEY project_roles_name_uniq (name)
+)
+''')
+print('ensured table project_roles')
+
+cur.execute('''
+CREATE TABLE IF NOT EXISTS project_roles_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    projectrole_id INT NOT NULL,
+    user_id INT NOT NULL,
+    UNIQUE KEY project_roles_members_uniq (projectrole_id, user_id),
+    KEY project_roles_members_user_idx (user_id)
+)
+''')
+print('ensured table project_roles_members')
+
+# projects.role_id：项目归属角色（可空；存量项目留空，由管理员手动挂）
+cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'projects' AND COLUMN_NAME = 'role_id'")
+if not cur.fetchone()[0]:
+    cur.execute('ALTER TABLE projects ADD COLUMN role_id INT NULL DEFAULT NULL, '
+                'ADD KEY projects_role_id_idx (role_id)')
+    print('ensured column projects.role_id')
+else:
+    print('projects.role_id already exists')
+
+# ui_elements.platform：元素库区分平台（Android/iOS/HarmonyOS/Web）
+# 同一业务元素在不同平台 locator 不同，必须分平台保存，否则多平台互相覆盖。
+cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'ui_elements' AND COLUMN_NAME = 'platform'")
+if not cur.fetchone()[0]:
+    cur.execute("ALTER TABLE ui_elements ADD COLUMN platform VARCHAR(20) NOT NULL DEFAULT ''")
+    print('ensured column ui_elements.platform')
+else:
+    print('ui_elements.platform already exists')
+
+# ui_elements (project_id, platform) 联合索引：元素拾取按项目+平台查询
+cur.execute("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'ui_elements' "
+            "AND INDEX_NAME = 'ui_elements_project_platform_idx'")
+if not cur.fetchone()[0]:
+    cur.execute('CREATE INDEX ui_elements_project_platform_idx '
+                'ON ui_elements (project_id, platform)')
+    print('ensured index ui_elements_project_platform_idx')
+else:
+    print('ui_elements_project_platform_idx already exists')
+
 # 确保墨刀技能 - 原型表（新功能：墨刀需求读取与用例生成）
 cur.execute('''
 CREATE TABLE IF NOT EXISTS modao_prototype (
@@ -347,15 +405,31 @@ if not cur.fetchone():
 else:
     print('category already exists on ui_business_actions')
 
-# 确保 AI 用例表的 app_config_id / device_id 允许为空。
-# 背景：该表是老表，部分环境建成了 NOT NULL DEFAULT 0，但模型 AICase.app_config / device
-# 均为 null=True。Django 插入时会显式写 NULL，在严格模式下直接报
-# (1048, "Column 'app_config_id' cannot be null")，导致该环境**任何** AI 用例都建不了
-# （不只是 Midscene Web，所有执行模式都受影响）。
+# 确保 AI 用例表里「模型声明为 null=True、但老库可能建成 NOT NULL」的列全部允许为空。
+#
+# 背景：ui_ai_cases 是老表，部分环境的表结构是早期建的，与当前模型不一致：
+# 模型上这些字段是 null=True，而库里是 NOT NULL，Django 插入时会【显式写 NULL】，
+# 于是直接报
+#     (1048, "Column 'task_description' cannot be null")
+# 表现为「建不了 AI 用例 / 保存步骤 500」，而且只在老环境复现，新环境（列已是 NULL）看不到。
+#
+# 已知踩过的字段（每踩一个就往下面那个 (_col, _coltype) 元组里加一行，别再逐个排查）：
+#   app_config_id / device_id   - 部分环境建成 NOT NULL DEFAULT 0，导致任何 AI 用例都建不了
+#   task_description            - 初始迁移建的是 TextField(blank=True, default='') 即
+#                                 NOT NULL DEFAULT ''，但模型后来改成了 null=True；
+#                                 2026-09-18 生产「Playground 存为用例步骤」500 就是它
+#                                 （views.py 里 AICase.objects.create 有一处漏传该字段）。
+#
 # 由于部分环境的 manage.py migrate 因历史迁移状态不一致而不可用，这里用幂等 DDL 兜底修复。
-for _col in ('app_config_id', 'device_id'):
+# 下面的元组是 (列名, 兜底类型)；MODIFY 时必须带上原类型，否则会把列的类型改坏。
+# 运行时优先采用库里真实的 column_type，兜底类型只在读不到时使用。
+for _col, _coltype in (
+    ('app_config_id', 'INT'),
+    ('device_id', 'INT'),
+    ('task_description', 'LONGTEXT'),
+):
     cur.execute(
-        "SELECT is_nullable FROM information_schema.columns "
+        "SELECT is_nullable, column_type FROM information_schema.columns "
         "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_cases' AND column_name = %s",
         (_col,),
     )
@@ -364,8 +438,10 @@ for _col in ('app_config_id', 'device_id'):
         # 列都不存在（极端老库）就跳过，交给建表逻辑处理
         print('skip %s on ui_ai_cases (column not found)' % _col)
     elif _row[0] == 'NO':
-        cur.execute('ALTER TABLE ui_ai_cases MODIFY %s INT NULL DEFAULT NULL' % _col)
-        print('ensured column %s on ui_ai_cases is nullable' % _col)
+        # 优先用库里真实的 column_type，避免把列改成与现状不同的类型
+        _type = _row[1] or _coltype
+        cur.execute('ALTER TABLE ui_ai_cases MODIFY %s %s NULL DEFAULT NULL' % (_col, _type))
+        print('ensured column %s on ui_ai_cases is nullable (type=%s)' % (_col, _type))
     else:
         print('%s on ui_ai_cases already nullable' % _col)
 
@@ -387,25 +463,40 @@ for _col, _ddl in (
     else:
         print('%s already exists on ui_ai_cases' % _col)
 
-# 确保 AI 执行记录表有 token 统计 + error_message 列
+# 确保 AI 执行记录表有 token 统计 + error_message 列（对应迁移 0013_aiexecutionrecord_tokens）。
+#
+# ⚠️ 表名必须是复数 ui_ai_execution_records —— 与 Django 模型的 db_table 一致。
+# 这里原来写成了单数 ui_ai_execution_record，于是：
+#   information_schema 查询永远查不到该“表” -> if not cur.fetchone() 恒为真 ->
+#   执行 ALTER TABLE ui_ai_execution_record ... -> 报 1146 表不存在 ->
+#   而调用方是 subprocess.run(..., check=False)，异常被静默吞掉、启动照常继续。
+# 结果：这段 DDL 从未真正生效过，生产库一直缺这 6 列，
+#   表现为「执行用例」时 AIExecutionRecord.objects.create() 报
+#   (1054, "Unknown column 'error_message' in 'field list'") → 500。
+# 2026-09-18 修：把表名补成复数，并在打印里带上表名便于核对。
 for _col, _ddl in (
-    ('model_calls', 'ALTER TABLE ui_ai_execution_record ADD COLUMN model_calls INT NOT NULL DEFAULT 0'),
-    ('prompt_tokens', 'ALTER TABLE ui_ai_execution_record ADD COLUMN prompt_tokens INT NOT NULL DEFAULT 0'),
-    ('completion_tokens', 'ALTER TABLE ui_ai_execution_record ADD COLUMN completion_tokens INT NOT NULL DEFAULT 0'),
-    ('tokens_estimated', 'ALTER TABLE ui_ai_execution_record ADD COLUMN tokens_estimated TINYINT(1) NOT NULL DEFAULT 0'),
-    ('replay_mode', 'ALTER TABLE ui_ai_execution_record ADD COLUMN replay_mode TINYINT(1) NOT NULL DEFAULT 0'),
-    ('error_message', "ALTER TABLE ui_ai_execution_record ADD COLUMN error_message LONGTEXT NOT NULL DEFAULT ('')"),
+    ('model_calls', 'ALTER TABLE ui_ai_execution_records ADD COLUMN model_calls INT NOT NULL DEFAULT 0'),
+    ('prompt_tokens', 'ALTER TABLE ui_ai_execution_records ADD COLUMN prompt_tokens INT NOT NULL DEFAULT 0'),
+    ('completion_tokens', 'ALTER TABLE ui_ai_execution_records ADD COLUMN completion_tokens INT NOT NULL DEFAULT 0'),
+    ('tokens_estimated', 'ALTER TABLE ui_ai_execution_records ADD COLUMN tokens_estimated TINYINT(1) NOT NULL DEFAULT 0'),
+    ('replay_mode', 'ALTER TABLE ui_ai_execution_records ADD COLUMN replay_mode TINYINT(1) NOT NULL DEFAULT 0'),
+    # 回放失败降级标记 + 原因（2026-09-22）：报告要能区分
+    # 「纯回放 / 回放失败降级 / 全新 AI 探索」三种状态，
+    # 否则降级时只显示「AI 探索」，用户会误判固化根本没生效。
+    ('replay_degraded', 'ALTER TABLE ui_ai_execution_records ADD COLUMN replay_degraded TINYINT(1) NOT NULL DEFAULT 0'),
+    ('replay_fail_reason', "ALTER TABLE ui_ai_execution_records ADD COLUMN replay_fail_reason VARCHAR(500) NOT NULL DEFAULT ''"),
+    ('error_message', "ALTER TABLE ui_ai_execution_records ADD COLUMN error_message LONGTEXT NOT NULL DEFAULT ('')"),
 ):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
-        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_execution_record' AND column_name = %s",
+        "WHERE table_schema = DATABASE() AND table_name = 'ui_ai_execution_records' AND column_name = %s",
         (_col,),
     )
     if not cur.fetchone():
         cur.execute(_ddl)
-        print('ensured column %s on ui_ai_execution_record' % _col)
+        print('ensured column %s on ui_ai_execution_records' % _col)
     else:
-        print('%s already exists on ui_ai_execution_record' % _col)
+        print('%s already exists on ui_ai_execution_records' % _col)
 
 # ui_ai_cases.steps 在老库是 text（上限 64KB，且无法做 JSON 查询），迁移后应为 json。
 # 只有现存数据全部是合法 JSON 时才转换，避免 ALTER 失败阻断启动。

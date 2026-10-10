@@ -17,7 +17,12 @@ services:
     networks:
       - dev-net
     ports:
-      - "127.0.0.1:${DEV_MYSQL_PORT:-13306}:3306"
+      # 端口绑定说明（2026-10-10 改为监听所有网卡）：
+      # 原先绑 127.0.0.1，团队同事无法从局域网连这套 dev 数据库。
+      # 现改为 0.0.0.0 以便同事用 <本机内网IP>:13306 共用同一套开发库。
+      # ⚠️ 安全前提：此端口必须在 Windows 防火墙里限定来源网段（如 192.168.8.0/24），
+      #    不要对公网开放。生产库是 testhub-mysql（端口未映射），此处放开的是 dev 库。
+      - "${DEV_MYSQL_PORT:-13306}:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "${MYSQL_USER:-testhub_dev}", "-p${MYSQL_PASSWORD}"]
       interval: 5s

@@ -14,6 +14,7 @@
             <option value="generating">用例编写中</option>
             <option value="reviewing">用例评审中</option>
             <option value="completed">已完成</option>
+            <option value="cancelled">已取消</option>
             <option value="failed">失败</option>
           </select>
         </div>
@@ -940,7 +941,9 @@ export default {
         'pending': '需求分析中',
         'generating': '用例编写中', 
         'reviewing': '用例评审中',
+        'revising': '用例改进中',
         'completed': '已完成',
+        'cancelled': '已取消',
         'failed': '失败'
       }
       return statusMap[status] || status
@@ -1018,8 +1021,8 @@ export default {
         return
       }
 
-      // completed / failed 都允许查看详情
-      if (task.status === 'completed' || task.status === 'failed') {
+      // completed / failed / cancelled 都允许查看详情（取消的任务保留已生成的部分内容）
+      if (['completed', 'failed', 'cancelled'].includes(task.status)) {
         // 改为当前页面跳转，不再新开窗口
         this.$router.push({
           name: 'TaskDetail',

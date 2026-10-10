@@ -93,11 +93,27 @@ class Element(models.Model):
         ('PENDING', '待验证'),
     ]
 
+    #: 元素适用的平台。
+    #: 同一个业务元素在不同平台上的 locator 完全不同（Android 是 resource-id/xpath，
+    #: iOS 是 accessibility id/name，鸿蒙是 component id），所以必须按平台分开存。
+    #: 留空 = 通用（历史数据/Web 元素），查询时"不限定平台的元素"对所有平台可见。
+    PLATFORM_CHOICES = [
+        ('android', 'Android'),
+        ('ios', 'iOS'),
+        ('harmony', 'HarmonyOS'),
+        ('web', 'Web'),
+    ]
+
     project = models.ForeignKey(UiProject, on_delete=models.CASCADE, related_name='elements', verbose_name='所属项目')
     group = models.ForeignKey(ElementGroup, on_delete=models.SET_NULL, null=True, blank=True, related_name='elements', verbose_name='所属分组')
     name = models.CharField(max_length=200, verbose_name='元素名称')
     description = models.TextField(blank=True, verbose_name='元素描述')
     element_type = models.CharField(max_length=50, choices=ELEMENT_TYPE_CHOICES, verbose_name='元素类型', default='BUTTON')
+    platform = models.CharField(
+        max_length=20, choices=PLATFORM_CHOICES, blank=True, default='',
+        verbose_name='适用平台',
+        help_text='留空表示通用；同一元素在不同平台的 locator 不同，需分平台保存'
+    )
 
     # 主要定位策略
     locator_strategy = models.ForeignKey(LocatorStrategy, on_delete=models.PROTECT, verbose_name='定位策略')
@@ -144,6 +160,8 @@ class Element(models.Model):
             models.Index(fields=['project', 'page']),
             models.Index(fields=['project', 'element_type']),
             models.Index(fields=['validation_status']),
+            # 元素拾取/回写按「项目 + 平台」查询，走索引避免全表扫
+            models.Index(fields=['project', 'platform']),
         ]
 
     def __str__(self):
@@ -1027,9 +1045,12 @@ class UiTaskNotificationSetting(models.Model):
 
 class AppDevice(models.Model):
     """移动设备管理"""
+    #: 已接入/规划中的设备平台。加新平台时这里、Element.PLATFORM_CHOICES、
+    #: 以及 element_provider 的平台分发都要同步。
     PLATFORM_CHOICES = [
         ('android', 'Android'),
         ('ios', 'iOS'),
+        ('harmony', 'HarmonyOS'),
     ]
 
     DEVICE_TYPE_CHOICES = [
@@ -1207,6 +1228,24 @@ class AIExecutionRecord(models.Model):
     replay_mode = models.BooleanField(
         default=False, verbose_name='纯坐标回放',
         help_text='True 表示本次执行走的是固化回放，理论上不调用视觉模型'
+    )
+    # ⚠️ 为什么单独记一个"回放失败降级"（2026-09-22 实测）：
+    #   回放失败会自动降级成 AI 探索重跑，而旧代码把 replay_mode 直接置 False，
+    #   于是报告里只显示「AI 探索」—— **用户完全看不出这次曾经试过回放**，
+    #   反复重跑都是这个标签，就会得出"固化根本没生效、省不了 token"的错误结论。
+    #   两个字段配合使用，报告里才能区分三种状态：
+    #     纯回放       replay_mode=True                  （真的零模型）
+    #     回放失败降级  replay_mode=False + replay_degraded=True
+    #     全新 AI 探索  replay_mode=False + replay_degraded=False
+    replay_degraded = models.BooleanField(
+        default=False, verbose_name='回放失败已降级',
+        help_text='True 表示本次曾尝试纯坐标回放但失败，已自动降级为 AI 探索重跑'
+    )
+    # 回放失败的具体原因（降级时写入，便于判断是"界面改版"还是"页面状态不对"）
+    replay_fail_reason = models.CharField(
+        max_length=500, blank=True, default='',
+        verbose_name='回放失败原因',
+        help_text='仅在 replay_degraded=True 时有值'
     )
 
     class Meta:

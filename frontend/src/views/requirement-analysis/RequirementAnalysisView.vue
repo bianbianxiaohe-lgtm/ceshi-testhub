@@ -141,7 +141,12 @@
                 class="form-textarea"
                 rows="8"
                 placeholder="请详细描述您的需求，包括功能描述、使用场景、业务流程等。例如：&#10;&#10;1. 用户可以通过用户名和密码登录系统&#10;2. 系统需要验证用户身份&#10;3. 登录成功后跳转到主页面&#10;4. 支持记住登录状态&#10;5. 登录失败要给出明确提示..."></textarea>
-              <div class="char-count">{{ manualInput.description.length }}/2000</div>
+              <div class="char-count">
+                <span v-if="manualInput.description.length > MANUAL_LEN_WARN" class="char-hint">
+                  建议不超过 {{ MANUAL_LEN_WARN }} 字，过长请分段
+                </span>
+                <span class="char-num">{{ manualInput.description.length }} 字</span>
+              </div>
             </div>
             
             <div class="form-group">
@@ -1218,6 +1223,10 @@ export default {
       // 全局输出模式设置
       globalOutputMode: 'stream',  // 默认使用流式输出
 
+      // 手动输入需求：不做硬性字数拦截（真实上限取决于所选模型的上下文长度），
+      // 仅当超出该建议值时提示「建议不超过 N 字，过长请分段」
+      MANUAL_LEN_WARN: 5000,
+
       // 手动输入需求
       manualInput: {
         title: '',
@@ -1406,9 +1415,10 @@ export default {
   
   computed: {
     canGenerateManual() {
+      // 不再对需求描述做字数上限拦截：真实需求经常上千字，硬性 2000 字会把用户挡在门外。
+      // 超长只做提示（见 MANUAL_LEN_WARN），实际上限取决于所选模型的上下文长度。
       return this.manualInput.title.trim() && 
-             this.manualInput.description.trim() && 
-             this.manualInput.description.length <= 2000
+             this.manualInput.description.trim()
     },
     canGenerateReqDoc() {
       if (this.reqDoc.inputMode === 'text') return !!this.reqDoc.rawText.trim()
@@ -3642,6 +3652,20 @@ export default {
             } else if (data.status === 'failed') {
               this.progressText = '生成失败'
               this.handleGenerationError()
+            } else if (data.status === 'cancelled') {
+              // 任务被取消（可能是在别的标签页取消的）：停止本地显示，不再等待
+              console.log('🛑 收到取消状态')
+              this.progressText = '已取消生成'
+              this.isGenerating = false
+              if (this.eventSource) {
+                this.eventSource.close()
+                this.eventSource = null
+              }
+              if (this.pollInterval) {
+                clearInterval(this.pollInterval)
+                this.pollInterval = null
+              }
+              ElMessage.info('任务已取消')
             }
           } else if (data.type === 'done') {
             // 流式结束，立即关闭EventSource，获取最终结果
@@ -3814,6 +3838,16 @@ export default {
 
             ElMessage.error('测试用例生成失败: ' + (task.error_message || '未知错误'))
             return
+          } else if (task.status === 'cancelled') {
+            // 任务被取消：停止轮询，不再等待
+            this.progressText = '已取消生成'
+            this.isGenerating = false
+
+            clearInterval(this.pollInterval)
+            this.pollInterval = null
+
+            ElMessage.info('任务已取消')
+            return
           }
 
         } catch (error) {
@@ -3823,14 +3857,40 @@ export default {
       }, 3000) // 每3秒检查一次
     },
 
-    cancelGeneration() {
+    async cancelGeneration() {
+      const taskId = this.currentTaskId
+
+      // 1. 先通知后端停止生成：后端线程会在流式回调和阶段之间检查取消事件，
+      //    不再继续调用模型，避免前端停了后端还在烧 token
+      let notified = false
+      if (taskId) {
+        try {
+          const resp = await api.post(
+            `/requirement-analysis/api/testcase-generation/${taskId}/cancel/`,
+            {},
+            { timeout: 10000 }
+          )
+          notified = !!(resp.data && resp.data.notified)
+        } catch (error) {
+          console.error('通知服务端取消任务失败:', error)
+          ElMessage.warning('通知服务端取消失败，已停止本地显示')
+        }
+      }
+
+      // 2. 关闭 SSE 连接（先 close 再置 null，避免 onerror 触发降级轮询）
+      if (this.eventSource) {
+        this.eventSource.close()
+        this.eventSource = null
+      }
+
+      // 3. 停止轮询与本地状态
       if (this.pollInterval) {
         clearInterval(this.pollInterval)
         this.pollInterval = null
       }
       this.isGenerating = false
       this.currentTaskId = null
-      ElMessage.info('已取消生成任务')
+      ElMessage.info(notified ? '已取消生成，正在停止剩余步骤' : '已取消生成任务')
     },
 
     // 下载测试用例为xlsx文件
@@ -4796,10 +4856,23 @@ export default {
 }
 
 .char-count {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
   text-align: right;
   font-size: 0.85rem;
   color: #666;
   margin-top: 5px;
+}
+
+.char-count .char-hint {
+  color: #e6a23c;
+  font-size: 0.82rem;
+}
+
+.char-count .char-num {
+  flex: 0 0 auto;
 }
 
 .required {

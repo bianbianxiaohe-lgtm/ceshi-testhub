@@ -79,6 +79,14 @@
           <h3>配置中心</h3>
           <p>系统环境、AI模型及通知配置</p>
         </div>
+        <!-- 帮助中心 -->
+        <div class="nav-card" @click="handleNavigate('help')" role="button" tabindex="0">
+          <div class="card-icon help-icon">
+            <el-icon><Reading /></el-icon>
+          </div>
+          <h3>帮助中心</h3>
+          <p>AI模型配置与用例生成操作说明</p>
+        </div>
       </div>
     </div>
   </div>
@@ -88,7 +96,7 @@
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { MagicStick, Link, Monitor, DataLine, Cpu, Setting, ChatDotRound, UserFilled, ArrowDown, Iphone } from '@element-plus/icons-vue'
+import { MagicStick, Link, Monitor, DataLine, Cpu, Setting, ChatDotRound, UserFilled, ArrowDown, Iphone, Reading } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -119,7 +127,8 @@ const handleNavigate = (type) => {
     'automation': '/automation/dashboard',
     'ai-intelligent': '/ai-intelligent-mode/testing',
     'assistant': '/ai-generation/assistant',
-    'config': '/configuration/ai-model'
+    'config': '/configuration/ai-model',
+    'help': '/help'
   }
 
   if (type === 'data') {
@@ -274,6 +283,11 @@ const handleNavigate = (type) => {
   &.assistant-icon {
     background: #fff7e6;
     color: #fa8c16;
+  }
+
+  &.help-icon {
+    background: #f0f9ff;
+    color: #0ea5e9;
   }
 }
 

@@ -1,17 +1,20 @@
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
 from django.conf import settings
-from .models import Project, ProjectMember, ProjectEnvironment, ProjectKnowledge
+from .models import Project, ProjectMember, ProjectEnvironment, ProjectKnowledge, ProjectRole
 from .serializers import (
-    ProjectSerializer, ProjectCreateSerializer,
+    ProjectSerializer, ProjectCreateSerializer, ProjectRoleSerializer,
     ProjectMemberSerializer, ProjectEnvironmentSerializer,
     ProjectKnowledgeSerializer
 )
-from apps.core.mixins import OwnerOrMemberMixin
+from apps.core.mixins import (
+    ProjectReadableMixin, IsProjectOwnerOrAdmin,
+    can_manage_project, can_delete_project,
+)
 import os
 import re
 import logging
@@ -19,7 +22,13 @@ from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
-class ProjectListCreateView(OwnerOrMemberMixin, generics.ListCreateAPIView):
+class ProjectListCreateView(ProjectReadableMixin, generics.ListCreateAPIView):
+    """
+    项目列表 / 新建项目。
+
+    2026-09-20 用户要求：**所有人可见所有项目**，所以列表不再按 owner/member 过滤。
+    新建项目仍然由后端把当前用户设为 owner（见 ProjectCreateSerializer）。
+    """
     queryset = Project.objects.all()
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -27,7 +36,7 @@ class ProjectListCreateView(OwnerOrMemberMixin, generics.ListCreateAPIView):
     search_fields = ['name', 'description']
     ordering_fields = ['created_at', 'updated_at', 'name']
     ordering = ['-created_at']
-    
+
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return ProjectCreateSerializer
@@ -41,9 +50,47 @@ def get_all_projects(request):
     return Response(list(projects))
 
 class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    项目详情 / 编辑 / 删除。
+
+    权限（2026-09-20 用户要求）：
+      - GET    查看：所有登录用户都可以（"每个人都可以查看别人创建的项目"）
+      - PUT/PATCH 编辑：项目负责人 / 成员 / 管理员（用户确认"可以编辑项目"）
+      - DELETE 删除：**仅项目负责人 + 管理员**（成员也不能删）
+    """
     queryset = Project.objects.all()
     serializer_class = ProjectSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        # 删除是唯一需要收紧的动作，单独加对象级校验
+        if self.request.method == 'DELETE':
+            return [permissions.IsAuthenticated(), IsProjectOwnerOrAdmin()]
+        return [permissions.IsAuthenticated()]
+
+    def update(self, request, *args, **kwargs):
+        # 编辑权限低于删除：负责人/成员/管理员都可改，其他人只读
+        project = self.get_object()
+        if not can_manage_project(request.user, project):
+            return Response(
+                {'error': '只有项目负责人、项目成员或管理员可以编辑该项目'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        # 双保险：permission_classes 已在 has_object_permission 拦一次，
+        # 这里再显式判一次并给出可读提示（has_object_permission 的 message 在
+        # 某些 DRF 版本下对 DELETE 的呈现不够清楚）。
+        project = self.get_object()
+        if not can_delete_project(request.user, project):
+            owner_name = getattr(project.owner, 'username', '') or '未知'
+            return Response(
+                {'error': '只有项目负责人或管理员可以删除项目'
+                          '（当前项目负责人：%s）' % owner_name},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().destroy(request, *args, **kwargs)
 
 @api_view(['POST'])
 @permission_classes([permissions.IsAuthenticated])
@@ -192,6 +239,42 @@ class ProjectKnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):
         except Exception as e:
             logger.warning(f'[KB] 删除条目向量同步失败（可忽略）: {e}')
         instance.delete()
+
+
+# ============================================================
+# 项目角色（组织级组）
+# ============================================================
+
+class ProjectRoleViewSet(viewsets.ModelViewSet):
+    """
+    项目角色的增删改查（用户管理页使用）。
+
+    2026-09-20 用户要求："用户管理加一个角色，以后再创建项目的时候默认这个角色下的
+    人能够对这些项目有权限" + "管理员管理"。
+
+    权限：
+      - 查看（list/retrieve）：所有登录用户（前端项目表单要能选角色）
+      - 增删改：**仅管理员**（is_staff / is_superuser）
+      - 删角色：不连带删项目（Project.role 是 SET_NULL，只解除关联），
+        但会提示该角色下还有几个项目，避免误删。
+    """
+    queryset = ProjectRole.objects.all().prefetch_related('members')
+    serializer_class = ProjectRoleSerializer
+
+    def get_permissions(self):
+        # 角色列表要开放给所有人：创建/编辑项目时需要下拉选择归属角色
+        if self.action in ('list', 'retrieve'):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAdminUser()]
+
+    def destroy(self, request, *args, **kwargs):
+        role = self.get_object()
+        n = role.projects.count()
+        if n:
+            # 不阻断（管理员可能就是要解散角色），但明确告知影响面
+            logger.warning('[ProjectRole] 角色「%s」被删除，其下 %d 个项目将失去角色授权',
+                           role.name, n)
+        return super().destroy(request, *args, **kwargs)
 
 
 # 语义去重阈值：相似度 >= 此值视为"疑似重复"

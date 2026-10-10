@@ -2,6 +2,12 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
+from .element_picker_views import (
+    dump_device_elements,
+    save_picked_elements,
+    learn_locator,
+    match_steps_to_elements,
+)
 from .views import (
     UiProjectViewSet,
     LocatorStrategyViewSet,
@@ -37,6 +43,7 @@ from .views import (
     import_airtest_script,
     device_agent_register,
     llm_proxy,
+    ios_dump_elements,
 )
 from .views_config import EnvironmentConfigViewSet, AIIntelligentModeConfigViewSet
 from .pipeline_views import AppPipelineRunViewSet
@@ -76,6 +83,16 @@ router.register(r'app-pipelines', AppPipelineRunViewSet)
 router.register(r'business-actions', BusinessActionViewSet)
 
 urlpatterns = [
+    # ⚠️ 元素拾取器必须排在 router 之前！
+    #    router 注册了 `elements`（ElementViewSet），会生成 `elements/<pk>/`，
+    #    排在前面就会把 `elements/dump/` 当成 pk='dump' 吃掉 → 返回 405。
+    path('elements/dump/', dump_device_elements, name='elements-dump'),
+    path('elements/save-picked/', save_picked_elements, name='elements-save-picked'),
+    path('elements/learn-locator/', learn_locator, name='elements-learn-locator'),
+    # 用元素库校正步骤的定位（自然语言用例 → 真元素定位）
+    path('elements/match-steps/', match_steps_to_elements, name='elements-match-steps'),
+
+
     path('', include(router.urls)),
     path('all-projects/', get_all_projects_unified, name='all-projects-unified'),
     path('ensure-ui-project/', ensure_ui_project, name='ensure-ui-project'),
@@ -91,6 +108,8 @@ urlpatterns = [
     # LLM 用量统计代理：OpenAI 兼容转发，顺带把 usage 记到执行记录上
     path('llm-proxy/', llm_proxy, name='llm-proxy'),
     path('llm-proxy/<path:rest>', llm_proxy, name='llm-proxy-rest'),
+    # 导出 iOS 当前页面的可访问性元素树（排查「精确定位该填什么」）
+    path('ios-dump-elements/', ios_dump_elements, name='ios-dump-elements'),
 ]
 
 # 添加媒体文件路由

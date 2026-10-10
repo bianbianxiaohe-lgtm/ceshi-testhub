@@ -875,8 +875,13 @@ class ModaoExtractor:
         if h5.get('pages'):
             h5['warnings'] = warnings + h5.get('warnings', [])
             return h5
-        # PRD 报告页（自研文档格式，第 4 种来源）：纯 HTTP、不做视觉 OCR
-        prd = self.extract_prd_report_sync(url, None)
+        # PRD 报告页（自研文档格式，第 4 种来源）：纯 HTTP、不做视觉 OCR。
+        # dual_fusion / fusion_config 必须透传：该格式没有视觉路，但阶段0 在
+        # dual_fusion=True 时会校验「融合需求是否为空」，不透传就必然阻断
+        # （这是"格式支持了却永远读不出来"的根因）。
+        prd = self.extract_prd_report_sync(url, None,
+                                           dual_fusion=dual_fusion,
+                                           fusion_config=fusion_config)
         if prd.get('pages'):
             prd['warnings'] = warnings + prd.get('warnings', [])
             logger.info(f'[webshare回退] 识别为 PRD 报告页，共 {len(prd["pages"])} 页')
@@ -1514,12 +1519,19 @@ class ModaoExtractor:
             return False
 
     def extract_prd_report_sync(self, url: str, cookies: Optional[str] = None,
-                                timeout: int = 120) -> Dict[str, Any]:
+                                timeout: int = 120, dual_fusion: bool = False,
+                                fusion_config=None) -> Dict[str, Any]:
         """PRD 报告页读取（纯 HTTP，不启动浏览器、不做视觉 OCR）。
 
         适用于「Lovin1.2.20-PRD.html」这类自研 PRD 文档：正文是 requirement-module 需求模块，
         内嵌截图体积极大（可达 100MB+）但信息量极低 → 解析前先剥离 data URI，
         处理耗时通常 < 2s。返回结构与 extract_webshare_sync 一致。
+
+        关于 dual_fusion：本路径**没有视觉路**（截图已被剥离），所以融合退化为
+        「纯 DOM 单路 → 融合」。之所以仍然产出 fused_requirements，是因为阶段0 的
+        「融合需求为空」门禁在 dual_fusion=True 时会阻断 —— 不产出就等于该格式永远
+        读不出来（这正是修复前的实际状况）。这里复用 dual_fusion_requirements()，
+        它本来就能处理「只有 dom_text、vision_text 为空」的输入。
         """
         import requests
         warnings: List[str] = []
@@ -1599,7 +1611,54 @@ class ModaoExtractor:
             f'PRD 报告页解析完成：{len(modules)} 个需求模块'
             + (f'、{len(proto_titles)} 个原型页面标题' if proto_titles else '')
             + '（内嵌截图未做识别，如需图片内容请另行提供）')
-        return {'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+
+        result: Dict[str, Any] = {
+            'run_id': self.run_id, 'url': url, 'pages': pages, 'warnings': warnings}
+
+        # 纯 DOM 融合：本格式没有截图，融合实际只跑 DOM 一路。
+        # 必须产出 fused_requirements，否则阶段0「融合需求为空」门禁会阻断该格式。
+        if dual_fusion:
+            result['dual_fusion'] = True
+            fused: List[Dict[str, Any]] = []
+            if fusion_config and pages:
+                try:
+                    fused = asyncio.run(
+                        self.dual_fusion_requirements(pages, fusion_config))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f'PRD 报告页 DOM 融合失败（已跳过）: {e}')
+                    warnings.append(f'PRD 报告页需求抽取失败（已跳过）: {e}')
+            if not fused:
+                # 融合失败/为空时，直接把 DOM 正文兜底成"每条需求"，避免门禁误判。
+                # 宁可给下游一份粗糙但完整的需求，也不要让整轮读取白跑。
+                fused = self._prd_dom_fallback_requirements(pages)
+                if fused:
+                    warnings.append(
+                        f'PRD 报告页未走 LLM 融合，已按需求模块原文兜底生成 '
+                        f'{len(fused)} 条需求')
+            result['fused_requirements'] = fused
+        return result
+
+    @staticmethod
+    def _prd_dom_fallback_requirements(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """融合不可用时的兜底：把每个 PRD 需求模块的正文原样包装成一条需求。
+
+        这些模块本身就是人工整理好的文字需求（requirement-module），
+        直接交给下游比"因为抽取失败而整轮判错"更有价值。
+        """
+        out: List[Dict[str, Any]] = []
+        for p in pages or []:
+            text = (p.get('text') or p.get('dom_text') or '').strip()
+            if not text:
+                continue
+            name = (p.get('page_name') or '').strip() or '未命名需求模块'
+            out.append({
+                'source_pages': [name],
+                'module': p.get('parent_name') or name,
+                'feature': name,
+                'interaction': text,
+                'evidence': 'A',
+            })
+        return out
 
     async def _read_singlefile_h5_screen_texts(self, url: str,
                                                pages_meta: List[Dict[str, Any]]) -> Dict[str, str]:

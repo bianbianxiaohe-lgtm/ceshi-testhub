@@ -23,6 +23,40 @@ class PassThroughRenderer(BaseRenderer):
     def render(self, data, accepted_media_type=None, renderer_context=None):
         # 直接返回data，不做任何处理
         return data
+
+
+class _GenerationCancelled(Exception):
+    """内部信号：用户取消用例生成时由 cancel_event 触发，except 块捕获后写 cancelled 状态。"""
+
+
+# 用例生成任务的取消事件表：task_id -> threading.Event
+# 后台线程在流式回调和阶段之间检查该 Event，实现"协作式取消"（不能强杀线程，只能让它尽快退出）
+_RUNNING_GENERATION: dict = {}
+_RUNNING_GENERATION_LOCK = threading.Lock()
+
+
+def _register_generation_task(task_id: str) -> threading.Event:
+    """注册一个正在运行的生成任务，返回用于协作式取消的 Event"""
+    event = threading.Event()
+    with _RUNNING_GENERATION_LOCK:
+        _RUNNING_GENERATION[task_id] = event
+    return event
+
+
+def _unregister_generation_task(task_id: str) -> None:
+    """任务结束（完成/失败/取消）后从注册表移除"""
+    with _RUNNING_GENERATION_LOCK:
+        _RUNNING_GENERATION.pop(task_id, None)
+
+
+def _request_cancel_generation(task_id: str) -> bool:
+    """通知后台线程停止。返回是否命中了一个正在运行的任务"""
+    with _RUNNING_GENERATION_LOCK:
+        event = _RUNNING_GENERATION.get(task_id)
+    if event is None:
+        return False
+    event.set()
+    return True
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -931,6 +965,8 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
             logger.info(f"API URL: {config.base_url}")
             logger.info(f"API Key前缀: {config.api_key[:10]}..." if len(config.api_key) > 10 else f"API Key: {config.api_key}")
 
+            logger.info(f"角色: {config.role}")
+
             # 准备测试消息
             test_messages = [
                 {"role": "system", "content": "你是一个AI助手"},
@@ -945,6 +981,22 @@ class AIModelConfigViewSet(viewsets.ModelViewSet):
 
                     try:
                         logger.info("开始调用API...")
+                        # 向量化模型（embedder）不支持 /chat/completions，
+                        # 必须走 /embeddings 接口测试，否则必然报 model_not_supported
+                        if config.role == 'embedder':
+                            vectors = loop.run_until_complete(
+                                asyncio.wait_for(
+                                    AIModelService.embed_texts(config, ['连接测试']),
+                                    timeout=60.0
+                                )
+                            )
+                            dim = len(vectors[0]) if vectors else 0
+                            logger.info(f"Embedding 测试成功，向量维度: {dim}")
+                            return {
+                                'success': True,
+                                'message': f'连接测试成功（Embedding 接口可用，向量维度 {dim}）',
+                                'response': f'dim={dim}',
+                            }
                         # 设置60秒超时，统一使用OpenAI兼容API
                         result = loop.run_until_complete(
                             asyncio.wait_for(
@@ -1579,7 +1631,15 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                 import django.db
                                 # 关闭主线程的数据库连接，让新线程创建自己的连接
                                 django.db.connections.close_all()
-                                
+
+                                # 注册取消事件：/cancel/ 接口会 set 它，本线程在阶段之间和流式回调中检查
+                                cancel_event = _register_generation_task(task.task_id)
+
+                                def _raise_if_cancelled():
+                                    """阶段之间调用：用户已取消则抛内部信号，跳过后续所有 LLM 调用"""
+                                    if cancel_event.is_set():
+                                        raise _GenerationCancelled()
+
                                 # 更新任务状态
                                 task.status = 'generating'
                                 task.progress = 10
@@ -1635,6 +1695,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                         async def stream_callback(chunk):
                                             """流式回调：实时保存每个chunk到数据库"""
+                                            # 用户已取消：中断流式读取，避免继续消耗 token
+                                            if cancel_event.is_set():
+                                                raise _GenerationCancelled()
                                             # 先追加到内存中的buffer
                                             task.stream_buffer += chunk
                                             task.stream_position = len(task.stream_buffer)
@@ -1663,6 +1726,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                         task.progress = 60
                                         task.save()
 
+                                        # 进入评审前检查：用户已取消则不再调用评审/改进模型
+                                        _raise_if_cancelled()
+
                                         # 流式评审和改进（根据生成配置决定是否执行）
                                         # 注意：必须用 _id 后缀检查，不能用懒加载 ForeignKey（线程中连接可能失效）
                                         if enable_auto_review and task.reviewer_model_config_id and task.reviewer_prompt_config_id:
@@ -1685,6 +1751,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                                 async def review_stream_callback(chunk):
                                                     """流式评审回调"""
+                                                    if cancel_event.is_set():
+                                                        raise _GenerationCancelled()
                                                     review_buffer.append(chunk)
                                                     current_length = sum(len(c) for c in review_buffer)
 
@@ -1726,6 +1794,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                                     # 根据评审意见改进测试用例（自动执行）
                                                     logger.info(f"任务 {task.task_id} 开始根据评审意见改进测试用例")
+                                                    # 进入改进阶段前检查：已取消则跳过改写（改写最耗 token）
+                                                    _raise_if_cancelled()
+
                                                     task.status = 'revising'
                                                     task.progress = 85
                                                     task.final_test_cases = ''  # 清空，准备流式写入
@@ -1744,6 +1815,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                         # 创建流式回调函数，实时更新final_test_cases
                                                         async def final_callback(chunk):
                                                             """流式回调：实时保存最终用例到数据库"""
+                                                            if cancel_event.is_set():
+                                                                raise _GenerationCancelled()
                                                             # 实时追加到final_test_cases并保存
                                                             task.final_test_cases = (task.final_test_cases or '') + chunk
 
@@ -1891,6 +1964,9 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
 
                                                     # 根据评审意见改进测试用例（自动执行）
                                                     logger.info(f"任务 {task.task_id} 开始根据评审意见改进测试用例")
+                                                    # 进入改进阶段前检查：已取消则跳过改写（改写最耗 token）
+                                                    _raise_if_cancelled()
+
                                                     task.status = 'revising'
                                                     task.progress = 85
                                                     task.final_test_cases = ''  # 清空，准备流式写入
@@ -1909,6 +1985,8 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                                         # 创建流式回调函数，实时更新final_test_cases
                                                         async def final_callback_full(chunk):
                                                             """流式回调：实时保存最终用例到数据库"""
+                                                            if cancel_event.is_set():
+                                                                raise _GenerationCancelled()
                                                             # 实时追加到final_test_cases并保存
                                                             task.final_test_cases = (task.final_test_cases or '') + chunk
 
@@ -2028,11 +2106,25 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                     finally:
                                         loop.close()
                                     
+                            except _GenerationCancelled:
+                                # 用户主动取消：停止后续所有 LLM 调用，已生成的部分内容保留在库里
+                                logger.info(f"任务 {task.task_id} 已被用户取消，停止生成")
+                                try:
+                                    task.refresh_from_db()
+                                    task.status = 'cancelled'
+                                    task.error_message = '用户取消生成'
+                                    task.completed_at = timezone.now()
+                                    task.save(update_fields=['status', 'error_message', 'completed_at'])
+                                except Exception as cancel_save_error:
+                                    logger.warning(f"任务 {task.task_id} 保存取消状态失败: {cancel_save_error}")
                             except Exception as e:
                                 logger.error(f"生成任务执行失败: {e}")
                                 task.status = 'failed'
                                 task.error_message = str(e)
                                 task.save()
+                            finally:
+                                # 无论成功/失败/取消，都要摘掉取消事件，避免字典无限增长
+                                _unregister_generation_task(task.task_id)
                         
                         # 在新线程中执行任务
                         thread = threading.Thread(target=execute_task)
@@ -2300,13 +2392,18 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
+            # 先通知后台线程停止（协作式取消：线程在流式回调和阶段之间检查该事件）
+            # 线程退出时会自己写 cancelled 状态；这里再置一次，覆盖线程尚未启动等边界情况
+            notified = _request_cancel_generation(task.task_id)
+
             task.status = 'cancelled'
-            task.save()
+            task.save(update_fields=['status'])
 
             return Response({
-                'message': '任务已取消',
+                'message': '任务已取消，正在停止生成' if notified else '任务已标记为取消',
                 'task_id': task.task_id,
-                'status': task.status
+                'status': task.status,
+                'notified': notified
             })
 
         except Exception as e:

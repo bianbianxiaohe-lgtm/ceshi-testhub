@@ -19,6 +19,12 @@ const routes = [
     meta: { requiresAuth: true }
   },
   {
+    path: '/help',
+    name: 'Help',
+    component: () => import('@/views/help/HelpCenter.vue'),
+    meta: { requiresAuth: true }
+  },
+  {
     path: '/login',
     name: 'Login',
     component: Login,
@@ -521,6 +527,12 @@ const routes = [
         path: 'business-actions',
         name: 'BusinessActionList',
         component: () => import('@/views/ui-automation/ai/BusinessActionList.vue')
+      },
+      {
+        // 元素拾取器：从设备抓元素 → 存入元素库（Android / iOS，鸿蒙预留）
+        path: 'element-picker',
+        name: 'ElementPicker',
+        component: () => import('@/views/ui-automation/ElementPicker.vue')
       }
     ]
   },

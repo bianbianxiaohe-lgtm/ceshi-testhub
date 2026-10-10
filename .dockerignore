@@ -13,6 +13,7 @@ frontend/node_modules
 frontend/dist
 appium_workspace
 _ext
+_db_backup
 skills-dist
 .agents
 _binlog_dump.sql

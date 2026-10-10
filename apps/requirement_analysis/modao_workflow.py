@@ -1077,7 +1077,25 @@ class ModaoWorkflow:
             )
 
         # ── 视觉识别校验 ──
-        attempted_pages = [p for p in valid_pages if p.get('vision_attempted')]
+        #
+        # ⚠️ PRD 报告页必须排除在视觉校验之外。
+        # 这类来源走 modao_extractor.extract_prd_report_sync()，是**纯 HTTP 解析**：
+        # 不启动浏览器、不截图、不做视觉 OCR，页面带 prd_module=True 显式标记，
+        # 且 vision_attempted=False / screenshot=''。
+        # 而双路融合开关（前端默认开）会要求「视觉覆盖率」达标，于是
+        # len(attempted)=0 != len(valid)=N 恒成立 → 无论文档多完整都必然阻断。
+        # 提取端早就预料到这点（见 _parse_prd_report 的注释），却没有同步改这里的
+        # 判据，导致该格式「支持了但永远读不出来」。
+        # ⇒ 视觉相关校验一律只在"非 PRD"页面上做；PRD 页走纯文本语义。
+        prd_pages = [p for p in valid_pages if p.get('prd_module')]
+        vision_scope = [p for p in valid_pages if not p.get('prd_module')]
+        if prd_pages:
+            self._log(
+                f'检测到 {len(prd_pages)} 个 PRD 报告页：该来源为纯 HTTP 文本解析、'
+                f'不含截图与视觉识别，已跳过视觉覆盖率校验'
+            )
+
+        attempted_pages = [p for p in vision_scope if p.get('vision_attempted')]
         vision_failed = [p for p in attempted_pages if not p.get('vision_success')]
         vision_failure_ratio = len(vision_failed) / len(attempted_pages) if attempted_pages else 0
         is_small_prototype = len(all_pages) <= 2  # 1~2 页的小原型不因单页视觉失败而阻断
@@ -1096,13 +1114,17 @@ class ModaoWorkflow:
                 f'已自动降级为纯 DOM 文本模式继续处理，不影响后续流程'
             )
 
-        if dual_fusion and len(attempted_pages) != len(valid_pages):
+        # 覆盖率只针对"本来该有视觉数据"的页面（vision_scope）；PRD 页不计入分母。
+        if dual_fusion and vision_scope and len(attempted_pages) != len(vision_scope):
             block_reasons.append(
-                f'视觉识别覆盖率不足：{len(valid_pages)} 个页面中仅 {len(attempted_pages)} 个完成了识别，'
+                f'视觉识别覆盖率不足：{len(vision_scope)} 个页面中仅 {len(attempted_pages)} 个完成了识别，'
                 f'请检查视觉模型是否可用'
             )
 
         # ── 阻断 5: 融合需求为空 ──
+        # PRD 页产出的融合需求只可能来自 DOM（无视觉路），由
+        # extract_prd_report_sync 的 _prd_fuse_requirements 负责；
+        # 它的结果同样写入 all_fused_requirements，所以这里无需为 PRD 开特例。
         if dual_fusion and not all_fused_requirements:
             block_reasons.append(
                 '双路融合（DOM + 视觉）未能生成有效的结构化需求，'

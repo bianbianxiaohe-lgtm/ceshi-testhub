@@ -9,15 +9,22 @@
 产物：dist/TestHub-iOS-Host.zip（含一个使用说明 README.txt）
 
 依赖关系（改脚本时请同步维护这两个清单）：
-    ios_wda_host.bat -> ios_find_exe.ps1
-                        ios_detect_udid.ps1   (内部再调 ios_find_exe.ps1)
-                        ios_detect_lan_ip.ps1
-                        ios_detect_wda.ps1
-                        ios_release_ports.ps1
-                        ios_register_device.ps1
-                        ios_resolve_server.ps1
+    ios_wda_host_prod.bat -> 同下（连【生产】8080，分发给同事的默认入口）
+    ios_wda_host.bat      -> ios_find_exe.ps1
+                             ios_detect_udid.ps1   (内部再调 ios_find_exe.ps1)
+                             ios_detect_lan_ip.ps1
+                             ios_detect_wda.ps1
+                             ios_release_ports.ps1
+                             ios_register_device.ps1
+                             ios_resolve_server.ps1
     ios_device_stop.bat -> ios_detect_udid.ps1 / ios_register_device.ps1
     ios_diag.bat -> ios_diag.ps1  (只读自检，排障用，建议一起带)
+
+两个启动器的区别只有一个：注册到哪台 TestHub。
+    ios_wda_host_prod.bat -> 生产  http://192.168.8.75:8080  (nginx 前端，反代 /api/)
+    ios_wda_host.bat      -> 开发  http://192.168.8.75:18000
+两者用不同的地址缓存（server_prod.txt / server.txt），可以无副作用地交替使用。
+发给同事时【两个都带上】，默认让他用 prod 那个。
 """
 import os
 import sys
@@ -28,8 +35,11 @@ ROOT = os.path.dirname(HERE)
 OUT_DIR = os.path.join(ROOT, 'dist')
 OUT_ZIP = os.path.join(OUT_DIR, 'TestHub-iOS-Host.zip')
 
-# 运行「一键启动」必需
+# 运行「一键启动」必需。
+# 两个启动器都算必需：它们共用同一套 ps1 辅助脚本，谁缺了都跑不起来，
+# 而且同事可能既要连生产也要连开发。
 REQUIRED = [
+    'ios_wda_host_prod.bat',
     'ios_wda_host.bat',
     'ios_find_exe.ps1',
     'ios_detect_udid.ps1',
@@ -88,16 +98,30 @@ WebDriverAgent 暴露给 TestHub 服务器，并自动把设备注册上去。
 
     两张证书可在 https://www.apple.com/certificateauthority/ 下载。
 
+用哪个启动器
+------------
+包里有两个，区别只是【把设备注册到哪台 TestHub】：
+
+    ios_wda_host_prod.bat   -> 生产环境  http://192.168.8.75:8080
+                               【默认用这个】
+
+    ios_wda_host.bat        -> 开发/测试 http://192.168.8.75:18000
+                               只在你要连测试环境时才用
+
+两个用不同的地址缓存文件，可以随便切换，互不影响。
+不确定用哪个，就用 prod 那个。
+
 怎么用
 ------
  1. 用【数据线】把 iPhone 插到这台电脑上
     - 手机要【解锁】
     - 屏幕弹出「要信任此电脑吗？」时点【信任】
- 2. 右键 ios_wda_host.bat -> 以【管理员身份运行】
+ 2. 右键 ios_wda_host_prod.bat -> 以【管理员身份运行】
     （必须管理员，隧道的建立需要提权）
  3. 首次运行会问一次 TestHub 服务器地址，例如：
-        http://192.168.8.75:18000
+        http://192.168.8.75:8080
     输入后回车，之后会记住。正常情况下脚本能自动探测到，不必手输。
+    （用 ios_wda_host.bat 时对应填 http://192.168.8.75:18000）
  4. 等待，直到看到：
         [SUCCESS] WDA is ready
         ... Registered device on TestHub
@@ -170,7 +194,8 @@ def main():
         print('  %-28s %-12s %d bytes' % (name, tag, os.path.getsize(path)))
     print()
     print('Tell the other person: unzip anywhere (e.g. Desktop), then')
-    print('right-click ios_wda_host.bat -> Run as administrator.')
+    print('right-click ios_wda_host_prod.bat -> Run as administrator.')
+    print('(use ios_wda_host.bat instead only when connecting to the DEV TestHub)')
     return 0
 
 

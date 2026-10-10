@@ -1,44 +1,36 @@
 # syntax=docker/dockerfile:1
-FROM python:3.12-slim
+#
+# 2026-10-10: system deps now live in the BASE image, not in this file.
+#   testhub-backend-base:20261010 already contains:
+#     - python:3.12-slim (digest-pinned)
+#     - apt packages (mysqlclient / build-essential / OpenCV GL libs / wget / unzip)
+#     - adb client
+#     - all 243 pip packages from requirements.lock.txt
+#     - Playwright Chromium + its apt deps (~184MB browser)
+#   Result: a code-only rebuild is `FROM` a local image + COPY . . => ~30 seconds,
+#   and it no longer depends on BuildKit's cache surviving (the layers are IN the image).
+#
+# ---- WHEN TO REBUILD THE BASE IMAGE (NOT for code changes) -------------------------
+#   Only when one of these changes:
+#     - requirements.lock.txt            (else new packages are missing at runtime)
+#     - system packages / playwright version
+#     - python base image                (re-pin the digest)
+#   Steps:
+#     python scripts/gen_backend_base.py                       # regenerates base Dockerfile
+#     docker build -f Dockerfile.backend-base -t testhub-backend-base:<YYYYMMDD> .
+#     docker tag   testhub-backend-base:<YYYYMMDD> testhub-backend-base:latest
+#     # then bump the FROM tag below and: docker compose build backend
+#
+#   !! Dockerfile.backend-base is GENERATED and its dependency lines are byte-identical
+#      to Dockerfile.backend's originals on purpose. A single byte difference turns into
+#      a CACHE MISS that re-resolves all 243 pip packages (hit on 2026-10-10). Do not
+#      hand-edit those lines; change scripts/gen_backend_base.py instead.
+# -----------------------------------------------------------------------------------
+#
+# (The dependency layers that used to live here are preserved in git history and in
+#  Dockerfile.backend-base.)
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-WORKDIR /app
-
-# 安装系统依赖（MySQL客户端编译必需 + Airtest/OpenCV 运行库）
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        default-libmysqlclient-dev \
-        build-essential \
-        pkg-config \
-        gcc \
-        libgl1 \
-        libglib2.0-0 \
-        libsm6 \
-        libxext6 \
-        libxrender1 \
-        wget \
-        unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-# 安装 adb 客户端（真机被动触摸监听 getevent 需要；缺失时自动退化，不会中断构建）
-RUN (wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O /tmp/pt.zip \
-    && unzip -o /tmp/pt.zip -d /opt \
-    && rm -f /tmp/pt.zip \
-    && ln -sf /opt/platform-tools/adb /usr/local/bin/adb) \
-    || echo "adb install skipped (getevent 实时监听将不可用，录制仍可走镜像点击)"
-
-# 安装Python依赖（2026-09-03 起使用阿里云镜像；清华 pypi.tuna.tsinghua.edu.cn 在当前网络下极慢/易超时，如需回退改回该源）
-# 2026-09-03 起安装 requirements.lock.txt（全量钉死版本）：requirements.txt 的宽约束组合会让 pip
-# resolver 回溯 20 万轮 ResolutionTooDeep 失败；lock 文件源自 prod 容器实测自洽解，零回溯。
-# 注意：不能带 --no-cache-dir（否则 pip 不读写缓存目录），依赖缓存在宿主 docker 持久化；
-# 效果：lock 未变→整层命中跳过；lock 变更→只增量下载，不全量重下
-COPY requirements.lock.txt .
-RUN --mount=type=cache,target=/root/.cache/pip pip install -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.lock.txt
-
-# 安装 Playwright Chromium（墨刀读取 / UI自动化 需要浏览器引擎）
-RUN playwright install chromium && playwright install-deps chromium || echo "playwright browser install partial"
+FROM testhub-backend-base:20261010
 
 # 复制项目代码
 COPY . .

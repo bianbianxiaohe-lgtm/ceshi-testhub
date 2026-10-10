@@ -180,8 +180,12 @@ def _to_data_url(b64: str) -> str:
 class MidsceneWebEngine:
     SUPPORTED_ACTIONS = {
         'aiAct', 'aiQuery', 'aiTap', 'aiInput', 'aiAssert', 'assert', 'wait',
-        'navigate', 'screenshot',
+        'navigate', 'screenshot', 'aiWaitFor',
     }
+
+    #: 条件等待默认超时（毫秒）。页面加载/渲染慢时，"等元素出现"比固定 sleep
+    #: 更省时间：条件一成立立刻继续，最多等到这个上限（可用步骤 timeout_ms 覆盖）。
+    DEFAULT_WAIT_FOR_TIMEOUT_MS = 15000
 
     def __init__(self, base_url='', model_config=None, headless=True, workspace=None):
         self.base_url = base_url.rstrip('/') if base_url else ''
@@ -325,6 +329,10 @@ class MidsceneWebEngine:
                 step_result['assert'] = {'pass': ok, 'reason': reason}
                 if not ok:
                     raise AssertionError(reason or step.get('assert', {}).get('expect', 'AI 断言未通过'))
+            elif action == 'aiWaitFor':
+                # 条件等待：等目标元素/文案出现再继续，解决"页面还没渲染出来
+                # 就去点"导致的偶发失败（语义与真机侧一致）。
+                self._wait_for(prompt, step.get('timeout_ms'))
             else:
                 raise ValueError("不支持的 action: %s" % action)
 
@@ -368,6 +376,48 @@ class MidsceneWebEngine:
                 if required:
                     raise
         return out
+
+    def _wait_for(self, prompt, timeout_ms=None):
+        """等到 prompt 描述的元素/条件出现，超时则抛错（与真机侧同语义）。
+
+        优先用 SDK 原生 waitFor；没有该方法时退化成"轮询 ai_query"的通用实现。
+        """
+        try:
+            timeout_ms = int(timeout_ms or 0) or self.DEFAULT_WAIT_FOR_TIMEOUT_MS
+        except (TypeError, ValueError):
+            timeout_ms = self.DEFAULT_WAIT_FOR_TIMEOUT_MS
+        timeout_ms = max(1000, timeout_ms)
+        timeout_s = timeout_ms / 1000.0
+
+        for name in ('ai_wait_for', 'ai_waitfor', 'aiWaitFor'):
+            fn = getattr(self._agent, name, None)
+            if callable(fn):
+                self._log("[等待元素] 等待「%s」出现（超时 %ds）", prompt, int(timeout_s))
+                try:
+                    fn(prompt, timeout_ms)
+                except TypeError:
+                    fn(prompt)
+                return
+
+        self._log("[等待元素] SDK 无原生 waitFor，改用轮询等待「%s」（超时 %ds）",
+                  prompt, int(timeout_s))
+        deadline = time.time() + timeout_s
+        ask = '回答 true 或 false：当前页面是否满足下面这个条件？\n%s' % prompt
+        last = ''
+        while time.time() < deadline:
+            try:
+                last = str(self._agent.ai_query(ask)).strip()
+            except Exception as exc:  # noqa: BLE001
+                self._log("[等待元素] 查询失败（继续重试）: %s", exc)
+                last = ''
+            if last.lower().startswith('true'):
+                self._log("[等待元素] 条件已成立，继续执行")
+                return
+            time.sleep(1)
+        raise AssertionError(
+            '等待超时（%ds）：元素/条件未出现 —— %s。最后一次判断结果：%s'
+            % (int(timeout_s), prompt, last or '(无返回)')
+        )
 
     def _do_assert(self, step):
         """执行 AI 断言，返回 (是否通过, 失败原因)。

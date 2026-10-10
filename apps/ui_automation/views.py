@@ -10,7 +10,10 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
 from django.utils import timezone
-from apps.core.mixins import OwnerOrMemberMixin, filter_by_owner_or_member
+from apps.core.mixins import (
+    OwnerOrMemberMixin, filter_by_owner_or_member,
+    filter_visible, can_manage_project, can_delete_project,
+)
 import logging
 import json
 import os
@@ -23,9 +26,9 @@ import subprocess
 from .smart_locator import smart_match_locator, parse_swipe_pattern, get_wheel_coords, dump_page_elements
 
 from .models import (
-    UiProject, LocatorStrategy, Element, TestScript, TestSuite,
+    UiProject, LocatorStrategy, Element, ElementGroup, TestScript, TestSuite,
     TestSuiteScript, TestExecution, Screenshot,
-    ElementGroup, PageObject, PageObjectElement, ScriptStep, ScriptElementUsage,
+    PageObject, PageObjectElement, ScriptStep, ScriptElementUsage,
     TestCase, TestCaseStep, TestCaseExecution, OperationRecord,
     TestCase, TestCaseStep, TestCaseExecution, OperationRecord,
     UiScheduledTask, UiNotificationLog, UiTaskNotificationSetting,
@@ -174,7 +177,15 @@ _UI_AI_STATUS_MAP = {
 }
 
 
-class UiProjectViewSet(OwnerOrMemberMixin, viewsets.ModelViewSet):
+class UiProjectViewSet(viewsets.ModelViewSet):
+    """
+    UI 自动化项目 CRUD。
+
+    2026-09-20 用户要求「每个人都能查看别人创建的项目，只是不能删除」：
+      - list/retrieve 查看：全员可见
+      - create/update    ：登录即可（update 额外要求负责人/成员/管理员）
+      - destroy 删除     ：仅负责人 + 管理员
+    """
     queryset = UiProject.objects.all()
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -182,6 +193,46 @@ class UiProjectViewSet(OwnerOrMemberMixin, viewsets.ModelViewSet):
     search_fields = ['name', 'description']
     ordering_fields = ['created_at', 'updated_at']
     ordering = ['-created_at']
+
+    def get_queryset(self):
+        # 查看放开：所有登录用户可见全部 UI 项目。
+        # ⚠️ 这里不能用 OwnerOrMemberMixin，否则用户看不到别人创建的项目。
+        qs = super().get_queryset()
+        user = getattr(self.request, 'user', None)
+        if user is None or not user.is_authenticated:
+            return qs.none()
+        return qs.distinct()
+
+    def _deny_if_not_manageable(self, obj):
+        """改/删前校验：负责人、成员或管理员。"""
+        if can_manage_project(self.request.user, obj):
+            return None
+        return Response(
+            {'error': '只有项目负责人、项目成员或管理员可以修改该项目'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
+    def update(self, request, *args, **kwargs):
+        denied = self._deny_if_not_manageable(self.get_object())
+        if denied:
+            return denied
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        denied = self._deny_if_not_manageable(self.get_object())
+        if denied:
+            return denied
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        obj = self.get_object()
+        # 删除从严：仅负责人 + 管理员（成员也不行），与主 Project 保持一致
+        if not can_delete_project(request.user, obj):
+            return Response(
+                {'error': '只有项目负责人或管理员可以删除项目'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -4293,11 +4344,15 @@ class AICaseViewSet(viewsets.ModelViewSet):
             '2. 数组每个元素结构：\n'
             '   {"action":"动作","name":"步骤简称","prompt":"给视觉模型的自然语言指令",'
             '"value":"","wait_ms":0}\n'
-            '3. action 只能取：launch / aiTap / aiInput / aiAct / back / home / wait / screenshot\n'
+            '3. action 只能取：launch / aiTap / aiInput / aiAct / aiQuery / '
+            'aiWaitFor / back / home / wait / screenshot\n'
             '   - launch：启动应用，prompt 写应用名\n'
             '   - aiTap：明确点击某个控件，prompt 写"点击XX"\n'
             '   - aiInput：输入文本，prompt 写"在XX输入框输入"，value 写要输入的内容\n'
             '   - aiAct：无法归入以上的复合操作\n'
+            '   - aiQuery：只读取信息、不做操作，prompt 写要查询的内容\n'
+            '   - aiWaitFor：需要**等待某个元素/页面出现**时用它，prompt 写"XX 出现"\n'
+            '     （例如"首页的搜索框出现"）；比固定等待更省时间，优先用它而不是 wait\n'
             '   - back / home：返回、回主屏（prompt 留空）\n'
             '4. **一个步骤只做一件事**。遇到"点击A，然后点击B，再进入C"，必须拆成 3 个步骤，'
             '禁止把多个动作塞进同一句 prompt（否则失败时无法定位）。\n'
@@ -4335,7 +4390,7 @@ class AICaseViewSet(viewsets.ModelViewSet):
             raise ValueError('模型返回的步骤为空')
 
         allowed = {'launch', 'aiTap', 'aiInput', 'aiAct', 'aiQuery',
-                   'back', 'home', 'wait', 'screenshot', 'assert'}
+                   'aiWaitFor', 'back', 'home', 'wait', 'screenshot', 'assert'}
         steps = []
         for i, item in enumerate(parsed):
             if not isinstance(item, dict):
@@ -4346,18 +4401,25 @@ class AICaseViewSet(viewsets.ModelViewSet):
             prompt = str(item.get('prompt') or '').strip()
             value = str(item.get('value') or '').strip()
             # 需要 prompt 的动作没给 prompt 就丢掉，避免产出"空步骤"
-            if action in ('launch', 'aiTap', 'aiInput', 'aiAct', 'aiQuery') and not prompt:
+            if action in ('launch', 'aiTap', 'aiInput', 'aiAct', 'aiQuery',
+                          'aiWaitFor') and not prompt:
                 continue
             try:
                 wait_ms = int(item.get('wait_ms') or 0)
             except (TypeError, ValueError):
                 wait_ms = 0
+            try:
+                timeout_ms = int(item.get('timeout_ms') or 0)
+            except (TypeError, ValueError):
+                timeout_ms = 0
             steps.append({
                 'action': action,
                 'name': str(item.get('name') or '').strip() or ('步骤 %d' % (i + 1)),
                 'prompt': prompt,
                 'value': value,
                 'wait_ms': max(0, wait_ms),
+                # aiWaitFor 的等待上限；0 = 用引擎默认值
+                'timeout_ms': max(0, timeout_ms),
                 'extract': [],
                 'assert': {'prompt': '', 'expect': ''},
             })
@@ -4393,16 +4455,23 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 'name': data.get('name'),
                 'value': data.get('value'),
                 'selector_hint': data.get('selector_hint'),
+                # 手动从元素库选定的元素 id（引擎不消费，仅记录来源）
+                'locate_element_id': data.get('locate_element_id'),
+                # 精确定位（仅 iOS）：走 WDA 元素树按文本取坐标
+                'locate_by_text': data.get('locate_by_text'),
+                'locate_region': data.get('locate_region'),
+                'locate_index': data.get('locate_index'),
                 'wait_ms': data.get('wait_ms'),
                 'extract': data.get('extract'),
                 'assert': data.get('assert'),
             }]
 
         allowed_actions = ('aiAct', 'aiTap', 'aiInput', 'aiQuery', 'assert', 'wait',
-                           'launch', 'back', 'home', 'screenshot')
+                           'launch', 'back', 'home', 'screenshot', 'aiWaitFor')
 
         # 这些动作天然不需要 prompt（返回/回主屏/等待/截图），
         # 强制要求 prompt 会把 AI 拆出来的 back 步骤全部拦下来。
+        # 注意 aiWaitFor 不在其中：它必须有 prompt（要等什么出现）。
         PROMPTLESS_ACTIONS = ('back', 'home', 'wait', 'screenshot')
 
         prepared = []
@@ -4452,6 +4521,11 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 device_id=data.get('device_id') or None,
                 execution_mode='midscene',
                 steps=[],
+                # 必须显式给值：老环境（如生产）该列是 NOT NULL（初始迁移 0002 建表时是
+                # TextField(blank=True, default='')），而当前模型是 null=True，
+                # 不传时 Django 会显式写 NULL，直接报
+                # (1048, "Column 'task_description' cannot be null") → 保存步骤 500。
+                task_description='',
                 created_by=request.user if request.user.is_authenticated else None,
             )
             created_case = True
@@ -4469,8 +4543,21 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 'action': action,
                 'prompt': prompt,
                 'selector_hint': (raw.get('selector_hint') or '').strip(),
+                # 手动从元素库选定的元素 id（引擎不消费，仅记录来源）。
+                # 必须显式透传，否则用户"重新打开用例"时选择丢失、又要重挑一遍。
+                'locate_element_id': raw.get('locate_element_id') or None,
+                # 精确定位（仅 iOS）：按下标/区域在元素树里消歧同名元素。
+                # 同样必须显式透传 —— 这里是逐字段重建 step 字典。
+                'locate_by_text': bool(raw.get('locate_by_text')),
+                'locate_region': (raw.get('locate_region') or '').strip(),
+                'locate_index': int(raw.get('locate_index') or 0),
                 'value': (raw.get('value') or '').strip(),
                 'wait_ms': int(raw.get('wait_ms') or 0),
+                # aiWaitFor 的等待上限（0 = 引擎默认 15 秒）。
+                # 这里必须显式透传：本方法是在重建 step 字典（不是直接把
+                # raw 存库），漏一个字段就会被静默丢掉 —— 前端填了超时值
+                # 却存成默认值，用户会以为设置没生效。
+                'timeout_ms': int(raw.get('timeout_ms') or 0),
             }
             extract = raw.get('extract')
             if extract:
@@ -4811,7 +4898,17 @@ class AICaseViewSet(viewsets.ModelViewSet):
         )
 
         if is_ios:
-            return self._run_ios_engine(ai_case, device, replay_mode=want_replay)
+            engine, result = self._run_ios_engine(
+                ai_case, device, replay_mode=want_replay)
+            self._log_replay_decision(engine, ai_case, want_replay, force_ai)
+            # ⚠️ 必须**在** _log_replay_decision 之后刷新快照：
+            #    _run_ios_engine 里 `result['engine_logs']` 是那一刻的拷贝，
+            #    之后 append 进 engine.logs 的行不会自动进快照 ——
+            #    结果就是「[固化] 本次走回放/AI」那行**永远不出现在执行日志里**
+            #    （2026-09-22 实测：日志里一行 [固化] 都没有，
+            #     害得排查时完全看不出这次到底走了哪条路）。
+            result['engine_logs'] = list(engine.logs)
+            return engine, result
 
         from .midscene_engine import MidsceneAppEngine
         engine = MidsceneAppEngine(
@@ -4823,7 +4920,58 @@ class AICaseViewSet(viewsets.ModelViewSet):
         )
         engine.connect()
         result = engine.run(steps)
+        self._log_replay_decision(engine, ai_case, want_replay, force_ai)
         return engine, result
+
+    @staticmethod
+    def _log_replay_decision(engine, ai_case, want_replay, force_ai=False):
+        """在执行日志开头写明"这次走的是回放还是 AI 探索，以及依据"。
+
+        为什么需要它（2026-09-22 实际踩到的坑）：
+          固化是在**上一次执行结束、结果落库之后**才写入的
+          （`_freeze_case_steps` 在 run_task 尾段调用）。
+          用户看到「成功」立刻点「重跑」，很可能**赶在固化写库之前** ——
+          于是那次仍是 AI 探索（12 次调用），用户看到的就是
+          "我明明跑通了，为什么重跑还是烧 token"，而且**日志里没有任何线索**，
+          只能去比对 `steps_frozen_at` 时间戳才能发现。
+
+        所以这里把判定依据直接打出来：已固化就报固化时间，
+        未固化就**说明原因**（没固化 / 缺坐标 / 强制 AI），
+        一眼就能分清"固化没生效"和"还没轮到固化"。
+        """
+        try:
+            if want_replay:
+                frozen = getattr(ai_case, 'steps_frozen_at', None)
+                engine.logs.append(
+                    '[固化] 本用例已固化 %s → 本次走**纯坐标回放**（定位类步骤不调用视觉模型）'
+                    % (frozen.strftime('%Y-%m-%d %H:%M:%S') if frozen else '?'))
+                return
+
+            if force_ai:
+                engine.logs.append(
+                    '[固化] 回放失败降级 → 本次强制走 AI 探索模式（跑通后会重新固化）')
+                return
+
+            steps = ai_case.steps or []
+            need = ('aiTap', 'aiAct', 'aiInput')
+            missing = [
+                i + 1 for i, s in enumerate(steps)
+                if isinstance(s, dict) and s.get('action') in need
+                and (s.get('center_x') is None or s.get('center_y') is None)
+            ]
+            if not getattr(ai_case, 'steps_frozen_at', None):
+                engine.logs.append(
+                    '[固化] 本用例**尚未固化** → 本次走 AI 探索模式，'
+                    '跑通后会自动固化为可复用脚本（下次执行起走纯坐标回放）')
+            elif missing:
+                engine.logs.append(
+                    '[固化] 用例已固化但第 %s 步缺坐标 → 本次退回 AI 探索模式'
+                    % '、'.join(str(m) for m in missing))
+            else:
+                engine.logs.append(
+                    '[固化] 判定异常：未走回放但条件似乎满足，请检查日志')
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('[固化] 写回放判定日志失败（不影响执行）: %s', exc)
 
     def _freeze_case_steps(self, ai_case, executed_steps, logs):
         """把本次执行采到的坐标写回用例，并打上固化时间戳。
@@ -4859,8 +5007,18 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 patched.append((idx, int(cx), int(cy)))
 
         if missing:
-            logs.append('[固化] 第 %s 步没有采到坐标，本次不固化（避免固化出会点空的半成品）'
-                        % '、'.join(str(m) for m in missing))
+            # ⚠️ 这里必须把**真实原因**说清楚。旧文案只说"没采到坐标"，
+            #    用户会以为"这次运气不好，再跑一次就好了"——
+            #    但如果原因是"引擎没有采坐标的能力"，重跑多少次都不会成功，
+            #    白烧 token 还以为是偶发问题。
+            logs.append(
+                '[固化] 第 %s 步没有采到坐标，本次不固化（避免固化出会点空的半成品）\n'
+                '        说明：坐标来自"定位采样"。精确元素定位（元素树）命中的步骤天然有坐标；\n'
+                '        走 AI 视觉定位的步骤需要引擎调用 aiLocate 采样 —— 若该能力不可用\n'
+                '        （或采样失败），这些步骤就永远没有坐标，**重复执行也不会改善**。\n'
+                '        请检查执行日志里是否有"已采样坐标"记录；若无，说明本次运行的引擎\n'
+                '        版本未启用 aiLocate 采样。'
+                % '、'.join(str(m) for m in missing))
             return
 
         if not patched:
@@ -4955,7 +5113,22 @@ class AICaseViewSet(viewsets.ModelViewSet):
         try:
             bundle_id = (ai_case.app_config.package_name if ai_case.app_config else '') or ''
             if bundle_id:
-                engine.launch_app(bundle_id)
+                # ⭐⭐ **探索与回放都先复位到同一起点**（2026-09-22 实测定型）。
+                #
+                # 为什么要复位：固化采到的是**绝对坐标**，隐含假设
+                #   「本次起点页面 == 固化采样时的起点页面」。
+                #   若探索从"任意残留状态"采样、回放从另一起点开始，两边页面不同
+                #   → 坐标整体偏掉 → 回放必失败 → 降级烧 token
+                #   → 用户误判"固化从没生效、永远省不了 token"。
+                #
+                # ⚠️ 复位**只重新拉起 App，不 home/不杀进程**（实测坑）：
+                #   最初实现是 `home` + 冷启动，以为能拿到"最干净首启状态"，
+                #   但该 App 冷启动会落到一个**既无主导航、也无返回按钮的死路页**
+                #   （iOS「日记本」页：`back` 两次元素树完全不变），
+                #   首步固化坐标 (40,794) 在此页落到「前一天」按钮 → 连锁失败。
+                #   **杀进程同样会落到那个死路页，所以也不做。**
+                #   起点一致性改由用例自身保证（用例应从期望的页面开始）。
+                engine.reset_to_home(bundle_id)
                 # 冷启动是最容易弹权限/协议/开屏广告的时刻，先清一轮再开始执行，
                 # 免得第一个步骤就被弹窗挡住（步骤级已有失败重试兜底，这里只是
                 # 提前把最常见的情况处理掉）。
@@ -4973,6 +5146,16 @@ class AICaseViewSet(viewsets.ModelViewSet):
             'error': raw.get('error') or '',
             'context': {},
         }
+        # 把引擎日志挂到 result 上。
+        #
+        # ⚠️ 为什么必须挂（2026-09-22 踩到）：
+        #   `_run_midscene` 里的回放降级分支会 `engine = engine2` **换掉** engine 对象，
+        #   然后 `logs = list(engine.logs)` 取的是**新引擎**的日志。
+        #   iOS 路径里「步骤 1 精确定位命中、步骤 2 失败」这类关键行都只在
+        #   **第一个** engine.logs 里 —— 不挂过来就会**整段丢失**，
+        #   用户看到的故障日志直接从「已启动」跳到「[步骤 2] 失败」，
+        #   完全无法判断第 1 步到底做了什么（这正是排查卡住的原因）。
+        result['engine_logs'] = list(engine.logs)
         return engine, result
 
     def _run_midscene(self, request, ai_case):
@@ -5229,8 +5412,15 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 set_current_execution(execution_record.id)
 
                 replay_used = False
+                replay_degraded = False
+                replay_fail_reason = ''
                 engine, result = self._execute_midscene_case(ai_case, _device)
                 replay_used = bool(getattr(engine, 'replay_mode', False))
+                # ⚠️ 先把本次执行的日志**抓在手里**再谈降级。
+                #    降级分支会 `engine = engine2` 覆盖掉 engine，届时 `engine.logs`
+                #    只剩第二个引擎的 —— iOS 上「要素定位命中/回退」这些只在第一个
+                #    引擎里记的行会**静默丢失**（见 _run_ios_engine 里 result['engine_logs']）。
+                attempt_logs = list(result.get('engine_logs') or engine.logs)
 
                 # ---- 回放失败 -> 自动降级回 AI 模式重跑 ----
                 # 坐标固化后如果界面改版/换机型，回放会点空。这时不能直接判失败，
@@ -5238,18 +5428,23 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 # 下次又能走回放。这样"重复跑省 token"和"界面变了也能过"两者兼得。
                 if replay_used and result.get('status') != 'passed':
                     logger.info('[Midscene] 回放失败，降级为 AI 探索模式重跑 (case#%s)', ai_case.id)
-                    engine.logs.append(
+                    # 记下"回放确实试过了、失败原因是什么"，供报告展示。
+                    # ⚠️ 旧代码只把 replay_used 置 False，报告就只剩「AI 探索」，
+                    #    用户看不出曾经走过回放 → 误判"固化没生效、永远省不了 token"。
+                    replay_degraded = True
+                    replay_fail_reason = str(result.get('error') or '')[:500]
+                    attempt_logs.append(
                         '\n[Midscene] 固化坐标回放失败（界面可能已改版或换了机型），'
-                        '自动切换为 AI 探索模式重跑...'
+                        '自动切换为 AI 探索模式重跑...\n'
+                        '       回放失败原因：%s' % (replay_fail_reason or '(未提供)')
                     )
-                    degraded_logs = list(engine.logs)
                     engine2, result2 = self._execute_midscene_case(
                         ai_case, _device, force_ai=True)
                     result2['steps'] = list(result2.get('steps') or [])
+                    attempt_logs += [''] + list(result2.get('engine_logs') or engine2.logs)
                     engine = engine2
                     result = result2
                     replay_used = False
-                    engine.logs = degraded_logs + [''] + list(engine2.logs)
 
                 # ---- 跑通且尚未固化 -> 自动固化坐标 ----
                 if result.get('status') == 'passed' and not getattr(engine, 'replay_mode', False):
@@ -5259,8 +5454,10 @@ class AICaseViewSet(viewsets.ModelViewSet):
                         engine.logs.append('[固化] 自动固化失败（不影响用例结果）: %s' % fexc)
                         logger.warning('[Midscene] 自动固化失败 case#%s: %s', ai_case.id, fexc)
 
-                # 合并引擎日志与每步结果
-                logs = list(engine.logs)
+                # 合并引擎日志与每步结果。
+                # 用 attempt_logs（含被替换掉的那次引擎日志），不是 engine.logs ——
+                # 降级后 engine 是第二个引擎，直接取会把第一次执行的日志丢掉。
+                logs = list(attempt_logs)
                 logs.append('\n[Midscene] 执行结束：%s' % result.get('status', 'unknown'))
                 if result.get('error'):
                     logs.append('错误：%s' % result['error'])
@@ -5286,6 +5483,8 @@ class AICaseViewSet(viewsets.ModelViewSet):
                 execution_record.screenshots_sequence = screenshots
                 execution_record.error_message = result.get('error') or ''
                 execution_record.replay_mode = replay_used
+                execution_record.replay_degraded = replay_degraded
+                execution_record.replay_fail_reason = replay_fail_reason
                 execution_record.end_time = timezone.now()
                 execution_record.duration = (
                     execution_record.end_time - execution_record.start_time
@@ -7491,6 +7690,58 @@ def import_airtest_script(request):
 #
 # 安全性：只允许转发到 AIModelConfig 里配置过的 base_url，避免变成任意
 # 请求转发器（SSRF）。
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def ios_dump_elements(request):
+    """
+    导出 iOS 设备当前页面的可访问性元素树。
+
+    背景（2026-09-21）：iOS 的「精确定位」是按元素树里的文案匹配的，但**不同 app
+    暴露的文案差异极大** —— 有的给中文标签（如「添加心情」），有的只有拼音英文 id
+    （如 `diary media font`）。用户看不见元素树，就不知道"该填什么、为什么定位失败"。
+    这个接口把设备当前可见的元素（文案 + 坐标）返回给前端展示。
+
+    请求体: { "device_id": 8, "only_named": true }
+    返回:   { "total": N, "count": M, "nodes": [{type,name,label,value,rect,center}] }
+    """
+    from .midscene_ios_engine import MidsceneIOSEngine
+
+    device_id = request.data.get('device_id')
+    if not device_id:
+        return Response({'error': '缺少 device_id'}, status=400)
+
+    device = AppDevice.objects.filter(id=device_id).first()
+    if not device:
+        return Response({'error': '设备不存在'}, status=404)
+    if (device.platform or '').lower() != 'ios':
+        return Response({'error': '该功能仅支持 iOS 设备'}, status=400)
+
+    engine = MidsceneIOSEngine(
+        wda_host=(device.wda_host or '').strip(),
+        wda_port=device.wda_port or 8100,
+    )
+    try:
+        engine.start()
+        res = engine._rpc(
+            'dumpTree',
+            {'sessionId': engine._session_id,
+             'onlyNamed': bool(request.data.get('only_named', True))},
+            timeout=120)
+        return Response({
+            'total': res.get('total'),
+            'count': res.get('count'),
+            'nodes': res.get('nodes') or [],
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('[iOS] dump 元素树失败: %s', exc)
+        return Response({'error': str(exc)}, status=500)
+    finally:
+        try:
+            engine.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @api_view(['POST'])

@@ -105,13 +105,37 @@ media/modao_samples/
 _fake_mig.py
 nul; Write-Output cleaned
 
-# 一次性排查/修复脚本及其输出（根目录 _ 前缀，全部为本地临时产物，禁止入库）
+# 本地一次性脚本与过程笔记（根目录 _ 前缀，禁止入库）
 /_*.py
 /_*.txt
 /_*.tar
 /_*.jpg
 /_*.json
 /_*.out
+/_*.sql
+/_*.md
+/_*.ps1
+/_*.js
+/_*.conf
+/.codebuddy/memory/
+
+# 本地数据库 dump（4GB 级，绝对禁止入库）
+_db_backup/
+
+# iOS 设备镜像 / 固件等本地大文件（10MB+ 二进制）
+devimages/
+
+# 2026-10-10 整理团队仓库时补：一次性调试残留与本地产物
+/dist/
+/generated-images/
+/media/modao/probe_full/
+/media/modao/clean_probe/
+/migrate_folder.sql
+/selfIdentity.plist
+/tried
+/scripts/ready
+/fix-all.ps1
+/fix-frontend-routes.sh
 .debug_tmps/
 frontend/_build_out.txt
 frontend/_build_err.txt

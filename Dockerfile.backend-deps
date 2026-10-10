@@ -1,0 +1,66 @@
+# =====================================================================================
+# RAW DEPENDENCY LAYERS for the TestHub backend base image - this is the SOURCE OF TRUTH.
+#   python scripts/gen_backend_base.py  ->  Dockerfile.backend-base (docs header + this file)
+#   Only edit THIS file when system deps change; do NOT edit Dockerfile.backend-base.
+#   Keep these instruction bytes stable: a 1-byte change = cache miss = re-resolving
+#   all 243 pip packages (~30-40 min on this network).
+# =====================================================================================
+
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# 安装系统依赖（MySQL客户端编译必需 + Airtest/OpenCV 运行库）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        default-libmysqlclient-dev \
+        build-essential \
+        pkg-config \
+        gcc \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        wget \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 adb 客户端（真机被动触摸监听 getevent 需要；缺失时自动退化，不会中断构建）
+RUN (wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O /tmp/pt.zip \
+    && unzip -o /tmp/pt.zip -d /opt \
+    && rm -f /tmp/pt.zip \
+    && ln -sf /opt/platform-tools/adb /usr/local/bin/adb) \
+    || echo "adb install skipped (getevent 实时监听将不可用，录制仍可走镜像点击)"
+
+# 安装Python依赖（2026-09-03 起使用阿里云镜像；清华 pypi.tuna.tsinghua.edu.cn 在当前网络下极慢/易超时，如需回退改回该源）
+# 2026-09-03 起安装 requirements.lock.txt（全量钉死版本）：requirements.txt 的宽约束组合会让 pip
+# resolver 回溯 20 万轮 ResolutionTooDeep 失败；lock 文件源自 prod 容器实测自洽解，零回溯。
+# 注意：不能带 --no-cache-dir（否则 pip 不读写缓存目录），依赖缓存在宿主 docker 持久化；
+# 效果：lock 未变→整层命中跳过；lock 变更→只增量下载，不全量重下
+COPY requirements.lock.txt .
+# 2026-10-10：--timeout/--retries 必加。本机实测到镜像源只有 150~270 KB/s，
+# pip 默认 socket 读超时 15s，下 opencv(67MB) 这种大包时一次卡顿就 ReadTimeoutError 整层失败（当天已连续失败 2 次）。
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -i https://mirrors.aliyun.com/pypi/simple/ \
+        --timeout 180 --retries 20 \
+        -r requirements.lock.txt
+
+# 安装 Playwright Chromium（墨刀读取 / UI自动化 需要浏览器引擎）
+#
+# 2026-10-10: PLAYWRIGHT_DOWNLOAD_HOST is MANDATORY on this network.
+#   cdn.playwright.dev measured 47 KB/s here (184 MiB => ~60+ min) and even times out from the
+#   host; cdn.npmmirror.com/binaries/playwright measured 6.6 MB/s (140x faster, ~30 s).
+#   The trailing `sed` also repoints Debian to the aliyun mirror, because `playwright
+#   install-deps chromium` runs apt internally and deb.debian.org is equally slow.
+#   WARNING: the whole line is wrapped in `|| echo`, so a failure here is SILENT and would
+#   leave production without a browser. Always verify:
+#     docker exec testhub-backend ls -d /root/.cache/ms-playwright/chromium*
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+RUN (sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources || true) \
+    && playwright install chromium \
+    && playwright install-deps chromium \
+    || echo "playwright browser install partial"

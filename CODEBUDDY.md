@@ -52,7 +52,97 @@ TestHub 是一套前后端分离的智能测试管理与自动化执行平台，
 - API 返回形式以相邻接口和前端调用约定为准。项目大量接口使用 `{code, data, message}`，但并非所有 DRF/SSE/文件响应都适合强行套该格式。
 - 数据库变更优先走 Django migration；仓库包含历史手工 SQL/修复脚本，使用前必须确认目标库状态，避免重复执行。
 
+#### 后端镜像构建慢/重建耗时的排查（2026-09-17 实测定型）
+
+> **触发场景**：`docker compose build backend` 长时间停在下载依赖（现象如"已运行 29 分钟 / 下载到第 N 个包 / 60-80 KB/s"）。
+> **先别急着重下，按下面顺序 30 秒定位，多数情况是可避免的白工。**
+
+**1. 先确认缓存是否还在（不是猜，直接查）**
+
+```powershell
+docker buildx du --verbose | Select-String -Pattern "Description|Last used" -Context 0,1
+```
+
+每条 `Description:` 就是一层，紧跟的 `Last used:` 是它**最近一次被构建使用**的时间。据此可判：
+
+| 观测 | 结论 |
+|---|---|
+| `Last used: About a minute ago` / `N minutes ago` | 该层**正在被本次构建使用**（= 构建卡在这一层） |
+| `Last used: 2 weeks ago`（值很旧） | 该层**本次尚未轮到**，前一层还没过 |
+| 找不到某层 | 缓存被清了（`buildx prune` / 磁盘清理） |
+
+**2. 平行看镜像与容器（判断"构建是否已产出"）**
+
+```powershell
+docker images --format "{{.Repository}} | {{.Size}} | {{.CreatedSince}}" | Select-String testhub-backend
+docker ps --format "{{.Names}} | {{.Status}}" | Select-String testhub-backend
+```
+
+- 镜像 `CreatedSince` 仍是旧的 **且** 容器 `Up N hours` 未被重启 → **构建还没产出，仍在进行**。
+- 镜像已更新 / 容器刚重启 → 构建已完成。
+
+**3. `Dockerfile.backend` 各层的缓存强度不同（这是"为什么慢"的根因）**
+
+| 层 | 缓存机制 | 失效后代价 |
+|---|---|---|
+| `apt-get install ...`（第 10~23 行） | **普通 Docker 层缓存，无 cache mount** | ⚠️ **最慢**，全量装 gcc/build-essential/libgl 等约 200~300MB，国内访问 `deb.debian.org` 常只有几十 KB/s |
+| `pip install -r requirements.lock.txt`（第 38 行） | `--mount=type=cache,target=/root/.cache/pip`（1.4GB 级） | 中等；缓存命中则秒过，**未命中会全量下 243 个包** |
+| `playwright install chromium`（第 41 行） | 普通层缓存 | 慢，需下 Chromium ~150MB + apt 装图形库 |
+| `COPY . .`（第 44 行） | 普通层缓存，**源码必变** | 正常重建，几分钟 |
+
+**⚠️ 关键认知：`--mount=type=cache` 的缓存挂在「宿主机 Docker」上，不在镜像里。**
+所以"以前构建过"不代表"这次不用重下"——**镜像层缓存和 cache mount 任缺其一都会退化为全量下载**。
+
+**⚠️ 另一个高频误判：`pip` 慢 vs `apt` 慢。**
+若 `buildx du` 显示**正在被使用的是 `apt-get` 那一层**，那么慢的是 **apt（Debian 源）**，不是 pip；
+此时"换 PyPI 镜像源"完全无效，**要换的是 Debian 源**。
+
+**4. 三条铁律（避免把几分钟的活干成几十分钟）**
+
+- **禁止 `--no-cache`**：会让 `COPY requirements.lock.txt` 层失效 → 后面整条链全废 → 全量重下 243 包。
+  仅当**前端 COPY 层**确需刷新时才考虑（那也只需重建 frontend）。
+- **只改代码时根本不需要重建镜像**：生产/开发同步后端 `.py` 一律走 `docker cp`（见下），秒级完成、不碰依赖。
+- **改动 `Dockerfile.backend` 任何一行都会使其后所有层失效**，因此**不要在有人正在构建时改它**；
+  改完后的**首次**构建必然重跑 apt + pip，属预期，之后恢复命中。
+
+**5. lock 文件的两个数字别搞混**
+
+`requirements.lock.txt` **总行数 254**，但**实际包数量 243**（254 含空行/注释）。
+看到"第 57/254"这类输出时，254 是**行数**不是包数，**不要据此推断"lock 被改过"**。
+校验 lock 是否真被改：`git diff requirements.lock.txt`（空 = 未改）。
+
+**6. 只同步后端代码时的标准流程（不重建镜像）**
+
+```powershell
+# Windows 下 docker cp 目录会随机漏文件 → 先在宿主打 tar
+tar -cf _sync.tar -C <repo根> apps backend
+docker cp _sync.tar testhub-backend:/tmp/
+docker exec testhub-backend sh -c "tar -xf /tmp/_sync.tar -C /app && find /app -name __pycache__ -type d -exec rm -rf {} +"
+docker restart testhub-backend
+# 等约 25s 后验证（404 = Django dev 正常活着）
+curl -w "%{http_code}" http://localhost:8000/api/
+```
+
+**7. 构建耗时的真实参考（2026-09-17 实测：全量重建约 1 小时）**
+
+`requirements.lock.txt`（243 包）全量重建（apt → pip → playwright → COPY）分布：
+
+| 阶段 | 实测 |
+|---|---|
+| apt（**无 cache mount**，走 Debian 官方源） | 5~20 分钟 |
+| pip（部分命中 cache mount，**新增包需真下载**） | 30~40 分钟 |
+| playwright chromium（**无 cache mount**，~150MB） | 30~50 分钟 |
+| COPY . . + 导出镜像 | 3~6 分钟 |
+
+**⚠️ 判断构建是否卡死不能只看 `docker buildx du`**：
+`Last used` **只在挂载那一刻更新一次**，不反映层内部进度。
+实例：pip 正在下载一个 47.7MB 的大包时，`Last used` 会一直停在"37 分钟前"不动，
+看起来像"卡死/中断"，实际构建完全正常。
+**⇒ 判断细粒度进度只能看构建方终端/AI 的实时日志；`buildx du` 只适合判断"哪一层是瓶颈"。**
+
+
 ### 前端
+
 
 - 页面放 `frontend/src/views/`，公共组件放合适的组件目录，Pinia store 放 `stores/`，请求封装放 `api/`。
 - 组件不要新写裸 axios；复用统一请求封装、JWT 刷新和错误处理逻辑。

@@ -2,7 +2,7 @@
   <div class="page-container">
     <div class="page-header">
       <h1 class="page-title">项目管理</h1>
-      <el-button type="primary" @click="showCreateDialog = true">
+      <el-button type="primary" @click="openCreateDialog">
         <el-icon><Plus /></el-icon>
         新建项目
       </el-button>
@@ -49,15 +49,25 @@
           </template>
         </el-table-column>
         <el-table-column prop="owner.username" label="负责人" width="120" />
+        <!-- 归属角色：该角色的成员自动拥有本项目的编辑权限 -->
+        <el-table-column label="归属角色" width="130">
+          <template #default="{ row }">
+            <el-tag v-if="row.role_name" size="small" type="warning">{{ row.role_name }}</el-tag>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="created_at" label="创建时间" width="180">
           <template #default="{ row }">
             {{ formatDate(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="170" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" @click="editProject(row)">编辑</el-button>
-            <el-button size="small" type="danger" @click="deleteProject(row)">删除</el-button>
+            <!-- 全员都能查看，但只有负责人/成员/角色成员/管理员能改；
+                 删除仅限负责人 + 管理员。后端是最终防线，这里只是提前隐藏避免误点。 -->
+            <el-button v-if="row.can_edit" size="small" @click="editProject(row)">编辑</el-button>
+            <span v-else class="muted">只读</span>
+            <el-button v-if="row.can_delete" size="small" type="danger" @click="deleteProject(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -103,6 +113,16 @@
             <el-option label="已归档" value="archived" />
           </el-select>
         </el-form-item>
+        <!-- 归属角色：该角色下的成员自动获得本项目的编辑权限（不含删除）。
+             角色在「用户管理 → 角色」里由管理员维护。 -->
+        <el-form-item label="归属角色" prop="role">
+          <el-select v-model="form.role" placeholder="可选：选择后该角色成员自动有编辑权限" clearable style="width: 100%">
+            <el-option v-for="r in roles" :key="r.id" :label="r.name" :value="r.id" />
+          </el-select>
+          <div class="form-hint">
+            该角色下的成员会自动获得本项目的<b>编辑</b>权限；<b>删除</b>仍仅限项目负责人或管理员。留空则只有负责人和项目成员能改。
+          </div>
+        </el-form-item>
         <el-form-item label="知识库目录" prop="knowledge_base_path">
           <el-input
             v-model="form.knowledge_base_path"
@@ -145,13 +165,27 @@ const total = ref(0)
 const searchText = ref('')
 const statusFilter = ref('')
 
+// 归属角色下拉的数据源（用户管理 → 角色 里维护）
+const roles = ref([])
+
 const form = reactive({
   id: null,
   name: '',
   description: '',
   status: 'active',
-  knowledge_base_path: ''
+  knowledge_base_path: '',
+  role: null
 })
+
+// 拉角色列表：创建/编辑项目时要能选择"归属角色"
+const fetchRoles = async () => {
+  try {
+    const res = await api.get('/projects/roles/', { params: { page_size: 200 } })
+    roles.value = res.data.results || res.data || []
+  } catch {
+    roles.value = []
+  }
+}
 
 const rules = {
   name: [
@@ -206,6 +240,7 @@ const editProject = (project) => {
   form.description = project.description
   form.status = project.status
   form.knowledge_base_path = project.knowledge_base_path || ''
+  form.role = project.role || null
   showCreateDialog.value = true
 }
 
@@ -215,7 +250,15 @@ const resetForm = () => {
   form.description = ''
   form.status = 'active'
   form.knowledge_base_path = ''
+  form.role = null
   isEdit.value = false
+}
+
+// 「新建项目」按钮：打开前必须清空表单，否则上次编辑的 role 会残留在新建里
+const openCreateDialog = () => {
+  resetForm()
+  fetchRoles()
+  showCreateDialog.value = true
 }
 
 const handleSubmit = async () => {
@@ -288,10 +331,25 @@ const formatDate = (dateString) => {
 
 onMounted(() => {
   fetchProjects()
+  // 角色列表预加载：列表页要显示「归属角色」，表单也要能选
+  fetchRoles()
 })
 </script>
 
 <style lang="scss" scoped>
+.muted {
+  color: #c0c4cc;
+  font-size: 12px;
+}
+.form-hint {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.6;
+  margin-top: 4px;
+}
+.warn-text {
+  color: #e6a23c;
+}
 .filter-bar {
   margin-bottom: 20px;
 }

@@ -38,12 +38,26 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="执行方式" width="110" align="center">
+        <el-table-column label="执行方式" width="140" align="center">
           <template #default="{ row }">
-            <!-- 固化回放 = 按坐标操作，不调用视觉模型；AI 探索 = 每步都要模型 -->
+            <!-- 三种状态必须分开显示，否则用户会误判"固化根本没生效"：
+                 ① 脚本回放        真零模型（定位类步骤按坐标点）
+                 ② 回放失败→AI降级  试过回放但失败，本次实际烧了 token
+                 ③ AI 探索         尚未固化（首次探索）
+                 旧实现把 ② 也显示成「AI 探索」，用户反复重跑都看到这个标签，
+                 就会以为固化没用、省钱没效果。 -->
             <el-tag v-if="row.replay_mode" type="success" size="small" effect="plain">
               脚本回放
             </el-tag>
+            <el-tooltip
+              v-else-if="row.replay_degraded"
+              :content="degradedTip(row)"
+              placement="top"
+            >
+              <el-tag type="danger" size="small" effect="plain">
+                回放失败·AI降级
+              </el-tag>
+            </el-tooltip>
             <el-tag v-else type="warning" size="small" effect="plain">
               AI 探索
             </el-tag>
@@ -60,7 +74,13 @@
                 </el-tooltip>
               </div>
             </div>
-            <span v-else style="color:#67c23a;">0 模型调用</span>
+            <!-- 真的 0 调用要分两种情况说清，否则用户以为"省了模型"
+                 其实是这一轮没记录到统计（会让成本判断失真）。 -->
+            <el-tooltip v-else :content="zeroModelTip(row)" placement="top">
+              <span :style="{ color: row.replay_mode ? '#67c23a' : '#e6a23c' }">
+                {{ zeroModelText(row) }}
+              </span>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column prop="duration" label="耗时(秒)" width="120">
@@ -119,15 +139,21 @@
         </div>
         <div class="detail-item">
           <span class="label">执行方式:</span>
-          <el-tag v-if="currentRecord.replay_mode" type="success" size="small">脚本回放（纯坐标，零模型）</el-tag>
-          <el-tag v-else type="warning" size="small">AI 探索（每步调用视觉模型）</el-tag>
+          <el-tag v-if="currentRecord.replay_mode" type="success" size="small">脚本回放（纯坐标）</el-tag>
+          <el-tag v-else type="warning" size="small">AI 探索（定位/操作走视觉模型）</el-tag>
         </div>
         <div class="detail-item">
           <span class="label">模型消耗:</span>
-          <span>
+          <span v-if="currentRecord.model_calls || currentRecord.prompt_tokens">
             {{ currentRecord.model_calls || 0 }} 次调用 ·
             {{ formatTokens(currentRecord) }} tokens
             <span v-if="currentRecord.tokens_estimated" style="color:#e6a23c;">（估算）</span>
+          </span>
+          <span v-else>
+            {{ zeroModelText(currentRecord) }}
+            <el-tooltip :content="zeroModelTip(currentRecord)" placement="top">
+              <span style="color:#909399;cursor:help;"> ⓘ</span>
+            </el-tooltip>
           </span>
         </div>
 
@@ -191,6 +217,38 @@ const formatTokens = (row) => {
   if (n < 1000000) return (n / 1000).toFixed(1) + 'k'
   return (n / 1000000).toFixed(2) + 'M'
 }
+
+// 「回放失败·AI降级」的悬浮说明：把"回放试过了、为什么失败"讲清楚。
+// 用户看到这个标签才知道"固化确实生效了，只是回放没点通"，而不是"固化没用"。
+const degradedTip = (row) => {
+  const reason = row?.replay_fail_reason
+  return '本次已尝试纯坐标回放，但回放过程中失败，已自动降级为 AI 探索重跑'
+    + '（所以本次仍消耗了模型 token）。'
+    + (reason ? '\n回放失败原因：' + reason : '')
+    + '\n常见原因：App 未回到预期起始页（回放不做启动/复位）、界面改版或换了机型。'
+    + '跑通后会重新固化坐标。'
+}
+
+// 「模型消耗为 0」时的文案与说明。
+// 必须区分"真零调用（脚本回放）"和"没统计到"——否则用户会把
+// 「AI 探索 + 0 调用」误读成"省了模型"，实际这次烧了 29k tokens。
+const zeroModelText = (row) => (
+  row && row.replay_mode ? '0 模型调用（脚本回放）' : '未记录到调用'
+)
+
+const zeroModelTip = (row) => {
+  if (row && row.replay_mode) {
+    return '本次按固化坐标回放，不调用视觉模型'
+  }
+  const head = (row && row.replay_degraded)
+    ? '本次曾尝试纯坐标回放但失败（已自动降级为 AI 探索）。'
+    : '本次执行方式为 AI 探索。'
+  return head + '未采集到模型调用统计，通常是 LLM 用量代理'
+    + '（MIDSCENE_LLM_PROXY_URL）未生效，'
+    + '实际模型调用可能已发生（可查看执行详情里的日志确认）。'
+    + '因此该列不能作为"零成本"的依据。'
+}
+
 
 const selectedRecords = ref([])
 const isDeleting = ref(false)

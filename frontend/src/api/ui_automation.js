@@ -1321,6 +1321,18 @@ export function generateCaseSteps(data) {
   })
 }
 
+// 用元素库校正步骤的「定位」：把描述对上元素库里实测出来的 locator，
+// 回填 selector_hint（同样只返回结果、不落库，由编辑器确认后保存）。
+// 这是「自然语言生成的用例」也能用上真元素定位的关键一步。
+export function matchStepsToElements(data) {
+  return request({
+    url: '/ui-automation/elements/match-steps/',
+    method: 'post',
+    data,
+    timeout: 60000
+  })
+}
+
 // 获取业务动作列表
 export function getBusinessActions(params) {
   return request({

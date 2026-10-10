@@ -98,6 +98,7 @@ export default {
     },
   },
   methods: {
+    // ⚠️ 必须带 `/api` 前缀（后端真实路由为 `api/requirement-analysis/`）。
     base() { return '/requirement-analysis/api/modao' },
     statusLabel(s) {
       // 注意：本列表与 ModaoSkillView.vue 各有一套 statusLabel/statusType，
