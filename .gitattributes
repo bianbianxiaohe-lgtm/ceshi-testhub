@@ -1,0 +1,10 @@
+# 2026-10-13
+# *.sh 是在 Linux 容器内用 `sh /tmp/x.sh` 执行的。Windows 上 core.autocrlf=true
+# 会把它检出成 CRLF，带 CR 的脚本在容器里会报 `^M: not found` 这类误导性错误，
+# 而且报错点在行尾、肉眼完全看不出来。故强制 LF。
+*.sh text eol=lf
+
+# Windows 侧执行的脚本统一 CRLF（PS 5.x / cmd 的已知坑，见 CODEBUDDY.md 记忆）
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

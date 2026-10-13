@@ -35,6 +35,9 @@ Say '--- baseline md5 (prod modao_workflow.py) ---'
 docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_workflow.py
 Say "baseline_exit=$LASTEXITCODE"
 
+Say '--- baseline md5 (2026-10-13 prompt + zentao coverage fix) ---'
+docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
+
 Say '--- recent modao tasks ---'
 docker exec testhub-backend python -c "import os,sys,django;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');django.setup();from apps.requirement_analysis.models import ModaoPrototype;print(ModaoPrototype.objects.filter(status__in=['running','processing','extracting']).count());print(list(ModaoPrototype.objects.order_by('-id').values_list('id','status','current_stage')[:3]))"
 
@@ -107,6 +110,39 @@ docker exec testhub-backend ls -la /app/apps/ui_automation/migrations/0015_aiexe
 
 $roles = curl.exe -s -o NUL -w '%{http_code}' http://localhost:8000/api/projects/roles/
 Say "GET /api/projects/roles/ -> $roles   (expect 401 = route exists, 404 = still old code)"
+
+Say '=== STEP 5 verify 2026-10-13 prompt + zentao coverage fix ==='
+# Expected md5 = host files via: Get-FileHash <file> -Algorithm MD5
+# If a host file changes on purpose, update the hash below in the same commit.
+$Expect = @{
+  '/app/tester.md'                                                        = 'B929122FFFC6E4D224279E2AF087215F';
+  '/app/tester_pro.md'                                                    = '147696BB6324666F7005FB50971AB56D';
+  '/app/apps/requirement_analysis/independent_skill/prompts/tester.md'     = 'ABFDD8548E5B852C3143F844EED62764';
+  '/app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md' = 'FAF9D37D6361CD1A7C1F9089A40A433E';
+  '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61'
+}
+$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
+$md5Bad = 0
+foreach ($line in $md5Raw) {
+  $parts = ($line -split '\s+') | Where-Object { $_ -ne '' }
+  if ($parts.Count -lt 2) { continue }
+  $h = $parts[0].ToUpper(); $f = $parts[1]
+  if (-not $Expect.ContainsKey($f)) { Say "MD5 UNKNOWN-PATH $f = $h"; continue }
+  if ($Expect[$f] -eq $h) { Say "MD5 OK   $f = $h" }
+  else { Say "MD5 MISMATCH $f : image=$h expected=$($Expect[$f])"; $md5Bad++ }
+}
+if ($md5Bad -gt 0) { Fail "$md5Bad file(s) did NOT make it into the image" }
+Say 'all 5 md5 match -> prompts + zentao/services.py are baked into the image'
+
+Say '--- runtime constants loaded by the rebuilt image (expect 600 / 600 / 0.0) ---'
+docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.zentao import services as s;print('JUDGE_CASE_CHARS=%s'%s.JUDGE_CASE_CHARS);print('JUDGE_BUG_CHARS=%s'%s.JUDGE_BUG_CHARS);print('JUDGE_TEMPERATURE=%s'%s.JUDGE_TEMPERATURE)"
+if ($LASTEXITCODE -ne 0) { Fail 'failed to read JUDGE_* constants from apps.zentao.services' }
+
+Say '--- PromptConfig lengths (expect writer 3089 / reviewer 1012 / analyzer 1466-custom) ---'
+docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.requirement_analysis.models import PromptConfig;[print('%s len=%d'%(p.prompt_type,len(p.content or ''))) for p in PromptConfig.objects.filter(is_active=True).order_by('prompt_type')]"
+
+Say '--- cross-version knowledge entries (expect >= 16 after report#29 promote) ---'
+docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.projects.models import ProjectKnowledge;print('global=%d'%ProjectKnowledge.objects.filter(version__isnull=True).count());print('confirmed=%d'%ProjectKnowledge.objects.filter(needs_review=False).count())"
 
 Say '=== DONE ==='
 Say "log file = $Log"

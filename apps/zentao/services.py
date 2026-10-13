@@ -5,6 +5,7 @@ import hashlib
 import html as html_mod
 import logging
 import math
+import os
 import re
 import threading
 from datetime import datetime
@@ -35,6 +36,17 @@ RERANK_RECALL_TOP_K = 15
 RERANK_FINAL_TOP_K = 5
 RERANK_COVER_THRESHOLD = 0.7
 SUGGESTION_MAX_BUGS = 30
+
+# LLM 判定/复核的输入预算与温度（均可用环境变量覆盖，默认值为 2026-10-12 report#29 实证调优结果）。
+# 背景：此前 LLM 判定只拿到「用例标题 + 预期结果」截断到 240 字，看不到操作步骤，
+# 「执行该用例是否会经过 Bug 所在功能」缺乏判定依据，未覆盖结论与假覆盖剔除抖动偏大
+# （用例库未变的两轮报告覆盖率 28.8% ↔ 21.9%）。故：
+#   1) 用例侧补入前置条件/操作步骤，预算放开到 600 字；
+#   2) Bug 侧复现步骤预算由 260 字放开到 600 字；
+#   3) 分类任务温度取 0，抑制同一 Bug 跨轮次判定翻转。
+JUDGE_CASE_CHARS = int(os.getenv('ZENTAO_COVER_JUDGE_CASE_CHARS', '600') or 600)
+JUDGE_BUG_CHARS = int(os.getenv('ZENTAO_COVER_JUDGE_BUG_CHARS', '600') or 600)
+JUDGE_TEMPERATURE = float(os.getenv('ZENTAO_COVER_JUDGE_TEMPERATURE', '0') or 0)
 
 _BROWSER_HEADERS = {
     'User-Agent': (
@@ -871,17 +883,22 @@ def _bug_text(bug: ZentaoBug) -> str:
 
 
 def _bug_text_compact(bug: ZentaoBug) -> str:
+    """LLM 判定用的精简 Bug 文本：标题 + 复现步骤（按 JUDGE_BUG_CHARS 截断）。"""
     text = _bug_text(bug)
-    if len(text) > 260:
-        text = text[:260] + '…'
+    if len(text) > JUDGE_BUG_CHARS:
+        text = text[:JUDGE_BUG_CHARS] + '…'
     return text
 
 
 def _case_text_compact(testcase: TestCase) -> str:
-    """LLM 判定用的精简用例文本：标题 + 预期结果（截断），控制 token。"""
-    text = '\n'.join(p for p in [testcase.title or '', testcase.expected_result or ''] if p).strip()
-    if len(text) > 240:
-        text = text[:240] + '…'
+    """LLM 判定用的精简用例文本：标题 + 前置条件 + 操作步骤 + 预期结果（按 JUDGE_CASE_CHARS 截断）。
+
+    2026-10-12 前只给「标题 + 预期结果」240 字，LLM 无法判断用例的操作路径是否
+    经过 Bug 所在功能；补入前置条件与操作步骤后，才具备判定「执行即发现」的依据。
+    """
+    text = _case_text(testcase)
+    if len(text) > JUDGE_CASE_CHARS:
+        text = text[:JUDGE_CASE_CHARS] + '…'
     return text
 
 
@@ -1288,7 +1305,7 @@ def _llm_judge_batch(model_config, items: List[Tuple[ZentaoBug, List[Tuple[TestC
         {'role': 'user', 'content': '\n\n'.join(blocks)},
     ]
     result = asyncio.run(
-        AIModelService.call_openai_compatible_api(model_config, messages, temperature=0.1)
+        AIModelService.call_openai_compatible_api(model_config, messages, temperature=JUDGE_TEMPERATURE)
     )
     arr = _extract_json_array(_extract_llm_text(result))
     out = {}
@@ -1349,7 +1366,7 @@ def _llm_precision_check(model_config, items) -> dict:
         {'role': 'user', 'content': '\n\n'.join(blocks)},
     ]
     result = asyncio.run(
-        AIModelService.call_openai_compatible_api(model_config, messages, temperature=0.1)
+        AIModelService.call_openai_compatible_api(model_config, messages, temperature=JUDGE_TEMPERATURE)
     )
     arr = _extract_json_array(_extract_llm_text(result))
     out = {}
@@ -2367,6 +2384,10 @@ def run_coverage_analysis(config: ZentaoConfig, user=None, report: Optional[Cove
             'reranker_model': reranker.model_name if reranker else None,
             'rerank_threshold': RERANK_COVER_THRESHOLD,
             'low_confidence_count': low_confidence_count,
+            # LLM 判定输入预算与温度：留痕便于跨报告复现「两轮判定不一致」类问题
+            'judge_case_chars': JUDGE_CASE_CHARS,
+            'judge_bug_chars': JUDGE_BUG_CHARS,
+            'judge_temperature': JUDGE_TEMPERATURE,
             'abnormal_scenes': abnormal_scenes,
             # 有效真实 Bug 反推与低覆盖诊断（status∈{resolved,closed} 且 resolution=='fixed'）
             'valid_bug_total': valid_total,
