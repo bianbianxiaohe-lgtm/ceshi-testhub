@@ -26,3 +26,5 @@ knowledge-bases
 build_*.txt
 be_*.txt
 tmp_*
+# 根目录一次性诊断脚本（2026-10-13：_cov_check.py / _kb_step1.py 曾被 COPY 进生产镜像）
+/_*.py
