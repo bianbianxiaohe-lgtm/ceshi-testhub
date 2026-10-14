@@ -331,3 +331,40 @@ docker exec testhub-dev-backend-1 cat /tmp/_verify_modao_prompts.txt
 （报 `JSON parse error ... column 2`）⇒ 改**写文件 + `--data-binary "@file"`**；
 ② `@file` 会被 PS 当 splatting 运算符 ⇒ 必须加引号写成 `"@file"`。
 （另：`Invoke-RestMethod` 在本机单次执行卡到 300s 超时，改用 `curl.exe --max-time` 更稳。）
+
+## 十三、墨刀线提示词同步生产（2026-10-14 固化完成）
+
+### 结果：`RESULT=SYNCED`，生产镜像已固化
+脚本 `scripts/rebuild_prod_backend.ps1` 全流程跑通（09:04:53 → 09:06:22，**仅 1.5 分钟**）：
+
+| 步骤 | 结果 |
+|---|---|
+| STEP1 备份 | 容器内 `/tmp/rollback_20261014_0904/apps.tar.gz` + mysqldump → `_db_backup/testhub_20261014_0904.sql` |
+| STEP2 build | exit=0，**7 秒**（base 镜像 `testhub-backend-base:20261010` 命中，只重跑 COPY 层） |
+| STEP3 重建 | `rm -f` + `up -d` 成功 |
+| STEP4 健康 | `/api/` = **404**（健康）；chromium 存在 |
+| STEP5 md5 | **7 个文件全部 `MD5 OK`**（含新增的 p2/p3） |
+| STEP6 运行期 | `RESULT=SYNCED`，`cache text-md5 == file text-md5` ⇒ `OK(缓存已刷新)` |
+
+### 同步前后对照（生产容器）
+| 判据 | 同步前 | 同步后 |
+|---|---|---|
+| p2 md5 | `a0967bbf…` | `c3f0f278…` ✅ |
+| p3 md5 | `0a0c496a…` | `4d600982…` ✅ |
+| `历史缺陷高发维度` 命中 | 0 / 0 | **1 / 1** ✅ |
+| 旧兜底句 `无白屏/破图/资源缺失即可` | 1 / 1 | **0 / 0**（REMOVED）✅ |
+
+### 本次顺带固化了两处（避免问题复现）
+1. ⚠️ **`.dockerignore` 缺 `tmp/`**：只有 `tmp_*` 匹配不到 `tmp/` 目录
+   ⇒ 本次 205KB 的 before/after 快照（**含真实用例内容**）本会被 `COPY . .` 打进生产镜像。
+   已补 `tmp/` 与 `/_*.txt`（根目录诊断产物已累积 100+ 个，同样会进镜像）。
+2. ⚠️ **rebuild 脚本结束语硬编码 "all 5 md5 match"**：把期望表扩到 7 条后数字就失真。
+   已改为 `$($Expect.Count)` 动态推导，并写进注释。
+
+### 提交
+- `d010887` improve(modao)：提示词改动 + 端到端验证流水线
+- `4308a87` fix(rebuild)：md5 结束语动态化
+
+### 仍待人工
+- 生产上跑一次墨刀生成，肉眼确认断言是否具体化（dev 已验证 62.5%→18.2%，
+  生产模型/数据不同，结论**不可直接外推**）。
