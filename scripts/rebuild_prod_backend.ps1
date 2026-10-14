@@ -116,7 +116,7 @@ docker exec testhub-backend ls -la /app/apps/ui_automation/migrations/0015_aiexe
 $roles = curl.exe -s -o NUL -w '%{http_code}' http://localhost:8000/api/projects/roles/
 Say "GET /api/projects/roles/ -> $roles   (expect 401 = route exists, 404 = still old code)"
 
-Say '=== STEP 5 verify 2026-10-13 prompt + zentao coverage fix ==='
+Say '=== STEP 5 verify prompts + zentao coverage fix (md5 expectation table) ==='
 # Expected md5 = host files via: Get-FileHash <file> -Algorithm MD5
 # If a host file changes on purpose, update the hash below in the same commit.
 $Expect = @{
@@ -139,7 +139,9 @@ foreach ($line in $md5Raw) {
   else { Say "MD5 MISMATCH $f : image=$h expected=$($Expect[$f])"; $md5Bad++ }
 }
 if ($md5Bad -gt 0) { Fail "$md5Bad file(s) did NOT make it into the image" }
-Say 'all 5 md5 match -> prompts + zentao/services.py are baked into the image'
+# 2026-10-14: was hardcoded to 'all 5 md5 match' and silently went stale when two
+# modao prompts were added. Derive the count from the table so it cannot drift.
+Say "all $($Expect.Count) md5 match -> prompts + zentao/services.py are baked into the image"
 
 Say '--- runtime constants loaded by the rebuilt image (expect 600 / 600 / 0.0) ---'
 docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.zentao import services as s;print('JUDGE_CASE_CHARS=%s'%s.JUDGE_CASE_CHARS);print('JUDGE_BUG_CHARS=%s'%s.JUDGE_BUG_CHARS);print('JUDGE_TEMPERATURE=%s'%s.JUDGE_TEMPERATURE)"
