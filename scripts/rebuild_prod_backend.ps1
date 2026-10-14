@@ -38,6 +38,11 @@ Say "baseline_exit=$LASTEXITCODE"
 Say '--- baseline md5 (2026-10-13 prompt + zentao coverage fix) ---'
 docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
 
+Say '--- baseline md5 (2026-10-14 modao p2/p3 prompt) ---'
+docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md
+Say '--- baseline anchors (old fallback sentence should be 1 before sync; new dimension 0) ---'
+docker exec testhub-backend sh -c "grep -c '历史缺陷高发维度' /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md"
+
 Say '--- recent modao tasks ---'
 docker exec testhub-backend python -c "import os,sys,django;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');django.setup();from apps.requirement_analysis.models import ModaoPrototype;print(ModaoPrototype.objects.filter(status__in=['running','processing','extracting']).count());print(list(ModaoPrototype.objects.order_by('-id').values_list('id','status','current_stage')[:3]))"
 
@@ -119,9 +124,11 @@ $Expect = @{
   '/app/tester_pro.md'                                                    = '147696BB6324666F7005FB50971AB56D';
   '/app/apps/requirement_analysis/independent_skill/prompts/tester.md'     = 'ABFDD8548E5B852C3143F844EED62764';
   '/app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md' = 'FAF9D37D6361CD1A7C1F9089A40A433E';
-  '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61'
+  '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md' = 'C3F0F278F4E949C1D62C0EDCFA687442';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md'      = '4D6009820A84E2FEAB6BFC958C5A12A6'
 }
-$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
+$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md
 $md5Bad = 0
 foreach ($line in $md5Raw) {
   $parts = ($line -split '\s+') | Where-Object { $_ -ne '' }
@@ -143,6 +150,21 @@ docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');o
 
 Say '--- cross-version knowledge entries (expect >= 16 after report#29 promote) ---'
 docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.projects.models import ProjectKnowledge;print('global=%d'%ProjectKnowledge.objects.filter(version__isnull=True).count());print('confirmed=%d'%ProjectKnowledge.objects.filter(needs_review=False).count())"
+
+Say '=== STEP 6 modao p2/p3 prompt runtime check ==='
+# The modao prompts live in files (NOT in PromptConfig) and are cached in a module-level
+# _CACHE inside modao_prompts.py: get_prompt() reads disk ONCE, then never again.
+# So verifying the file exists is NOT enough - we must call get_prompt() and check the
+# anchors are actually visible to the running process.
+# The script writes its own report to /tmp and prints nothing to stdout, because
+# `docker exec python -c` output does not land in this log file.
+docker exec testhub-backend python /app/scripts/_verify_modao_prompts.py
+if ($LASTEXITCODE -ne 0) { Fail 'modao prompt verify script failed (is scripts/ in the image?)' }
+$vp = docker exec testhub-backend cat /tmp/_verify_modao_prompts.txt
+Add-Content -Path $Log -Value $vp -Encoding UTF8
+Write-Output $vp
+if (($vp -join "`n") -notmatch 'RESULT=SYNCED') { Fail 'modao p2/p3 prompts NOT synced in the rebuilt image' }
+Say 'modao p2/p3 prompts verified in the running container'
 
 Say '=== DONE ==='
 Say "log file = $Log"

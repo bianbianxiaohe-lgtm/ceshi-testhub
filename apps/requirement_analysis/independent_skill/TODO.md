@@ -96,3 +96,238 @@ prod `/app/apps` 非 bind mount ⇒ 上面两节的热更**容器一重建就静
   `analyzer len=1466`（定制版未被覆盖）/ `reviewer=1012` / `writer=3089`；
   知识库 `global(version null)=166`、`confirmed(needs_review=False)=167`、`pending=32`（≥16 达标，后续生成可被 RAG 召回）。
   ⇒ **至此本批改动在 prod 已「进镜像 + 生效」双确认。**
+
+## 八、待验证：新提示词对覆盖率的实际提升（用户决定延后，2026-10-13）
+
+> 现在跑覆盖率**只能验证判定侧**（输入 600 字 + 温度 0），**验证不了生成质量**——
+> 提示词只影响「新生成的用例」，对 report#29 那 266 条已有用例无效。
+> 故等下一个版本用新提示词生成用例、测试执行完成后再跑。到期按本节清单执行。
+
+### 触发条件（满足才跑）
+1. 新版本用例**确实由新提示词生成**（见下方「前置确认」）；
+2. 该版本测试执行完成，禅道已有对应 bug 数据。
+
+### 前置确认：这批用例是不是新提示词生成的
+
+```powershell
+docker cp scripts\_verify_prompt_sync.py <容器>:/tmp/
+docker exec <容器> python /tmp/_verify_prompt_sync.py
+docker exec <容器> cat /tmp/_verify_prompt_sync.txt
+```
+
+判据：末尾必须是 **`RESULT=SYNCED`**，且
+
+| 类型 | 期望 |
+|---|---|
+| writer | `SYNCED`，text-md5=`B929122F`、bin-md5=`ABFDD854`、len=3089，**5 个 feature 全 OK** |
+| reviewer | `SYNCED`，text-md5=`49A6BD79`、bin-md5=`FAF9D37D`、len=1012，**5 个 feature 全 OK** |
+| analyzer | `CUSTOM`（1466 字符定制版，与文件不同属**预期**），**不是** MISMATCH |
+
+⚠️ **不要用 `updated_at` 判断同步时间**：`update_prompt_configs.py` 用
+`obj.save(update_fields=['content'])`，`auto_now` 的 `updated_at` **不会被刷新**
+（实测 writer 仍显示 `2026-08-10`）。同步与否**只能看 md5**。
+
+⚠️ **长度对 ≠ 内容对**：判同步必须比 md5（本脚本同时给 text-md5 与 bin-md5；
+两者可能不同，因为 Python 文本模式读会把 `\r\n` 归一为 `\n`，
+两侧同口径比对即可；bin-md5 用于和镜像固化期望值交叉核对）。
+
+### 执行
+1. 前端/接口对新版本执行一次 `run_coverage_analysis`；
+2. 导出该报告的判定明细（`_cov_check.py` 同款脚本），统计下列指标。
+
+### 判据（⚠️ 跨版本不要只比覆盖率数字）
+> bug 集不同、功能范围不同 ⇒ 21.9% → 30% 这种直接对比**没有意义**。看下面三个归一化指标：
+
+| 指标 | report#29 基线 | 期望 |
+|---|---|---|
+| 假覆盖剔除率（LLM 初判覆盖 → 复核剔除） | 18/34 ≈ **53%** | **明显下降**（对应 4.4「预期结果必须可判伪」生效） |
+| 未覆盖 bug 归因分布：功能域缺失 + 同域变体 的占比 | 约 40/57 ≈ **70%** | **下降**（对应 4.1/4.2/4.3 生效） |
+| 判定稳定性：同一批用例连跑两次覆盖率差值 | 28.8% ↔ 21.9% = **6.9 个百分点** | **< 3 个百分点**（对应温度 0 + 600 字输入生效） |
+
+### 结论记录
+跑完把三项指标回填到本节，并同步 `.codebuddy/memory/` 当日日志；
+若指标未改善，回到第一/二节按「根因 → prompt 章节」重新定位，不要在数字上反复纠结。
+
+## 九、提示词同步验证（2026-10-13，内容级比对，prod 实测）
+
+> 第七节只证明了「提示词文件进了镜像」。本节回答另一个问题：
+> **运行期实际读的是 DB 的 `PromptConfig`（FK `writer_prompt_config` / `reviewer_prompt_config`），
+> 那 DB 里的内容是不是也是新的？**
+
+- 方法：`scripts/_verify_prompt_sync.py`（容器内执行，结果自写 `/tmp/_verify_prompt_sync.txt`）
+  —— 逐类型比对「提示词文件 md5」vs「DB content md5」，并校验 2026-10-13 新增章节锚点串是否真在 DB content 里。
+- 实测：**`RESULT=SYNCED`**
+
+| 类型 | 结果 | 文件 text-md5 | 文件 bin-md5 | DB md5 | len | 锚点串 |
+|---|---|---|---|---|---|---|
+| writer | **SYNCED** | B929122F | ABFDD854 | B929122F | 3089 | 4.1/4.2/4.3/4.4/4.5 **全 OK** |
+| reviewer | **SYNCED** | 49A6BD79 | FAF9D37D | 49A6BD79 | 1012 | 5 项**全 OK** |
+| analyzer | **CUSTOM**（预期差异） | ED8D7DE0 | 6B066165 | 6DD95D9B | DB 1466 / 文件 1959 | — |
+
+- 交叉印证：`writer bin-md5=ABFDD854`、`reviewer bin-md5=FAF9D37D`
+  **与第七节 STEP5 镜像固化期望值完全一致** ⇒ 「镜像内文件」与「DB 内容」两条链对上了同一个字节内容。
+- 生成任务实际引用：`TestCaseGenerationTask` 最近 5 条（id=179/180/181/184/185）
+  `writer_fk=1`、`reviewer_fk=2` ⇒ 指向的正是上面这两条 SYNCED 记录，**运行链路打通**。
+
+### 本次踩到的两个坑（已写进脚本注释 / 第八节判据）
+1. ⚠️ **`updated_at` 不能当同步判据**：`update_prompt_configs.py` 用 `save(update_fields=['content'])`，
+   `auto_now` 的 `updated_at` 不刷新 ⇒ writer 至今显示 `2026-08-10`。
+   第八节原写「`updated_at > 2026-10-13`」是**错误判据**（会误判没同步），已改为 md5 判据。
+2. ⚠️ **锚点串必须抄自文件真实文本**：第一版凭印象写了「同域变体」，
+   而提示词里 4.1 实际叫「同一操作的**重复 / 再进入**变体」、4.3 叫「**状态迁移与权益边界**」
+   ⇒ 误报 MISSING。属于未验证假设，改取文件原文后 5/5 全 OK。
+
+### 结论
+**提示词同步已确认**：文件 → 镜像 → DB → 生成任务 FK，四环一致。
+剩下唯一未验证的是「新提示词生成的用例，覆盖率是否真的提升」（第八节，挂起中）。
+
+## 十、墨刀线纳入覆盖率提升（2026-10-13，用户要求「酌情调整」）
+
+### 三条线边界（代码级核查，勿凭印象）
+| 能力 | 独立线(AI生产线) | 墨刀线 | 共用 |
+|---|---|---|---|
+| 生成提示词 | `independent_skill/prompts/tester*.md` → **PromptConfig(DB)** | `modao_skill/prompts/p0~p8_*.md`，**不读 PromptConfig** | ❌ 分离 |
+| 知识库 RAG | `ai_model_service.py:2150` | `modao_workflow.py:1766/1770` `_kb_suffix()` | ✅ |
+| 禅道覆盖率判定 | `zentao/services.py:1928`；用例取 **`apps.testcases.TestCase`（用例库）**，`_get_case_pool()` 按 version/project，**不区分来源** | 同左 | ✅ |
+
+### 实证：墨刀线**同样存在**断言不可判伪问题
+- report#29 用例池 266 条，**63 条（23.7%）**命中「页面展示正常 / 显示正确 / 恢复正常状态」等不可判伪断言。
+- 抽样 5 条里出现「各选项图标与文案展示正确，**无白屏/破图/资源缺失**」——
+  与墨刀线 `p3_case_gen.md:24` / `p2_testpoint_gen.md:26` 的原文**逐字一致** ⇒ 该批用例受墨刀线提示词影响（强提示，非铁证，见下）。
+- 根因是提示词**允许**把视觉兜底句当完整预期结果，与独立线 4.4 的教训同源。
+
+### 已改（墨刀线提示词，仅本地文件，未同步容器）
+- `p3_case_gen.md`
+  - 硬约束 6「视觉细节收敛」：保留"不做像素/取色比对"，新增 **「兜底句不得单独成条」**，要求每条至少 1 个功能级可观测断言。
+  - 预期结果编写规范：新增 ❌ 禁止项（页面展示正常 / 恢复正常状态 / 展示正确）。
+  - 新增硬约束 8「历史缺陷高发维度」：① 再次执行 ② 刷新与回撤 ③ 权益边界。
+- `p2_testpoint_gen.md`
+  - 硬约束 7「视觉细节收敛」：同步加兜底句限制，并要求 `pass_criteria` 给出功能级判据。
+  - 新增硬约束 9「历史缺陷高发维度」：① 再次执行（**扩展到非交易类功能**）② 刷新与回撤 ③ 权益边界 ④ 中断恢复。
+
+⚠️ **刻意保留的差异（勿跨线统一）**：墨刀线**仍禁止**像素尺寸/取色比对类用例（原型驱动无法得知精确色值，此约束合理）。
+只要求"兜底句不能单独成条"，**不是**照抄独立线 4.4 的"颜色/位置/尺寸"断言。
+
+### ⚠️ P0 未决：无法按线拆分统计覆盖率
+- `TestCase.source` 仅 `ai/manual/unknown`；两条线入库**都写 `source='ai'`**
+  （`modao_views.py:407/518/1350`、`views.py:2511/2661/2771`）。
+- `feature_modules`、`tags`、作者**均无法区分线**（两条线都会关联 feature_modules；墨刀 tags 只有「冒烟」）。
+- ⇒ **第八节的三个基线（53% / 70% / 6.9pp）实为两条线混合口径**。
+  同口径纵向对比仍然有效，但**改任一条线都无法归因**。
+- 若要分线度量：给 `TestCase` 加 `generated_by`（independent/modao/manual）字段 + 迁移 + `docker_start.py` 幂等 DDL + 两处入库写值。
+  代价：**历史用例无法回填**，只能对新生成的用例生效。
+- ⇒ 需用户决策是否做（涉及 DB schema 变更，未擅自执行）。
+
+### 落地待办
+1. ~~同步到 dev 容器~~ ✅ 2026-10-13 完成，运行期校验 `RESULT=SYNCED`（详见下节）。
+   ⏸ 待人工：跑一次墨刀线生成，看新用例断言是否具体化。
+2. ⏸ 确认有效后再同步 prod 并 `rebuild_prod_backend.ps1` 固化
+   （墨刀提示词是**文件**、不进 PromptConfig，只需文件进镜像；**prod 非 bind mount，必须 rebuild 否则重建容器即回退**）。
+3. 第八节验证时注明「混合口径」，若做了 P0 字段则按线分别统计。
+
+## 十一、墨刀线提示词同步 dev 验证（2026-10-13 实测）
+
+### ⭐⭐ 本次发现的关键坑：墨刀线提示词有**模块级内存缓存**，改文件必须 restart
+`apps/requirement_analysis/modao_prompts.py:14` 有一个 `_CACHE = {}`，
+`get_prompt()` 命中后**不再读盘**：
+
+```python
+_CACHE = {}
+def get_prompt(name):
+    if name not in _CACHE:
+        with open(path, 'r', encoding='utf-8') as f:
+            _CACHE[name] = f.read()      # ← 只在首次读，之后一直用旧的
+    return _CACHE[name]
+```
+
+⇒ **只更新文件不 restart = 静默用旧提示词，且不报错**（典型"改了没生效"陷阱）。
+墨刀线提示词不进 `PromptConfig`，所以 §九 的 `_verify_prompt_sync.py` **管不到这条线**，
+必须用本节的脚本单独验。
+
+### 验证脚本（可复用）
+`scripts/_verify_modao_prompts.py`（dev 的 `apps`/`scripts` 已 bind mount，可直接跑）：
+
+```powershell
+docker exec testhub-dev-backend-1 python /app/scripts/_verify_modao_prompts.py
+docker exec testhub-dev-backend-1 cat /tmp/_verify_modao_prompts.txt
+```
+
+判据：末尾 `RESULT=SYNCED`，且
+- `file bin-md5` 命中期望值（p2 `C3F0F278…` / p3 `4D600982…`）
+- `cache text-md5 == file text-md5` ⇒ 标 `OK(缓存已刷新)`；若显示 `STALE` 说明**忘了 restart**
+- 两个文件的 feature 锚点全 OK，旧兜底句 `无白屏/破图/资源缺失即可` 为 `REMOVED`
+
+⚠️ 脚本刻意**调用 `get_prompt()` 而非直接读盘**——只有这样才能证明"跑生成时读到的就是新提示词"。
+
+### 实测结果（`RESULT=SYNCED`）
+| 文件 | 文件 bin-md5 | 缓存 text-md5 vs 文件 text-md5 | 锚点 | 旧句 |
+|---|---|---|---|---|
+| p2_testpoint_gen | `C3F0F278…` OK | `6E6AF46F…` 一致 ⇒ OK(缓存已刷新) | 7 项全 OK | REMOVED |
+| p3_case_gen | `4D600982…` OK | `FE26202F…` 一致 ⇒ OK(缓存已刷新) | 6 项全 OK | REMOVED |
+
+### 双口径 md5 坑（第二次踩，已写进脚本注释）
+（见上节末；本节的对比实验在其之后进行）
+`EXPECT` 用 `Get-FileHash`（**原始字节**口径），而 `get_prompt()` 走 Python 文本模式会把
+`\r\n` 归一为 `\n` ⇒ 两个口径**必然不同**，拿错口径比对会 100% 误报 MISMATCH。
+**正确做法**：文件按 bin 口径比对期望值；缓存按 text 口径与「文件 text 口径」比对。
+（与 §九 `_verify_prompt_sync.py` 同一个坑，凡"文本 md5 vs 文件 md5"都要先想口径。）
+
+## 十二、墨刀线新旧提示词对比实验（2026-10-13，dev 实测）
+
+### 实验设计（关键：同输入、可归因）
+- 对象：`proto=65`（Boddi2.3.0）/ `page=722`（P6 升级付费-Android），画布级。
+- 手法：`modao_design` + `modao_generate_cases` **都传 `page_ids=[722]`**。
+  画布级独立运行会**放宽人工确认闸门**且产物写在 **page 级**（`page_testpoints_json` /
+  `page_testcases_json`），不覆盖 proto 级其他数据 ⇒ 可与旧产物并存对比。
+- **基准成立的依据**（不是拍脑袋）：
+  `p2_testpoint_gen.md` / `p3_case_gen.md` 最近一次提交是 **`cbcf4f8`（2026-08-26 15:30）**，
+  之后未改（本次改动仍在工作区）；而 proto65 的产物时间是 **2026-09-07**
+  ⇒ 旧产物用的正是 2026-08-26 那一版提示词，**归因干净**。
+- 备份：BEFORE/AFTER 两份快照在 `tmp/modao_rerun_20261013/_dump_modao_{before,after}.json`，可回滚。
+
+### 结果
+| 指标 | 旧提示词 | 新提示词 | 变化 |
+|---|---|---|---|
+| 用例条数 | 8 | 11 | +3 |
+| **不可判伪断言占比** | **62.5%** | **18.2%** | **−44.3 个百分点** ✅ |
+| 含功能级可观测断言 | 75.0%（6/8） | 72.7%（**8/11**） | 比例略降、**绝对数 +2** |
+| ① 再次执行 | 3 | 3 | 持平（但质量提升，见下） |
+| ② 刷新与回撤 | 2 | 3 | +1 |
+| ③ 权益边界 | 3 | 5 | +2 |
+| ④ 中断恢复 | 0 | 1 | +1 |
+
+**核心目标达成**：本次改的首要目的（断言不可判伪 ⇒ Bug 存在时也通过）从 62.5% 降到 18.2%。
+
+⚠️ **①「再次执行」持平不是没生效**：旧版是「连续快速充值两次仅展示一个弹窗」，
+新版是「支付回调延迟与**重复回调**时弹窗触发次数正确」——更贴近真实幂等缺陷，**质量提升而非数量增加**。
+
+新增场景（旧版没有）：弱网支付超时后客户端/服务器状态一致、多设备同时登录数据同步、
+价格滚动动画未结束时的用户交互。这些正是历史高发维度。
+
+### 本次踩到的三个坑（都已写进脚本注释）
+1. ⚠️ **`call_openai_compatible_api` 是 async**：不 await 直接调用只得到协程对象，
+   `str()` 出来是 `'<coroutine object ...>'` ⇒ 会把「根本没测」误报成「调用成功」。
+   预检脚本已改为 `inspect.iscoroutine()` + `asyncio.run()`，并对 `coroutine object` 字样兜底判无效。
+2. ⚠️ **轮询不能用 `page.stage_status` 判断本轮是否跑完**：画布级 `current_stage/stage_status`
+   是**上一轮遗留**的（这里仍是 9-07 那轮的 stage=4/done），新一轮启动后不会立刻变
+   ⇒ 一进循环就误判 FINISHED。正确判据：**`proto.status` 离开 `designing`**
+   **且 `page.work_log` 长度发生变化**（work_log 每步追加时间戳，是最可靠的信号）。
+3. ⚠️ **维度覆盖关键词不能用固定短语**：第一版写「重新生成/再次提交/重复打开」，
+   漏掉了真实存在的「**重复回调**」⇒ 误判 ①=0。改为「重复/再次/二次/连续/幂等」等字根后，
+   ① 实际为 3。**自动化统计必须用标题列表人工交叉验证**（`_list_modao_titles.py`）。
+
+### 局限（不要过度外推）
+- 样本 = **1 个画布、8→11 条用例**，只证明「方向正确」，不能当总体结论。
+- 未验证覆盖率是否提升（那要在禅道跑覆盖率分析，属第八节）。
+- dev 上 proto65 的产物现已被新提示词覆盖；如需还原，用 BEFORE 快照回滚。
+
+### 新增脚本（均在 `scripts/`，dev 可直接跑，`scripts` 已 bind mount）
+`_find_modao_candidate.py`（挑候选画布）、`_precheck_modao_rerun.py`（跑前预检+LLM 连通）、
+`_dump_modao_page.py`（BEFORE/AFTER 快照）、`_poll_modao_page.py`（进度轮询）、
+`_compare_modao_cases.py`（质量对比）、`_list_modao_titles.py`（标题列表，人工交叉验证）、
+`_modao_rerun.ps1`（触发；⚠️ 实际更推荐 curl + 文件传 body，见下）。
+
+⚠️ **PowerShell 调 API 的两个坑**：① 内联 JSON body 的双引号会被 PS 转义破坏
+（报 `JSON parse error ... column 2`）⇒ 改**写文件 + `--data-binary "@file"`**；
+② `@file` 会被 PS 当 splatting 运算符 ⇒ 必须加引号写成 `"@file"`。
+（另：`Invoke-RestMethod` 在本机单次执行卡到 300s 超时，改用 `curl.exe --max-time` 更稳。）
