@@ -113,7 +113,8 @@ def _repair_yaml_text(text: str) -> str:
     import re as _re
     out = []
     for line in (text or '').split('\n'):
-        m = _re.match(r'^(\s*-\s*)(["\'])(.*?)\2(.*)$', line)
+        # 兼容列表项形如 `- "xxx" yyy` 或 键值形如 `key: "xxx" yyy`
+        m = _re.match(r'^(\s*(?:-\s*|[\w_]+:\s*))(["\'])(.*?)\2(.*)$', line)
         if m and m.group(4).strip():
             # 引号后还有裸文本：把引号内 + 引号外拼接后整体 JSON 转义（JSON 字符串是合法 YAML 标量）
             out.append(m.group(1) + _json.dumps(m.group(3) + m.group(4), ensure_ascii=False))
@@ -1006,7 +1007,7 @@ class ModaoWorkflow:
                 annotations=json.dumps(p.get('annotations', []), ensure_ascii=False),
                 screenshot=p.get('screenshot', ''),
                 screenshot_segments=json.dumps(p.get('screenshot_segments', []), ensure_ascii=False),
-                selected=(not should_filter),
+                selected=False,  # 首次提取默认不全选，由用户在看板显式执行「全部勾选」或按需挑选
                 recognition_note=note,
                 # A2-b：提取完成即标记画布「已读取」
                 current_stage=0,
@@ -1402,11 +1403,14 @@ class ModaoWorkflow:
                     continue
                 if selected_names and p.get('page_name') not in selected_names:
                     continue
+                anno_str = json.dumps(p.get('annotations', []), ensure_ascii=False) if p.get('annotations') else '[]'
+                va_str = json.dumps(p.get('visual_artifacts', []), ensure_ascii=False) if p.get('visual_artifacts') else '[]'
                 parts.append(
-                    f"### {p['page_name']}\n{p.get('text','')}\n"
-                    f"[注释/标注] {json.dumps(p.get('annotations', []), ensure_ascii=False)}\n"
-                    f"[结构化视觉内容 visual_artifacts] "
-                    f"{json.dumps(p.get('visual_artifacts', []), ensure_ascii=False)}")
+                    f"### 画布：{p['page_name']}\n"
+                    f"【核心需求标注/便利贴批注（本次需求增量核心，权重大）】：\n{anno_str}\n\n"
+                    f"【结构化视觉内容 visual_artifacts（注意：ui_screen 仅代表底模线框图外观截图，非业务规则；rule_list/state_matrix/annotation 为规则批注）】：\n{va_str}\n\n"
+                    f"【画布全景 OCR / 背景底模文字（仅供了解界面视觉上下文，未批注提及的底图固有文字非本次需求）】：\n{p.get('text','')}"
+                )
             return '\n\n'.join(parts)
         return self.prototype.requirement_summary or ''
 
@@ -1940,11 +1944,14 @@ class ModaoWorkflow:
                     continue
                 if p.get('page_name') not in page_names:
                     continue
+                anno_str = json.dumps(p.get('annotations', []), ensure_ascii=False) if p.get('annotations') else '[]'
+                va_str = json.dumps(p.get('visual_artifacts', []), ensure_ascii=False) if p.get('visual_artifacts') else '[]'
                 parts.append(
-                    f"### {p['page_name']}\n{p.get('text','')}\n"
-                    f"[注释/标注] {json.dumps(p.get('annotations', []), ensure_ascii=False)}\n"
-                    f"[结构化视觉内容 visual_artifacts] "
-                    f"{json.dumps(p.get('visual_artifacts', []), ensure_ascii=False)}")
+                    f"### 画布：{p['page_name']}\n"
+                    f"【核心需求标注/便利贴批注（本次需求增量核心，权重大）】：\n{anno_str}\n\n"
+                    f"【结构化视觉内容 visual_artifacts（注意：ui_screen 仅代表底模线框图外观截图，非业务规则；rule_list/state_matrix/annotation 为规则批注）】：\n{va_str}\n\n"
+                    f"【画布全景 OCR / 背景底模文字（仅供了解界面视觉上下文，未批注提及的底图固有文字非本次需求）】：\n{p.get('text','')}"
+                )
             return '\n\n'.join(parts)
         return ''
 

@@ -997,8 +997,26 @@ def modao_edit(request, pk):
     value = request.data.get('value', '')
     if field not in EDITABLE_FIELDS:
         return Response({'detail': f'字段 {field} 不可编辑'}, status=http_status.HTTP_400_BAD_REQUEST)
+    old = getattr(proto, field, '') or ''
     setattr(proto, field, value)
     proto.save(update_fields=[field])
+    # 若修改/删除了阶段2全局澄清清单，且某些画布的 page_clarification 与旧全局一致，同步更新对应画布
+    if field == 'clarification_log' and old:
+        proto.pages.filter(page_clarification=old).update(page_clarification=value)
+    # 若修改/删除了阶段3全局合并测试点，把已删除的测试点从各画布的 page_testpoints_json 中同步移除
+    elif field == 'final_testpoints_json' and value:
+        try:
+            curr_tp_ids = {x.get('id') for x in json.loads(value) if isinstance(x, dict) and x.get('id')}
+            for pg in proto.pages.exclude(page_testpoints_json='').exclude(page_testpoints_json__isnull=True):
+                pg_raw = pg.page_testpoints_json or ''
+                pg_tps = json.loads(pg_raw) if pg_raw.strip() else []
+                if isinstance(pg_tps, list):
+                    filtered_pg_tps = [x for x in pg_tps if not (isinstance(x, dict) and x.get('id') and x.get('id') not in curr_tp_ids)]
+                    if len(filtered_pg_tps) != len(pg_tps):
+                        pg.page_testpoints_json = json.dumps(filtered_pg_tps, ensure_ascii=False)
+                        pg.save(update_fields=['page_testpoints_json'])
+        except Exception as e:
+            logger.warning(f'同步删除画布级测试点失败: {e}')
     return Response({'detail': f'已更新 {field}'})
 
 
@@ -1116,7 +1134,7 @@ def modao_page_edit(request, pk, page_id):
         elif field == 'page_clarification':
             # 阶段2 的联合澄清清单会写进每个画布：若全局与该画布原本一致，说明尚未在任务级
             # 单独改过，此时同步；否则只改本画布，避免覆盖任务级的人工修改。
-            if (proto.clarification_log or '') == old:
+            if (proto.clarification_log or '').strip() == old.strip():
                 proto.clarification_log = value
                 proto_fields.append('clarification_log')
                 sync = '全局澄清清单已同步'

@@ -5,6 +5,7 @@ from django.conf.urls.static import static
 from django.views.static import serve
 from django.views.decorators.csrf import csrf_exempt
 from apps.requirement_analysis.modao_views import modao_log_viewer, modao_log_raw
+from django.views.generic import RedirectView
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularRedocView,
@@ -12,6 +13,7 @@ from drf_spectacular.views import (
 )
 
 urlpatterns = [
+    path('', RedirectView.as_view(url='/api/docs/', permanent=False), name='root-redirect'),
     path('admin/', admin.site.urls),
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),

@@ -16,13 +16,34 @@
     <el-tabs v-model="activeTab" class="board-tabs">
       <!-- ============ Tab1：画布任务看板（按画布独立分支） ============ -->
       <el-tab-pane label="画布任务看板" name="board">
-        <!-- 文件夹筛选 -->
+        <!-- 文件夹筛选与全局控制条 -->
         <div class="folder-filter-bar" v-if="folderGroups.length">
-          <el-select v-model="folderFilter" placeholder="按文件夹筛选" clearable size="small" style="width: 240px">
-            <el-option label="全部文件夹" value="" />
-            <el-option v-for="fg in folderGroups" :key="fg.path" :label="fg.path || '未分组'" :value="fg.path" />
-          </el-select>
-          <span class="folder-count">共 {{ filteredPages.length }} 个画布 / {{ folderGroups.length }} 个文件夹</span>
+          <div class="filter-controls">
+            <el-select v-model="folderFilter" placeholder="按文件夹筛选" clearable size="small" style="width: 220px">
+              <el-option label="全部文件夹" value="" />
+              <el-option v-for="fg in folderGroups" :key="fg.path" :label="fg.path || '未分组'" :value="fg.path" />
+            </el-select>
+            <el-checkbox
+              v-model="globalAllSelected"
+              :indeterminate="globalIndeterminate"
+              @change="onGlobalSelectAllChange"
+              style="margin-left: 8px"
+            >
+              全选当前画布
+            </el-checkbox>
+            <el-button
+              v-if="totalSelectedCount > 0"
+              size="small"
+              plain
+              @click="onGlobalSelectAll(false)"
+              style="margin-left: 8px"
+            >
+              清空勾选
+            </el-button>
+          </div>
+          <span class="folder-count">
+            已勾选 <b style="color: #409EFF">{{ totalSelectedCount }}</b> / 共 {{ filteredPages.length }} 个画布 ({{ folderGroups.length }} 个文件夹)
+          </span>
         </div>
 
         <div v-if="!pages.length" class="empty-tip">
@@ -43,6 +64,9 @@
                    按钮上的数字就是本次会执行的画布数量，动手前即可核对。 -->
               <div class="folder-actions" v-if="fg.selectedCount">
                 <span class="action-scope">将对勾选的 {{ fg.selectedCount }} 个画布执行：</span>
+                <el-button size="mini" type="info" plain @click="onFolderBatchAction(fg, 'struct')">
+                  🔧 结构化 ({{ fg.selectedCount }})
+                </el-button>
                 <el-button size="mini" type="primary" @click="onFolderBatchAction(fg, 'clarify')">
                   🔍 澄清 ({{ fg.selectedCount }})
                 </el-button>
@@ -322,6 +346,23 @@ export default {
       if (!this.folderFilter) return this.pages
       return this.pages.filter(p => (p.folder || '').trim() === this.folderFilter)
     },
+    totalSelectedCount() {
+      return (this.filteredPages || []).filter(p => p.selected).length
+    },
+    globalAllSelected: {
+      get() {
+        const pages = this.filteredPages || []
+        return pages.length > 0 && pages.every(p => p.selected)
+      },
+      set(val) {
+        this.onGlobalSelectAll(val)
+      }
+    },
+    globalIndeterminate() {
+      const selected = this.totalSelectedCount
+      const total = (this.filteredPages || []).length
+      return selected > 0 && selected < total
+    },
   },
   mounted() {
     // protoId 必须是数字 pk；非数字（如 'new'）说明入口错误，跳过 loadDetail 避免 404 报错
@@ -467,6 +508,19 @@ export default {
         if (fresh) this.focused = fresh
       }
     },
+    onGlobalSelectAllChange(val) {
+      this.onGlobalSelectAll(val)
+    },
+    onGlobalSelectAll(selected) {
+      const targetPages = this.filteredPages || []
+      if (!targetPages.length) return
+      for (const p of targetPages) {
+        p.selected = selected
+        this.pendingSelection[p.id] = selected
+      }
+      this.flushSelectionSave()
+      this.$message.success(selected ? `已全部勾选 ${targetPages.length} 个画布` : '已全部取消勾选')
+    },
     onFolderSelectAll(fg) {
       const selected = fg.allSelected
       for (const p of fg.pages) {
@@ -489,7 +543,7 @@ export default {
         return
       }
       const estimatedTokens = selectedPages.length * 500 * 1.5
-      const actionLabels = { 'clarify': '需求澄清', 'design': '测试设计', 'generate-cases': '生成用例' }
+      const actionLabels = { 'struct': '需求结构化', 'clarify': '需求澄清', 'design': '测试设计', 'generate-cases': '生成用例' }
       const actionLabel = actionLabels[action] || action
 
       const missingSummary = selectedPages.filter(p => !(p.page_summary || '').trim()).length
@@ -690,11 +744,19 @@ export default {
   .folder-filter-bar {
     display: flex;
     align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
     gap: 16px;
     margin-bottom: 16px;
     padding: 12px 16px;
     background: #f5f7fa;
     border-radius: 8px;
+    .filter-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
     .folder-count { color: #606266; font-size: 13px; }
   }
 

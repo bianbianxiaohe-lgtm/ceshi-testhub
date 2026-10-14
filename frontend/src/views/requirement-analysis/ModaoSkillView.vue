@@ -114,7 +114,7 @@
         <!-- 左侧：画布模块列表 -->
         <div class="canvas-list">
           <div class="canvas-list-toolbar">
-            <el-checkbox v-model="checkAll" :indeterminate="canvasIndeterminate" @click.stop>全选</el-checkbox>
+            <el-checkbox v-model="checkAll" :indeterminate="canvasIndeterminate" @change="toggleSelectAll">全选</el-checkbox>
             <span class="canvas-count">已选 {{ canvasSelectedCount }}/{{ canvasPages.length }}</span>
           </div>
           <div
@@ -313,22 +313,28 @@
 
         <!-- 逐条填写模式 -->
         <template v-if="clarifyParsed && editingField !== 'clarification_log'">
-          <div v-for="(item, i) in clarifyItems" :key="i" class="clarify-item">
-            <div class="clarify-item-head">
-              <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
-              <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
-              <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+          <template v-if="clarifyItems.length">
+            <div v-for="(item, i) in clarifyItems" :key="i" class="clarify-item">
+              <div class="clarify-item-head">
+                <div class="clarify-head-left">
+                  <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
+                  <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
+                  <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+                </div>
+                <el-button size="mini" type="danger" plain class="clarify-delete-btn" @click="deleteClarifyItem(i)">🗑️ 删除</el-button>
+              </div>
+              <div class="clarify-issue">{{ item.issue }}</div>
+              <div v-if="item.suggested_question" class="clarify-suggest">
+                <b>建议提问：</b>{{ item.suggested_question }}
+              </div>
+              <div v-if="item.impact" class="clarify-impact">影响范围：{{ item.impact }}</div>
+              <el-input v-model="clarifyReplies[i]" type="textarea" :rows="2" class="mt"
+                :placeholder="item.resolution ? '' : '填写与产品确认后的回复/结论…'" />
             </div>
-            <div class="clarify-issue">{{ item.issue }}</div>
-            <div v-if="item.suggested_question" class="clarify-suggest">
-              <b>建议提问：</b>{{ item.suggested_question }}
-            </div>
-            <div v-if="item.impact" class="clarify-impact">影响范围：{{ item.impact }}</div>
-            <el-input v-model="clarifyReplies[i]" type="textarea" :rows="2" class="mt"
-              :placeholder="item.resolution ? '' : '填写与产品确认后的回复/结论…'" />
-          </div>
-          <el-button size="small" type="primary" class="mt" :disabled="!clarifyItems.length"
-            @click="saveClarifyReplies">💾 保存全部回复</el-button>
+            <el-button size="small" type="primary" class="mt"
+              @click="saveClarifyReplies">💾 保存全部回复</el-button>
+          </template>
+          <el-empty v-else description="暂无澄清项（已确认无需澄清或已删除）" :image-size="60" />
         </template>
 
         <!-- 原文/未解析模式 -->
@@ -783,9 +789,12 @@
           </div>
           <div v-for="(item, i) in clarifyEditItems" :key="i" class="clarify-item">
             <div class="clarify-item-head">
-              <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
-              <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
-              <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+              <div class="clarify-head-left">
+                <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
+                <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
+                <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+              </div>
+              <el-button size="mini" type="danger" plain class="clarify-delete-btn" @click="deleteClarifyEditItem(i)">🗑️ 删除</el-button>
             </div>
             <div class="clarify-issue">{{ item.issue || item.suggested_question || '' }}</div>
             <div v-if="item.suggested_question" class="clarify-suggest"><b>建议提问：</b>{{ item.suggested_question }}</div>
@@ -1571,6 +1580,45 @@ export default {
         this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
       }
     },
+    async deleteClarifyItem(index) {
+      const item = this.clarifyItems[index]
+      const loc = (item && (item.location || item.issue)) ? `「${item.location || item.issue}」` : '该澄清点'
+      try {
+        await this.$confirm(
+          `确定要删除澄清点 ${loc} 吗？\n删除后该条目将不再参与后续测试设计与用例生成。`,
+          '删除澄清点',
+          { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' }
+        )
+      } catch (e) {
+        return
+      }
+      const newItems = this.clarifyItems.filter((_, i) => i !== index)
+      const newReplies = this.clarifyReplies.filter((_, i) => i !== index)
+      const itemsToSave = newItems.map((it, i) => ({
+        ...it,
+        resolution: (newReplies[i] || '').trim(),
+      }))
+      const value = this._replaceClarifyJsonInRaw(
+        (this.proto && this.proto.clarification_log) || '', JSON.stringify(itemsToSave, null, 2))
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+          data: { field: 'clarification_log', value },
+        })
+        this.proto.clarification_log = value
+        this.clarifyItems = newItems
+        this.clarifyReplies = newReplies
+        await this.refresh()
+        this.$message.success('已删除该澄清点')
+        this.warnApprovalInvalidated()
+      } catch (e) {
+        this.$message.error('删除失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+    deleteClarifyEditItem(index) {
+      this.clarifyEditItems.splice(index, 1)
+      this.$message.info('已移除条目，点底部「保存全部结论」后生效')
+    },
     /** 澄清/测试点改动后，若原生成批准已失效，提示需重新批准 */
     warnApprovalInvalidated() {
       const g = this.proto && this.proto.generation_gate
@@ -1815,6 +1863,19 @@ export default {
       }
       if (i < 0 || i >= arr.length) return
       const removed = arr[i]
+      const name = (removed && (removed.title || removed.name || '')).trim()
+      const label = (removed && removed.id && name)
+        ? `「${removed.id} · ${name}」`
+        : (name ? `「${name}」` : (removed && removed.id ? `「${removed.id}」` : `第 ${i + 1} 个测试点`))
+      try {
+        await this.$confirm(
+          `确定要删除测试点 ${label} 吗？\n删除后该条目将不再参与后续用例生成。`,
+          '删除测试点',
+          { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' }
+        )
+      } catch (e) {
+        return
+      }
       arr.splice(i, 1)
       const value = wrapped ? JSON.stringify({ ...wrapped, testpoints: arr }, null, 2)
                            : JSON.stringify(arr, null, 2)
@@ -3499,7 +3560,23 @@ export default {
   border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; margin-top: 12px;
   background: #fff;
 }
-.clarify-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.clarify-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.clarify-head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 1;
+}
+.clarify-delete-btn {
+  margin-left: auto;
+}
 .clarify-loc { color: #6b7280; font-size: 12px; }
 .clarify-issue { color: #1f2937; font-size: 13px; line-height: 1.7; margin-top: 8px; }
 .clarify-suggest { color: #374151; font-size: 12.5px; line-height: 1.7; margin-top: 6px; background: #f3f4f6; border-radius: 6px; padding: 6px 10px; }
