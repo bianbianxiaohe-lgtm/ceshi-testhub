@@ -149,8 +149,8 @@ $Expect = @{
   # 2026-10-15: _llm 默认超时 300->600（analyzer=DeepSeek deepseek-chat 大原型偶发慢响应误杀）
   '/app/apps/requirement_analysis/modao_workflow.py'                      = 'A50E091707A0E4A392F55A01F06E7E9F';
   # 2026-10-14 晚: 自愈闭环第 3/4 环（diff_ai_vs_adopted / _adoption_kb_items / backfill_kb_from_adoption）
-  # 2026-10-15: call_openai_compatible_api 增加 asyncio.CancelledError 原样透传（修复超时/取消语义被污染）
-  '/app/apps/requirement_analysis/ai_model_service.py'                    = '122639E11407039A4D557636FA06132F';
+  # 2026-10-15: call_openai_compatible_api 增加有界重试（供应商瞬断/超时/5xx/429 自动恢复；硬错误与取消不重试）
+  '/app/apps/requirement_analysis/ai_model_service.py'                    = '14C379C1748695726545DFCA62178362';
   # 2026-10-15: PageObjectViewSet.filterset_fields 去掉不存在的 execution_mode（Swagger /api/schema/ 500）
   '/app/apps/ui_automation/views.py'                                      = 'E2DAF94F92ACF8D61911AC4F59C9BF86'
 }

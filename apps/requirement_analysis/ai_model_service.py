@@ -742,73 +742,82 @@ class AIModelService:
         logger.info(f"模型名称: {config.model_name}")
         logger.info(f"请求参数: max_tokens={actual_max_tokens}, temperature={config.temperature}, top_p={config.top_p}")
 
-        try:
-            # 增加HTTP超时时间到900秒（15分钟），支持大文档生成
-            # 禁用HTTP/2，使用HTTP/1.1以提高兼容性
-            # 显式设置所有超时参数，避免默认的连接超时导致请求失败
-            # 若调用方显式传了 timeout（如覆盖率分析辅助判断），则用它覆盖读取超时
-            read_timeout = timeout if timeout is not None else 900.0
-            timeout_config = httpx.Timeout(
-                connect=60.0,      # 连接超时：60秒
-                read=read_timeout, # 读取超时：默认900秒（15分钟），可被调用方覆盖
-                write=60.0,        # 写入超时：60秒
-                pool=60.0          # 连接池超时：60秒
-            )
-            async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
-                logger.info(f"发送POST请求到: {url}")
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json=data
+        provider_name = config.get_model_type_display()
+        # 有界重试：供应商瞬断（连接中途关闭 / 网络抖动 / 读取超时 / 5xx / 429）自动恢复，
+        # 避免单次掉线就让整条生成流水线失败。硬错误（402 余额不足、401 鉴权失败等 4xx）与
+        # 任务取消（CancelledError）不重试。
+        max_attempts = 3
+        read_timeout = timeout if timeout is not None else 900.0
+        timeout_config = httpx.Timeout(
+            connect=60.0,      # 连接超时：60秒
+            read=read_timeout, # 读取超时：默认900秒（15分钟），可被调用方覆盖
+            write=60.0,        # 写入超时：60秒
+            pool=60.0          # 连接池超时：60秒
+        )
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
+                    logger.info(f"发送POST请求到: {url} (attempt {attempt}/{max_attempts})")
+                    response = await client.post(url, headers=headers, json=data)
+
+                    logger.info(f"收到响应: status_code={response.status_code}")
+
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        logger.error(f"API调用返回错误: Status={response.status_code}, Body={error_detail}")
+
+                    response.raise_for_status()
+                    result = response.json()
+                    # 兼容推理模型（如 DeepSeek deepseek-v4-pro）：正文可能在 reasoning_content，content 为空
+                    try:
+                        _message = result['choices'][0].get('message') or {}
+                        if not _message.get('content') and _message.get('reasoning_content'):
+                            _message['content'] = _message['reasoning_content']
+                    except Exception:
+                        pass
+                    logger.info(f"API调用成功，响应内容: {str(result)[:200]}...")
+                    return result
+            except asyncio.CancelledError:
+                # 任务被外部取消（wait_for 超时 / 用户中止）：绝不重试，原样上抛，保留取消语义。
+                raise
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                # 5xx（含 503 繁忙）与 429（限流）为瞬时故障，可重试；
+                # 402 余额不足 / 401 鉴权失败等 4xx 硬错误不重试，直接失败。
+                if status >= 500 or status == 429:
+                    last_exc = e
+                    logger.warning(
+                        f"{provider_name}({config.model_name}) HTTP {status} 瞬时错误，"
+                        f"第 {attempt}/{max_attempts} 次将重试（{str(e.response.text)[:200]}）"
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(min(2 * attempt, 10))
+                        continue
+                    raise Exception(
+                        f"{provider_name}({config.model_name}) API返回错误 {status}: {e.response.text}"
+                    )
+                raise Exception(
+                    f"{provider_name}({config.model_name}) API返回错误 {status}: {e.response.text}"
                 )
-
-                logger.info(f"收到响应: status_code={response.status_code}")
-
-                if response.status_code != 200:
-                    error_detail = response.text
-                    logger.error(f"API调用返回错误: Status={response.status_code}, Body={error_detail}")
-
-                response.raise_for_status()
-                result = response.json()
-                # 兼容推理模型（如 DeepSeek deepseek-v4-pro）：正文可能在 reasoning_content，content 为空
-                try:
-                    _message = result['choices'][0].get('message') or {}
-                    if not _message.get('content') and _message.get('reasoning_content'):
-                        _message['content'] = _message['reasoning_content']
-                except Exception:
-                    pass
-                logger.info(f"API调用成功，响应内容: {str(result)[:200]}...")
-                return result
-        except httpx.HTTPStatusError as e:
-            provider_name = config.get_model_type_display()
-            error_msg = (
-                f"{provider_name}({config.model_name}) API返回错误 "
-                f"{e.response.status_code}: {e.response.text}"
-            )
-            logger.error(error_msg)
-            raise Exception(error_msg)
-        except httpx.TimeoutException as e:
-            provider_name = config.get_model_type_display()
-            logger.error(f"{provider_name}({config.model_name}) API请求超时: {repr(e)}")
+            except httpx.TransportError as e:
+                # 覆盖连接中断（peer closed / incomplete chunked read）、网络抖动、读取超时等瞬时故障。
+                # 注：httpx.TimeoutException 也是 httpx.TransportError 的子类，一并命中。
+                last_exc = e
+                logger.warning(
+                    f"{provider_name}({config.model_name}) 传输层瞬时错误（{repr(e)}），"
+                    f"第 {attempt}/{max_attempts} 次将重试"
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(min(2 * attempt, 10))
+                    continue
+                raise Exception(
+                    f"{provider_name}({config.model_name}) API调用失败: {str(e) or repr(e)}"
+                )
+        # 兜底（重试耗尽且上面的 raise 未触发）
+        if last_exc is not None:
             raise Exception(
-                f"{provider_name}({config.model_name}) API请求超时，请稍后再试或检查网络连接"
-            )
-        except asyncio.CancelledError:
-            # 任务被外部取消：最常见是上层 asyncio.wait_for 超时触发，或整个生成被用户/请求中止。
-            # 必须原样上抛，绝不能包成普通 Exception —— 否则会：
-            #   1) 污染错误语义（把"调用超时/被取消"伪装成"API 调用失败"）；
-            #   2) 破坏 asyncio.wait_for 的超时→TimeoutError 转换（wait_for 取消内部协程后，
-            #      若内部把 CancelledError 吞掉并改抛别的异常，wait_for 就无法干净地转成 TimeoutError）；
-            #   3) 阻止整个生成任务被真正取消（用户点了停止却因取消被吞而挂死）。
-            # Python 3.12 的 wait_for 在超时取消后会将 CancelledError 规范化为 asyncio.TimeoutError，
-            # 这样上层 _llm 的 `except asyncio.TimeoutError` 与 run_design_phase1 的降级逻辑才能正确工作。
-            raise
-        except BaseException as e:
-            provider_name = config.get_model_type_display()
-            # Use repr(e) to capture the full exception type and message, especially if str(e) is empty
-            logger.error(f"{provider_name}({config.model_name}) API调用失败: {repr(e)}")
-            raise Exception(
-                f"{provider_name}({config.model_name}) API调用失败: {str(e) or repr(e)}"
+                f"{provider_name}({config.model_name}) API调用失败: {str(last_exc) or repr(last_exc)}"
             )
     
     @staticmethod
