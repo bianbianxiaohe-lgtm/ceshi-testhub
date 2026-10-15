@@ -93,6 +93,14 @@ $code = curl.exe -s -o NUL -w '%{http_code}' http://localhost:8000/api/
 Say "GET /api/ -> $code   (expect 404 = healthy, 000 = process dead)"
 if ($code -ne '404') { Fail "health check returned $code" }
 
+# 2026-10-15: drf-spectacular generates the whole schema eagerly, so ANY bad
+# filterset_fields/filterset_class makes /api/schema/ return 500 (the real bug we hit:
+# PageObjectViewSet declared a non-existent 'execution_mode'). Health check alone
+# cannot catch it -> check the schema endpoint too.
+$schCode = curl.exe -s -o NUL -w '%{http_code}' --max-time 120 http://localhost:8000/api/schema/
+Say "GET /api/schema/ -> $schCode   (expect 200; 500 = some ViewSet declares a bad filter field)"
+if ($schCode -ne '200') { Fail "Swagger schema returned $schCode" }
+
 Say '--- modao_workflow.py ---'
 docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_workflow.py
 docker exec testhub-backend wc -l /app/apps/requirement_analysis/modao_workflow.py
@@ -161,9 +169,10 @@ Say '--- 2026-10-14 晚 anchors (self-heal loop + manual source) ---'
 # (no spaces in the patterns, so PS does not mangle the docker exec argv)
 docker exec testhub-backend grep -c max_redundant /app/apps/requirement_analysis/ai_model_service.py
 docker exec testhub-backend grep -c source=source /app/apps/requirement_analysis/modao_views.py
-Say '--- 2026-10-15 anchors (p0 底模降噪 / ui_automation 去掉 execution_mode 期望 0) ---'
+Say '--- 2026-10-15 anchor (p0 底模降噪条款在位；ui_automation 由 STEP4 的 /api/schema/ 200 覆盖) ---'
+# NOTE: do NOT use `grep -c execution_mode` here -- that string legitimately appears
+# (serializer fields etc.). The real regression guard is the STEP4 schema check.
 docker exec testhub-backend grep -c ui_screen /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md
-docker exec testhub-backend grep -c execution_mode /app/apps/ui_automation/views.py
 # 2026-10-14: was hardcoded to 'all 5 md5 match' and silently went stale when two
 # modao prompts were added. Derive the count from the table so it cannot drift.
 Say "all $($Expect.Count) md5 match -> prompts + zentao/services.py are baked into the image"
