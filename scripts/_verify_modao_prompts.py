@@ -51,10 +51,15 @@ def md5_bin(path):
 #    而 get_prompt() 返回的是「文本口径」（\r\n → \n）。两者必然不同，
 #    若拿文本口径去比对 EXPECT 会 100% 误报 MISMATCH。
 #    ⇒ 正确做法：文件按 bin 口径比对 EXPECT；缓存按 text 口径与「文件文本口径」比对。
-# 期望值 = 2026-10-13 本地改后的文件 md5（Get-FileHash MD5，原始字节口径）
+# 期望值 = 当前仓库提示词文件的 md5（Get-FileHash MD5，原始字节口径）
+# ⚠️ 每次改动提示词后必须同步更新本表，否则 STEP5/STEP6 会 MISMATCH（非真故障）。
+# 2026-10-14 更新：p2/p3 补「兜底句先改写 + 覆盖不回退 + 硬约束6例外」；
+#                  p7 补「pass_criteria 原样继承」（修根因：判据在合并阶段被静默丢弃）。
 EXPECT = {
-    'p2_testpoint_gen': 'C3F0F278F4E949C1D62C0EDCFA687442',
-    'p3_case_gen': '4D6009820A84E2FEAB6BFC958C5A12A6',
+    'p0_requirement_struct': '63CD0947D95E4831C247418C520C0708',
+    'p2_testpoint_gen': '2A183D64FEE02FE01ECB6C3C3A877759',
+    'p3_case_gen': '6596C958C826F7003F7003197AB8B428',
+    'p7_merge_dedup': 'AF4D46C137E031D8EB6B6EB063E7A438',
 }
 
 # 锚点串：取自提示词文件真实文本（⚠️ 不要凭印象写，曾误报过 MISSING）
@@ -68,6 +73,12 @@ FEATURES = {
         ('③ 权益边界', '③ **权益边界**'),
         ('④ 中断恢复', '④ **中断恢复**'),
     ],
+    'p0_requirement_struct': [
+        ('ui_screen降噪', 'ui_screen 底图上的未批注元素'),
+        ('批注增量优先', '批注增量优先（Annotation-First）'),
+        ('原型底模降噪', '原型底模降噪'),
+        ('负向禁止静态底模', '静态背景文字'),
+    ],
     'p3_case_gen': [
         ('兜底句不得单独成条', '兜底句不得单独成条'),
         ('功能级可观测断言', '功能级可观测断言'),
@@ -76,14 +87,21 @@ FEATURES = {
         ('② 刷新与回撤', '② **刷新与回撤**'),
         ('③ 权益边界', '③ **权益边界**'),
     ],
+    'p7_merge_dedup': [
+        ('pass_criteria 原样继承', 'pass_criteria 必须原样继承'),
+        ('功能级可观测判据', '功能级可观测判据'),
+        ('禁止改写为兜底句', '禁止把已有判据改写'),
+    ],
 }
 
 # 旧句残留检查：改动前这些表述把视觉兜底句当成了完整预期结果，
 # 必须确认它们已从「允许单独成条」的语境里删掉。
 # 注意：新文本里仍会以「禁止项」形式引用这些词（p3:25），所以只查带 "即可" 的原句。
 LEGACY = {
+    'p0_requirement_struct': [],
     'p2_testpoint_gen': ['无白屏/破图/资源缺失即可'],
     'p3_case_gen': ['无白屏/破图/资源缺失即可'],
+    'p7_merge_dedup': [],
 }
 
 bad = 0
@@ -93,7 +111,7 @@ w('=' * 70)
 
 PROMPTS_DIR = '/app/apps/requirement_analysis/modao_skill/prompts'
 
-for name in ('p2_testpoint_gen', 'p3_case_gen'):
+for name in ('p0_requirement_struct', 'p2_testpoint_gen', 'p3_case_gen', 'p7_merge_dedup'):
     path = os.path.join(PROMPTS_DIR, name + '.md')
     text = modao_prompts.get_prompt(name)  # ← 走缓存，等同运行期实际取到的内容
 

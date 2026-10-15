@@ -38,8 +38,10 @@ Say "baseline_exit=$LASTEXITCODE"
 Say '--- baseline md5 (2026-10-13 prompt + zentao coverage fix) ---'
 docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
 
-Say '--- baseline md5 (2026-10-14 modao p2/p3 prompt) ---'
-docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md
+Say '--- baseline md5 (2026-10-14 modao p2/p3/p7 prompt) ---'
+docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md
+Say '--- baseline md5 (2026-10-15 modao p0 底模降噪 prompt) ---'
+docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md
 Say '--- baseline anchors (old fallback sentence should be 1 before sync; new dimension 0) ---'
 docker exec testhub-backend sh -c "grep -c '历史缺陷高发维度' /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md"
 
@@ -125,10 +127,24 @@ $Expect = @{
   '/app/apps/requirement_analysis/independent_skill/prompts/tester.md'     = 'ABFDD8548E5B852C3143F844EED62764';
   '/app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md' = 'FAF9D37D6361CD1A7C1F9089A40A433E';
   '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61';
-  '/app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md' = 'C3F0F278F4E949C1D62C0EDCFA687442';
-  '/app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md'      = '4D6009820A84E2FEAB6BFC958C5A12A6'
+  '/app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md' = '2A183D64FEE02FE01ECB6C3C3A877759';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md'      = '6596C958C826F7003F7003197AB8B428';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md' = 'AF4D46C137E031D8EB6B6EB063E7A438';
+  # 2026-10-15: p0 底模降噪（第 23/24 条）+ p2 展示型/回归型/埋点型测试点（第 11/12 条）
+  '/app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md' = '63CD0947D95E4831C247418C520C0708';
+  # 2026-10-14: 用例合并采纳页补列 + 采纳挂版本/子孙模块筛选 + 采纳覆盖更新 + adopted_keys
+  # 2026-10-14 hotfix: _adopted_entry_keys/_in_lib 去掉 get_or_create（GET detail 1048 created_by_id 不能为 null）
+  # 2026-10-14 晚: 自愈闭环人工触发（adoption-diff / backfill-kb）+ 人工补充采纳 source='manual'
+  '/app/apps/requirement_analysis/modao_views.py'                         = 'CA155DA9D8CECD70F869FE367E0FC279';
+  '/app/apps/requirement_analysis/serializers.py'                         = '8935EEEDB95043128F5815793ACEE9C2';
+  # 2026-10-15: 跨画布澄清归属隔离（run_clarify 写回按画布过滤）+ 提取后默认不全选
+  '/app/apps/requirement_analysis/modao_workflow.py'                      = '130F8D96C7DF898EF7952181B28A7169';
+  # 2026-10-14 晚: 自愈闭环第 3/4 环（diff_ai_vs_adopted / _adoption_kb_items / backfill_kb_from_adoption）
+  '/app/apps/requirement_analysis/ai_model_service.py'                    = 'F0BBEC6FF1D54D123F7A4AD59591D176';
+  # 2026-10-15: PageObjectViewSet.filterset_fields 去掉不存在的 execution_mode（Swagger /api/schema/ 500）
+  '/app/apps/ui_automation/views.py'                                      = 'E2DAF94F92ACF8D61911AC4F59C9BF86'
 }
-$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md
+$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md /app/apps/requirement_analysis/modao_views.py /app/apps/requirement_analysis/serializers.py /app/apps/requirement_analysis/modao_workflow.py /app/apps/requirement_analysis/ai_model_service.py /app/apps/ui_automation/views.py
 $md5Bad = 0
 foreach ($line in $md5Raw) {
   $parts = ($line -split '\s+') | Where-Object { $_ -ne '' }
@@ -139,6 +155,15 @@ foreach ($line in $md5Raw) {
   else { Say "MD5 MISMATCH $f : image=$h expected=$($Expect[$f])"; $md5Bad++ }
 }
 if ($md5Bad -gt 0) { Fail "$md5Bad file(s) did NOT make it into the image" }
+
+Say '--- 2026-10-14 晚 anchors (self-heal loop + manual source) ---'
+# md5 only proves the file was copied; these prove the new code paths are really there.
+# (no spaces in the patterns, so PS does not mangle the docker exec argv)
+docker exec testhub-backend grep -c max_redundant /app/apps/requirement_analysis/ai_model_service.py
+docker exec testhub-backend grep -c source=source /app/apps/requirement_analysis/modao_views.py
+Say '--- 2026-10-15 anchors (p0 底模降噪 / ui_automation 去掉 execution_mode 期望 0) ---'
+docker exec testhub-backend grep -c ui_screen /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md
+docker exec testhub-backend grep -c execution_mode /app/apps/ui_automation/views.py
 # 2026-10-14: was hardcoded to 'all 5 md5 match' and silently went stale when two
 # modao prompts were added. Derive the count from the table so it cannot drift.
 Say "all $($Expect.Count) md5 match -> prompts + zentao/services.py are baked into the image"
