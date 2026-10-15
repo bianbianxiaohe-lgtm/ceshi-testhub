@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <el-card class="artifact-card" :class="{ 'has-content': !!rawText }">
     <template #header>
       <div class="ac-head">
@@ -28,37 +28,86 @@
     </div>
 
     <!-- 澄清：逐条视图 + 人工结论 -->
-    <div v-else-if="kind === 'clarify' && clarifyItems.length" class="ac-clarify">
-      <div v-for="(it, i) in clarifyItems" :key="i" class="ci-item">
-        <div class="ci-head">
-          <el-tag size="mini" :type="typeTag(it.type)">{{ it.type || '待确认' }}</el-tag>
-          <span class="ci-loc">{{ it.location || '未标注位置' }}</span>
-          <el-tag v-if="it.evidence_valid === false" size="mini" type="warning">证据未匹配原文</el-tag>
-          <el-tag v-if="(it.resolution || it.answer || '').trim()" size="mini" type="success">已填结论</el-tag>
+    <div v-else-if="kind === 'clarify'" class="ac-clarify">
+      <template v-if="clarifyItems.length">
+        <div v-for="(it, i) in clarifyItems" :key="i" class="ci-item">
+          <div class="ci-head">
+            <div class="ci-head-left">
+              <el-tag size="mini" :type="typeTag(it.type)">{{ it.type || '待确认' }}</el-tag>
+              <span class="ci-loc">{{ it.location || '未标注位置' }}</span>
+              <el-tag v-if="it.evidence_valid === false" size="mini" type="warning">证据未匹配原文</el-tag>
+              <el-tag v-if="(it.resolution || it.answer || '').trim()" size="mini" type="success">已填结论</el-tag>
+            </div>
+            <el-button
+              size="mini"
+              type="danger"
+              plain
+              class="ci-delete-btn"
+              :loading="saving"
+              @click="deleteClarifyItem(i)"
+            >
+              🗑️ 删除
+            </el-button>
+          </div>
+          <div v-if="it.evidence" class="ci-row"><label>原文依据</label><span>{{ it.evidence }}</span></div>
+          <div v-if="it.issue || it.uncertainty" class="ci-row"><label>问题</label><span>{{ it.issue || it.uncertainty }}</span></div>
+          <div v-if="it.suggested_question" class="ci-row"><label>建议提问</label><span>{{ it.suggested_question }}</span></div>
+          <div v-if="it.impact" class="ci-row"><label>影响范围</label><span>{{ it.impact }}</span></div>
+          <el-input v-model="clarifyReplies[i]" type="textarea" :rows="2" class="ci-input"
+            placeholder="填写人工结论（保存后写入该条 resolution，供后续用例生成引用）" />
         </div>
-        <div v-if="it.evidence" class="ci-row"><label>原文依据</label><span>{{ it.evidence }}</span></div>
-        <div v-if="it.issue || it.uncertainty" class="ci-row"><label>问题</label><span>{{ it.issue || it.uncertainty }}</span></div>
-        <div v-if="it.suggested_question" class="ci-row"><label>建议提问</label><span>{{ it.suggested_question }}</span></div>
-        <div v-if="it.impact" class="ci-row"><label>影响范围</label><span>{{ it.impact }}</span></div>
-        <el-input v-model="clarifyReplies[i]" type="textarea" :rows="2" class="ci-input"
-          placeholder="填写人工结论（保存后写入该条 resolution，供后续用例生成引用）" />
-      </div>
-      <el-button size="small" type="primary" :loading="saving" class="ci-save" @click="saveClarify">💾 保存全部结论</el-button>
+        <el-button size="small" type="primary" :loading="saving" class="ci-save" @click="saveClarify">💾 保存全部结论</el-button>
+      </template>
+      <el-empty v-else description="暂无澄清项（已确认无需澄清或已删除）" :image-size="60" />
     </div>
 
     <!-- 结构化卡片视图（测试点 / 用例 / 冒烟 / 其它 JSON） -->
     <div v-else-if="structuredItems.length" class="ac-structured">
-      <div v-for="(item, i) in structuredItems" :key="i" class="obj-card">
-        <div class="obj-no">#{{ i + 1 }}</div>
-        <div class="obj-rows">
+      <div v-for="(item, i) in structuredItems" :key="i" class="obj-card" :class="{ 'obj-expanded': isExpanded(i) }">
+        <div class="obj-head" @click="toggleItem(i)">
+          <div class="obj-head-left">
+            <span class="obj-no">#{{ i + 1 }}</span>
+            <span v-if="item.id" class="obj-id-tag">{{ item.id }}</span>
+            <el-tag v-if="item.priority" size="mini" :type="item.priority === 'P0' ? 'danger' : (item.priority === 'P1' ? 'warning' : 'info')">
+              {{ item.priority }}
+            </el-tag>
+          </div>
+          <el-button
+            size="mini"
+            type="danger"
+            plain
+            class="obj-delete-btn"
+            :loading="saving"
+            @click.stop="deleteStructuredItem(i)"
+          >
+            🗑️ 删除
+          </el-button>
+        </div>
+        <!-- 收起态：只显示 标题 / 描述 -->
+        <div v-if="!isExpanded(i)" class="obj-rows">
+          <div v-for="(row, j) in summaryRows(item)" :key="'s' + j" class="obj-row">
+            <label>{{ row[0] }}</label><span>{{ row[1] }}</span>
+          </div>
+          <div v-if="hiddenRowCount(item) > 0" class="obj-toggle" @click="toggleItem(i)">
+            展开全部字段（还有 {{ hiddenRowCount(item) }} 项）▾
+          </div>
+        </div>
+        <!-- 展开态：全部字段 + 收起入口 -->
+        <div v-else class="obj-rows">
           <div v-for="(row, j) in flatten(item)" :key="j" class="obj-row">
             <label>{{ row[0] }}</label><span>{{ row[1] }}</span>
           </div>
+          <div class="obj-toggle" @click="toggleItem(i)">收起 ▴</div>
         </div>
       </div>
       <div v-if="itemCount > structuredItems.length" class="ac-more">
         仅展示前 {{ structuredItems.length }} 条，共 {{ itemCount }} 条，完整内容请点「编辑」查看
       </div>
+    </div>
+
+    <!-- 空状态：如果是 JSON 格式且已无内容，或者 rawText 解析为空数组 -->
+    <div v-else-if="isJson && rawText && !parsedArray.length" class="ac-empty">
+      <el-empty :description="'暂无' + title + '（已全部处理或已删除）'" :image-size="60" />
     </div>
 
     <pre v-else-if="rawText" class="stage-pre">{{ rawText }}</pre>
@@ -108,6 +157,8 @@ export default {
       saving: false,
       clarifyItems: [],
       clarifyReplies: [],
+      /** 默认收起：记录已展开条目的下标 */
+      expandedIndexes: [],
     }
   },
   computed: {
@@ -152,6 +203,41 @@ export default {
     },
   },
   methods: {
+    /** 收起态摘要行：只取 标题 / 描述 类字段 */
+    summaryRows(item) {
+      const keys = ['title', 'name', 'case_name', 'description', 'desc']
+      const out = []
+      for (const [k, v] of Object.entries(item || {})) {
+        if (!keys.includes(k)) continue
+        if (v === null || v === undefined || v === '') continue
+        const label = this.lbl(k)
+        if (Array.isArray(v)) {
+          const txt = v.map(x => (x && typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' / ')
+          if (txt) out.push([label, txt])
+        } else if (typeof v === 'object') {
+          out.push(...this.flatten(v, label))
+        } else {
+          out.push([label, String(v)])
+        }
+      }
+      if (!out.length) out.push(['内容', JSON.stringify(item).slice(0, 120)])
+      return out
+    },
+    /** 收起时被隐藏的字段数（顶层） */
+    hiddenRowCount(item) {
+      const keys = ['title', 'name', 'case_name', 'description', 'desc']
+      return Object.entries(item || {})
+        .filter(([k, v]) => !keys.includes(k) && v !== null && v !== undefined && v !== '')
+        .length
+    },
+    isExpanded(i) {
+      return this.expandedIndexes.includes(i)
+    },
+    toggleItem(i) {
+      const idx = this.expandedIndexes.indexOf(i)
+      if (idx >= 0) this.expandedIndexes.splice(idx, 1)
+      else this.expandedIndexes.push(i)
+    },
     base() {
       return '/requirement-analysis/api/modao'
     },
@@ -265,7 +351,85 @@ export default {
         this.rawText, JSON.stringify(items, null, 2))
       this.saveValue(value).then(ok => { if (ok) this.clarifyReplies = items.map(it => it.resolution) })
     },
-    async saveValue(value) {
+    async deleteClarifyItem(index) {
+      const it = this.clarifyItems[index]
+      const loc = (it && (it.location || it.issue)) ? `「${it.location || it.issue}」` : '该澄清点'
+      try {
+        await this.$confirm(
+          `确定要删除澄清点 ${loc} 吗？\n删除后该条目将不再参与后续测试设计与用例生成。`,
+          '删除澄清点',
+          {
+            confirmButtonText: '确定删除',
+            cancelButtonText: '取消',
+            type: 'warning',
+          }
+        )
+      } catch (e) {
+        return
+      }
+
+      const newItems = this.clarifyItems.filter((_, i) => i !== index)
+      const newReplies = this.clarifyReplies.filter((_, i) => i !== index)
+      const itemsToSave = newItems.map((item, i) => ({
+        ...item,
+        resolution: String(newReplies[i] || '').trim(),
+      }))
+      const value = this._replaceClarifyJsonInRaw(
+        this.rawText, JSON.stringify(itemsToSave, null, 2))
+      const ok = await this.saveValue(value, '已成功删除该澄清点')
+      if (ok) {
+        this.clarifyItems = newItems
+        this.clarifyReplies = newReplies
+      }
+    },
+    async deleteStructuredItem(index) {
+      const it = this.parsedArray[index]
+      if (!it) return
+      const name = (it.title || it.name || it.case_name || '').trim()
+      const label = (it.id && name)
+        ? `「${it.id} · ${name}」`
+        : (name ? `「${name}」` : (it.id ? `「${it.id}」` : `第 ${index + 1} 项`))
+      try {
+        await this.$confirm(
+          `确定要删除${this.title} ${label} 吗？\n删除后该条目将不再参与后续流程。`,
+          `删除${this.title}`,
+          {
+            confirmButtonText: '确定删除',
+            cancelButtonText: '取消',
+            type: 'warning',
+          }
+        )
+      } catch (e) {
+        return
+      }
+
+      let newValue = ''
+      try {
+        const parsed = JSON.parse(this.rawText.trim())
+        if (Array.isArray(parsed)) {
+          const nextArr = parsed.filter((_, idx) => idx !== index)
+          newValue = JSON.stringify(nextArr, null, 2)
+        } else if (parsed && Array.isArray(parsed.smoke_testcases)) {
+          parsed.smoke_testcases.splice(index, 1)
+          newValue = JSON.stringify(parsed, null, 2)
+        } else if (parsed && Array.isArray(parsed.data)) {
+          parsed.data.splice(index, 1)
+          newValue = JSON.stringify(parsed, null, 2)
+        } else if (parsed && Array.isArray(parsed.testpoints)) {
+          parsed.testpoints.splice(index, 1)
+          newValue = JSON.stringify(parsed, null, 2)
+        } else {
+          this.$message.error('无法识别当前数据结构，请在编辑原文中手动调整')
+          return
+        }
+      } catch (e) {
+        this.$message.error('解析数据失败：' + e.message)
+        return
+      }
+
+      await this.saveValue(newValue, `已成功删除${this.title} ${label}`)
+    },
+    async saveValue(value, successMsg) {
       this.saving = true
       try {
         const res = await request({
@@ -274,7 +438,7 @@ export default {
           data: { field: this.field, value },
         })
         const d = res.data || {}
-        this.$message.success(d.detail || '已保存')
+        this.$message.success(successMsg || d.detail || '已保存')
         if (d.stale_stages && d.stale_stages.length) {
           this.$message.warning('该画布下游产物基于旧内容，建议重跑对应阶段')
         }
@@ -339,7 +503,24 @@ export default {
     padding: 10px 12px;
     margin-bottom: 10px;
     background: #fcfcfd;
-    .ci-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .ci-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 6px;
+    }
+    .ci-head-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+    .ci-delete-btn {
+      margin-left: auto;
+    }
     .ci-loc { font-size: 12px; color: #606266; font-weight: 600; }
     .ci-row {
       display: flex;
@@ -355,15 +536,41 @@ export default {
 
   /* 结构化卡片 */
   .obj-card {
-    display: flex;
-    gap: 10px;
     border: 1px solid #ebeef5;
     border-radius: 6px;
     padding: 10px 12px;
     margin-bottom: 10px;
     background: #fcfcfd;
-    .obj-no { flex: 0 0 34px; font-size: 12px; color: #c0c4cc; }
-    .obj-rows { flex: 1; }
+    transition: all 0.2s;
+    &:hover {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+    }
+    .obj-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      padding-bottom: 6px;
+      border-bottom: 1px dashed #ebeef5;
+      .obj-head-left {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .obj-no { font-size: 13px; font-weight: bold; color: #909399; }
+      .obj-id-tag {
+        font-size: 11px;
+        color: #409eff;
+        background: #ecf5ff;
+        border: 1px solid #d9ecff;
+        border-radius: 4px;
+        padding: 1px 6px;
+        font-family: Consolas, Monaco, monospace;
+      }
+      .obj-delete-btn { margin-left: auto; }
+    }
+    .obj-rows { width: 100%; }
     .obj-row {
       display: flex;
       gap: 8px;
@@ -372,6 +579,15 @@ export default {
       label { flex: 0 0 88px; color: #909399; }
       span { flex: 1; color: #303133; word-break: break-word; white-space: pre-wrap; }
     }
+    .obj-toggle {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #409eff;
+      cursor: pointer;
+      user-select: none;
+      &:hover { text-decoration: underline; }
+    }
+    .obj-head { cursor: pointer; }
   }
   .ac-more { font-size: 12px; color: #909399; }
 }

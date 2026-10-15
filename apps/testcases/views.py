@@ -37,10 +37,20 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
         if version:
             qs = qs.filter(versions__id=version)
         
-        # 功能模块筛选
+        # 功能模块筛选（含子孙模块：按父模块筛选时也能查到其下子模块的用例）
         feature_module = self.request.query_params.get('feature_module', None)
         if feature_module:
-            qs = qs.filter(feature_modules__id=feature_module)
+            from apps.feature_modules.models import FeatureModule as _FM
+            fm_ids = {int(feature_module)}
+            # 递归收集所有子孙模块 id
+            stack = [int(feature_module)]
+            while stack:
+                pid = stack.pop()
+                for cid in _FM.objects.filter(parent_id=pid).values_list('id', flat=True):
+                    if cid not in fm_ids:
+                        fm_ids.add(cid)
+                        stack.append(cid)
+            qs = qs.filter(feature_modules__id__in=fm_ids)
         
         # 测试点筛选
         test_point = self.request.query_params.get('test_point', None)

@@ -80,7 +80,7 @@
           <div class="form-hint">默认开启。DOM 与视觉分别逐页提取，再由 AI 分批交叉融合；任一路覆盖不足会阻断后续分析，避免生成不完整用例。</div>
         </el-form-item>
       </el-form>
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'"
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)"
         :description="proto.error_message" show-icon />
       <!-- 部分成功：读取超时但已保留已读画布。提示可继续读取补齐，而不是要求从头重跑。 -->
       <el-alert v-if="proto && proto.status === 'partial'" type="warning" :title="'读取未完成（已保留部分画布）'"
@@ -234,7 +234,7 @@
       <el-button v-if="proto && proto.requirement_summary" size="small" :loading="busy" :disabled="isRunning || busy" @click="onReStructAll">重新结构化全部</el-button>
       <el-alert v-if="proto && proto.status === 'structuring'" type="info" title="结构化中…" />
       <el-button v-if="proto && proto.status === 'structuring'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)" :description="proto.error_message" show-icon />
       <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
         title="质量门禁提示（以下检查未通过，已保留用例/报告）"
         :description="qualityGateSummary.join('\n')" />
@@ -298,7 +298,7 @@
       <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onClarify">识别澄清问题</el-button>
       <el-alert v-if="proto && proto.status === 'clarifying'" type="info" title="澄清分析中…" />
       <el-button v-if="proto && proto.status === 'clarifying'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)" :description="proto.error_message" show-icon />
       <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
         title="质量门禁提示（以下检查未通过，已保留用例/报告）"
         :description="qualityGateSummary.join('\n')" />
@@ -313,22 +313,28 @@
 
         <!-- 逐条填写模式 -->
         <template v-if="clarifyParsed && editingField !== 'clarification_log'">
-          <div v-for="(item, i) in clarifyItems" :key="i" class="clarify-item">
-            <div class="clarify-item-head">
-              <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
-              <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
-              <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+          <template v-if="clarifyItems.length">
+            <div v-for="(item, i) in clarifyItems" :key="i" class="clarify-item">
+              <div class="clarify-item-head">
+                <div class="clarify-head-left">
+                  <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
+                  <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
+                  <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+                </div>
+                <el-button size="mini" type="danger" plain class="clarify-delete-btn" @click="deleteClarifyItem(i)">🗑️ 删除</el-button>
+              </div>
+              <div class="clarify-issue">{{ item.issue }}</div>
+              <div v-if="item.suggested_question" class="clarify-suggest">
+                <b>建议提问：</b>{{ item.suggested_question }}
+              </div>
+              <div v-if="item.impact" class="clarify-impact">影响范围：{{ item.impact }}</div>
+              <el-input v-model="clarifyReplies[i]" type="textarea" :rows="2" class="mt"
+                :placeholder="item.resolution ? '' : '填写与产品确认后的回复/结论…'" />
             </div>
-            <div class="clarify-issue">{{ item.issue }}</div>
-            <div v-if="item.suggested_question" class="clarify-suggest">
-              <b>建议提问：</b>{{ item.suggested_question }}
-            </div>
-            <div v-if="item.impact" class="clarify-impact">影响范围：{{ item.impact }}</div>
-            <el-input v-model="clarifyReplies[i]" type="textarea" :rows="2" class="mt"
-              :placeholder="item.resolution ? '' : '填写与产品确认后的回复/结论…'" />
-          </div>
-          <el-button size="small" type="primary" class="mt" :disabled="!clarifyItems.length"
-            @click="saveClarifyReplies">💾 保存全部回复</el-button>
+            <el-button size="small" type="primary" class="mt"
+              @click="saveClarifyReplies">💾 保存全部回复</el-button>
+          </template>
+          <el-empty v-else description="暂无澄清项（已确认无需澄清或已删除）" :image-size="60" />
         </template>
 
         <!-- 原文/未解析模式 -->
@@ -377,7 +383,7 @@
       <el-alert v-if="proto && proto.final_testpoints_json && generationGateReasons.length" type="warning"
         :closable="false" show-icon title="最终测试用例尚未获准生成"
         :description="generationGateReasons.join('；')" />
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)" :description="proto.error_message" show-icon />
       <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
         title="质量门禁提示（以下检查未通过，已保留用例/报告）"
         :description="qualityGateSummary.join('\n')" />
@@ -783,9 +789,12 @@
           </div>
           <div v-for="(item, i) in clarifyEditItems" :key="i" class="clarify-item">
             <div class="clarify-item-head">
-              <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
-              <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
-              <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+              <div class="clarify-head-left">
+                <el-tag size="mini" :type="typeTag(item.type)">{{ item.type || '问题' }}</el-tag>
+                <el-tag v-if="item.priority" size="mini" type="warning">{{ item.priority }}</el-tag>
+                <span v-if="item.location" class="clarify-loc">📍 {{ item.location }}</span>
+              </div>
+              <el-button size="mini" type="danger" plain class="clarify-delete-btn" @click="deleteClarifyEditItem(i)">🗑️ 删除</el-button>
             </div>
             <div class="clarify-issue">{{ item.issue || item.suggested_question || '' }}</div>
             <div v-if="item.suggested_question" class="clarify-suggest"><b>建议提问：</b>{{ item.suggested_question }}</div>
@@ -1130,7 +1139,7 @@ export default {
     // ---------- A2-b 画布级进度展示与回退 ----------
     canvasStageLabel(c) {
       const st = c.current_stage || 0
-      const labels = ['待读取', '已结构化', '已澄清', '已生成用例', '已冒烟决策']
+      const labels = ['待读取', '已结构化', '已澄清', '已生成测试点', '已冒烟决策']
       let label = labels[st] || '待读取'
       if (c.stage_status === 'needs_rerun') label = '需重跑·' + label
       if (c.stage_status === 'failed') label = '失败·' + label
@@ -1424,6 +1433,18 @@ export default {
     countOf(jsonStr) {
       try { return JSON.parse(jsonStr).length } catch (e) { return 0 }
     },
+    friendlyError(raw) {
+      // 把后端抛出的技术性错误文案转成中文友好提示，便于用户快速判断根因并决策
+      if (!raw) return '任务执行失败，请查看下方详情或重试'
+      const m = String(raw)
+      if (/Insufficient Balance|余额不足|402/.test(m)) return 'AI 模型余额不足，请联系管理员充值后重试'
+      if (/401|Unauthorized|Invalid API|鉴权失败|API key/.test(m)) return 'AI 模型鉴权失败，请检查密钥配置'
+      if (/503|too busy|Service Unavailable|服务繁忙/.test(m)) return 'AI 模型服务繁忙，请稍后重试'
+      if (/peer closed|incomplete chunked read|RemoteProtocolError|连接中断|Connection reset|TransportError/.test(m)) return 'AI 服务连接中断（供应商网络抖动），已自动重试仍失败，请稍后重试'
+      if (/Timeout|超时|CancelledError/.test(m)) return 'AI 调用超时或被取消，请稍后重试或精简原型'
+      if (/Connection refused|无法连接|getaddrinfo|Name or service not known/.test(m)) return '无法连接 AI 服务地址，请检查网络与代理配置'
+      return '任务执行失败：' + (m.length > 100 ? m.slice(0, 100) + '…' : m)
+    },
     startPoll() {
       if (this.pollTimer) clearInterval(this.pollTimer)
       this.pollTimer = setInterval(() => this.refresh(), 3000)
@@ -1461,6 +1482,13 @@ export default {
           if (this.stage2Confirmed && this.step !== 2) this.stage2Collapsed = true
         }
         const s = res.data.status
+        // 任务从「运行中」转入「失败/部分成功」时，弹出明显的错误提示——否则轮询结果容易被用户错过
+        if ((s === 'failed' || s === 'partial') && this._prevProtoStatus
+            && this._prevProtoStatus !== s
+            && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this._prevProtoStatus)) {
+          this.$message.error(this.friendlyError(res.data.error_message))
+        }
+        this._prevProtoStatus = s
         if (!['extracting', 'structuring', 'clarifying', 'designing'].includes(s)) {
           this.stopPoll()
           this.busy = false
@@ -1570,6 +1598,45 @@ export default {
       } catch (e) {
         this.$message.error('保存失败：' + (e.response?.data?.detail || e.message))
       }
+    },
+    async deleteClarifyItem(index) {
+      const item = this.clarifyItems[index]
+      const loc = (item && (item.location || item.issue)) ? `「${item.location || item.issue}」` : '该澄清点'
+      try {
+        await this.$confirm(
+          `确定要删除澄清点 ${loc} 吗？\n删除后该条目将不再参与后续测试设计与用例生成。`,
+          '删除澄清点',
+          { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' }
+        )
+      } catch (e) {
+        return
+      }
+      const newItems = this.clarifyItems.filter((_, i) => i !== index)
+      const newReplies = this.clarifyReplies.filter((_, i) => i !== index)
+      const itemsToSave = newItems.map((it, i) => ({
+        ...it,
+        resolution: (newReplies[i] || '').trim(),
+      }))
+      const value = this._replaceClarifyJsonInRaw(
+        (this.proto && this.proto.clarification_log) || '', JSON.stringify(itemsToSave, null, 2))
+      try {
+        await request({
+          url: `${this.base()}/${this.protoId}/edit/`, method: 'patch',
+          data: { field: 'clarification_log', value },
+        })
+        this.proto.clarification_log = value
+        this.clarifyItems = newItems
+        this.clarifyReplies = newReplies
+        await this.refresh()
+        this.$message.success('已删除该澄清点')
+        this.warnApprovalInvalidated()
+      } catch (e) {
+        this.$message.error('删除失败：' + (e.response?.data?.detail || e.message))
+      }
+    },
+    deleteClarifyEditItem(index) {
+      this.clarifyEditItems.splice(index, 1)
+      this.$message.info('已移除条目，点底部「保存全部结论」后生效')
     },
     /** 澄清/测试点改动后，若原生成批准已失效，提示需重新批准 */
     warnApprovalInvalidated() {
@@ -1815,6 +1882,19 @@ export default {
       }
       if (i < 0 || i >= arr.length) return
       const removed = arr[i]
+      const name = (removed && (removed.title || removed.name || '')).trim()
+      const label = (removed && removed.id && name)
+        ? `「${removed.id} · ${name}」`
+        : (name ? `「${name}」` : (removed && removed.id ? `「${removed.id}」` : `第 ${i + 1} 个测试点`))
+      try {
+        await this.$confirm(
+          `确定要删除测试点 ${label} 吗？\n删除后该条目将不再参与后续用例生成。`,
+          '删除测试点',
+          { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' }
+        )
+      } catch (e) {
+        return
+      }
       arr.splice(i, 1)
       const value = wrapped ? JSON.stringify({ ...wrapped, testpoints: arr }, null, 2)
                            : JSON.stringify(arr, null, 2)
@@ -1825,7 +1905,7 @@ export default {
           data: { field: 'final_testpoints_json', value },
         })
         this.proto.final_testpoints_json = value
-        this.$message.success(`已删除测试点「${(removed && removed.title) || ('#' + (i + 1))}」`)
+        this.$message.success(`已删除测试点 ${label}`)
       } catch (e) {
         this.$message.error('删除失败：' + (e.response?.data?.detail || e.message))
       } finally {
@@ -3499,7 +3579,23 @@ export default {
   border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; margin-top: 12px;
   background: #fff;
 }
-.clarify-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.clarify-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.clarify-head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 1;
+}
+.clarify-delete-btn {
+  margin-left: auto;
+}
 .clarify-loc { color: #6b7280; font-size: 12px; }
 .clarify-issue { color: #1f2937; font-size: 13px; line-height: 1.7; margin-top: 8px; }
 .clarify-suggest { color: #374151; font-size: 12.5px; line-height: 1.7; margin-top: 6px; background: #f3f4f6; border-radius: 6px; padding: 6px 10px; }

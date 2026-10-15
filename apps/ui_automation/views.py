@@ -548,7 +548,7 @@ class PageObjectViewSet(viewsets.ModelViewSet):
     queryset = PageObject.objects.all()
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['project', 'execution_mode']
+    filterset_fields = ['project']
     search_fields = ['name', 'class_name', 'description']
 
     def get_serializer_class(self):
