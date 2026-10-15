@@ -80,7 +80,7 @@
           <div class="form-hint">默认开启。DOM 与视觉分别逐页提取，再由 AI 分批交叉融合；任一路覆盖不足会阻断后续分析，避免生成不完整用例。</div>
         </el-form-item>
       </el-form>
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'"
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)"
         :description="proto.error_message" show-icon />
       <!-- 部分成功：读取超时但已保留已读画布。提示可继续读取补齐，而不是要求从头重跑。 -->
       <el-alert v-if="proto && proto.status === 'partial'" type="warning" :title="'读取未完成（已保留部分画布）'"
@@ -234,7 +234,7 @@
       <el-button v-if="proto && proto.requirement_summary" size="small" :loading="busy" :disabled="isRunning || busy" @click="onReStructAll">重新结构化全部</el-button>
       <el-alert v-if="proto && proto.status === 'structuring'" type="info" title="结构化中…" />
       <el-button v-if="proto && proto.status === 'structuring'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)" :description="proto.error_message" show-icon />
       <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
         title="质量门禁提示（以下检查未通过，已保留用例/报告）"
         :description="qualityGateSummary.join('\n')" />
@@ -298,7 +298,7 @@
       <el-button type="primary" :loading="busy" :disabled="isRunning || busy" @click="onClarify">识别澄清问题</el-button>
       <el-alert v-if="proto && proto.status === 'clarifying'" type="info" title="澄清分析中…" />
       <el-button v-if="proto && proto.status === 'clarifying'" size="small" type="danger" plain :loading="terminating" @click="onTerminate">终止任务</el-button>
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)" :description="proto.error_message" show-icon />
       <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
         title="质量门禁提示（以下检查未通过，已保留用例/报告）"
         :description="qualityGateSummary.join('\n')" />
@@ -377,7 +377,7 @@
       <el-alert v-if="proto && proto.final_testpoints_json && generationGateReasons.length" type="warning"
         :closable="false" show-icon title="最终测试用例尚未获准生成"
         :description="generationGateReasons.join('；')" />
-      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="'执行失败'" :description="proto.error_message" show-icon />
+      <el-alert v-if="proto && proto.status === 'failed'" type="error" :title="friendlyError(proto.error_message)" :description="proto.error_message" show-icon />
       <el-alert v-if="proto && qualityGateSummary.length" type="warning" :closable="false" show-icon
         title="质量门禁提示（以下检查未通过，已保留用例/报告）"
         :description="qualityGateSummary.join('\n')" />
@@ -1424,6 +1424,18 @@ export default {
     countOf(jsonStr) {
       try { return JSON.parse(jsonStr).length } catch (e) { return 0 }
     },
+    friendlyError(raw) {
+      // 把后端抛出的技术性错误文案转成中文友好提示，便于用户快速判断根因并决策
+      if (!raw) return '任务执行失败，请查看下方详情或重试'
+      const m = String(raw)
+      if (/Insufficient Balance|余额不足|402/.test(m)) return 'AI 模型余额不足，请联系管理员充值后重试'
+      if (/401|Unauthorized|Invalid API|鉴权失败|API key/.test(m)) return 'AI 模型鉴权失败，请检查密钥配置'
+      if (/503|too busy|Service Unavailable|服务繁忙/.test(m)) return 'AI 模型服务繁忙，请稍后重试'
+      if (/peer closed|incomplete chunked read|RemoteProtocolError|连接中断|Connection reset|TransportError/.test(m)) return 'AI 服务连接中断（供应商网络抖动），已自动重试仍失败，请稍后重试'
+      if (/Timeout|超时|CancelledError/.test(m)) return 'AI 调用超时或被取消，请稍后重试或精简原型'
+      if (/Connection refused|无法连接|getaddrinfo|Name or service not known/.test(m)) return '无法连接 AI 服务地址，请检查网络与代理配置'
+      return '任务执行失败：' + (m.length > 100 ? m.slice(0, 100) + '…' : m)
+    },
     startPoll() {
       if (this.pollTimer) clearInterval(this.pollTimer)
       this.pollTimer = setInterval(() => this.refresh(), 3000)
@@ -1461,6 +1473,13 @@ export default {
           if (this.stage2Confirmed && this.step !== 2) this.stage2Collapsed = true
         }
         const s = res.data.status
+        // 任务从「运行中」转入「失败/部分成功」时，弹出明显的错误提示——否则轮询结果容易被用户错过
+        if ((s === 'failed' || s === 'partial') && this._prevProtoStatus
+            && this._prevProtoStatus !== s
+            && ['extracting', 'structuring', 'clarifying', 'designing'].includes(this._prevProtoStatus)) {
+          this.$message.error(this.friendlyError(res.data.error_message))
+        }
+        this._prevProtoStatus = s
         if (!['extracting', 'structuring', 'clarifying', 'designing'].includes(s)) {
           this.stopPoll()
           this.busy = false
