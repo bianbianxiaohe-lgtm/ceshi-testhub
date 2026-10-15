@@ -50,6 +50,10 @@
           @click="handleClearSelection">
           取消全选
         </el-button>
+        <el-button type="primary" @click="openImportDialog">
+          <el-icon><Upload /></el-icon>
+          导入Excel
+        </el-button>
         <el-button type="success" @click="exportToExcel">
           <el-icon><Download /></el-icon>
           导出Excel
@@ -391,13 +395,61 @@
       </template>
     </el-dialog>
 
+    <!-- 导入测试用例弹窗 -->
+    <el-dialog v-model="showImportDialog" title="导入测试用例" width="580px" :close-on-click-modal="false" @closed="resetImport">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="导入强制要求"
+        description="必须选择「所属项目」和「关联版本」，这两个值将应用到 Excel 中的每一条用例；文件内的关联项目/版本列会被忽略。Excel 表头需包含「用例标题」「预期结果」（其余列为可选）。"
+        style="margin-bottom:16px;"
+      />
+      <el-form label-width="110px">
+        <el-form-item label="所属项目" required>
+          <el-select v-model="importProject" placeholder="请选择项目" style="width:100%" :disabled="importing" @change="importProjectChange">
+            <el-option v-for="p in projects" :key="p.id" :label="p.name" :value="p.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="关联版本" required>
+          <el-select v-model="importVersions" multiple placeholder="请选择版本" style="width:100%" :disabled="!importProject || importing">
+            <el-option v-for="v in importProjectVersions" :key="v.id" :label="v.name + (v.is_baseline ? ' (基线)' : '')" :value="v.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="选择Excel" required>
+          <el-upload
+            :auto-upload="false"
+            :limit="1"
+            :on-change="handleImportFileChange"
+            :on-remove="handleImportFileRemove"
+            :file-list="importFileList"
+            accept=".xlsx,.xls,.csv"
+            style="width:100%">
+            <el-button type="primary">选择文件</el-button>
+            <template #tip>
+              <div class="el-upload__tip">支持从本系统导出的 Excel（.xlsx/.xls），表头需含「用例标题」「预期结果」</div>
+            </template>
+          </el-upload>
+        </el-form-item>
+        <el-form-item v-if="importPreview" label="解析预览">
+          <span :class="importPreview.invalid > 0 ? 'no-version' : ''">
+            共解析 {{ importPreview.total }} 条，有效 {{ importPreview.valid }} 条，缺失必填（标题/预期结果）{{ importPreview.invalid }} 条
+          </span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showImportDialog = false">取消</el-button>
+        <el-button type="success" :loading="importing" :disabled="!canImport" @click="confirmImport">确认导入</el-button>
+      </template>
+    </el-dialog>
+
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion } from '@element-plus/icons-vue'
+import { Plus, Search, Download, Delete, RefreshLeft, Select, Promotion, Upload } from '@element-plus/icons-vue'
 import api from '@/utils/api'
 import dayjs from 'dayjs'
 import * as XLSX from 'xlsx'
@@ -1271,6 +1323,152 @@ const fetchProjects = async () => {
     projects.value = response.data.results || response.data || []
   } catch (error) {
     ElMessage.error('获取项目列表失败')
+  }
+}
+
+// =============== 导入测试用例 ===============
+const showImportDialog = ref(false)
+const importProject = ref(null)
+const importVersions = ref([])
+const importFileList = ref([])
+const importParsedCases = ref([])
+const importPreview = ref(null)
+const importing = ref(false)
+
+// 当前导入对话框中，按所选项目过滤的版本列表
+const importProjectVersions = computed(() => {
+  if (!importProject.value) return []
+  const pid = Number(importProject.value)
+  return allVersions.value.filter(v => {
+    if (v.projects && Array.isArray(v.projects)) {
+      return v.projects.some(p => p.id === pid)
+    }
+    return false
+  })
+})
+
+// 满足「项目 + 版本 + 已解析文件」三个条件才允许导入
+const canImport = computed(() => {
+  return !!importProject.value && importVersions.value.length > 0 && importParsedCases.value.length > 0
+})
+
+const openImportDialog = () => {
+  showImportDialog.value = true
+}
+
+const importProjectChange = () => {
+  // 切换项目后清空已选版本（版本归属项目可能变化）
+  importVersions.value = []
+}
+
+const resetImport = () => {
+  importProject.value = null
+  importVersions.value = []
+  importFileList.value = []
+  importParsedCases.value = []
+  importPreview.value = null
+  importing.value = false
+}
+
+const handleImportFileRemove = () => {
+  importParsedCases.value = []
+  importPreview.value = null
+}
+
+const handleImportFileChange = (uploadFile) => {
+  const raw = uploadFile.raw
+  if (!raw) return
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const data = new Uint8Array(e.target.result)
+      const workbook = XLSX.read(data, { type: 'array' })
+      const sheetName = workbook.SheetNames[0]
+      if (!sheetName) {
+        ElMessage.warning('Excel 中未找到工作表')
+        return
+      }
+      const worksheet = workbook.Sheets[sheetName]
+      const rows = XLSX.utils.sheet_to_json(worksheet, { defval: '' })
+      const cases = []
+      let valid = 0
+      let invalid = 0
+      for (const row of rows) {
+        const get = (...keys) => {
+          for (const k of keys) {
+            const val = row[k]
+            if (val !== undefined && val !== null && String(val).trim() !== '') {
+              return String(val).trim()
+            }
+          }
+          return ''
+        }
+        const title = get('用例标题', 'title')
+        const expected = get('预期结果', 'expected_result', 'expectedResult')
+        cases.push({
+          title,
+          expected_result: expected,
+          description: get('用例描述', '描述', 'description'),
+          preconditions: get('前置条件', 'preconditions'),
+          steps: get('操作步骤', 'steps'),
+          priority: get('优先级', 'priority'),
+          status: get('状态', 'status'),
+          test_type: get('测试类型', 'testType'),
+          feature_modules: get('功能模块', 'featureModules'),
+          test_point: get('测试点', 'testPoint'),
+          tags: get('标签', 'tags')
+        })
+        if (title && expected) valid++
+        else invalid++
+      }
+      importParsedCases.value = cases
+      importPreview.value = { total: cases.length, valid, invalid }
+      if (cases.length === 0) {
+        ElMessage.warning('文件中未解析到任何数据行')
+      }
+    } catch (err) {
+      console.error('解析 Excel 失败:', err)
+      ElMessage.error('解析 Excel 失败，请确认文件格式是否为合法的 .xlsx/.xls')
+    }
+  }
+  reader.readAsArrayBuffer(raw)
+}
+
+const confirmImport = async () => {
+  if (!importProject.value) {
+    ElMessage.warning('请选择所属项目')
+    return
+  }
+  if (importVersions.value.length === 0) {
+    ElMessage.warning('请至少选择一个关联版本')
+    return
+  }
+  if (importParsedCases.value.length === 0) {
+    ElMessage.warning('请先选择包含用例的 Excel 文件')
+    return
+  }
+  importing.value = true
+  try {
+    const res = await api.post('/testcases/import/', {
+      project_id: importProject.value,
+      version_ids: importVersions.value,
+      cases: importParsedCases.value
+    })
+    ElMessage.success(res.data?.message || '导入成功')
+    showImportDialog.value = false
+    await fetchTestCases()
+  } catch (error) {
+    const data = error.response?.data
+    let msg = '导入失败'
+    if (data?.error) {
+      msg = data.error
+    } else if (data && typeof data === 'object') {
+      const fieldErrors = Object.values(data).flat()
+      if (fieldErrors.length > 0) msg = fieldErrors[0]
+    }
+    ElMessage.error(msg)
+  } finally {
+    importing.value = false
   }
 }
 
