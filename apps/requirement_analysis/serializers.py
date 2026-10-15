@@ -420,6 +420,7 @@ class ModaoPrototypeSerializer(serializers.ModelSerializer):
     pages = ModaoPageSerializer(many=True, read_only=True)
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
+    version_name = serializers.SerializerMethodField()
     confirmations = serializers.SerializerMethodField()
     feature_module_info = serializers.SerializerMethodField()
     generation_gate = serializers.SerializerMethodField()
@@ -431,7 +432,8 @@ class ModaoPrototypeSerializer(serializers.ModelSerializer):
             'extracted_json', 'requirement_summary', 'clarification_log', 'module_split',
             'risks_json', 'pci_json', 'final_testpoints_json', 'testcases_json',
             'dedup_audit_json', 'smoke_json', 'quality_report_json', 'excel_path', 'stage4_decision',
-            'error_message', 'work_log', 'qa_log', 'project', 'project_name', 'created_by_name', 'created_at', 'updated_at',
+            'error_message', 'work_log', 'qa_log', 'project', 'project_name', 'version', 'version_name',
+            'created_by_name', 'created_at', 'updated_at',
             'pages', 'confirmations', 'feature_module_info', 'generation_gate',
             'merged_testcases_json', 'merged_smoke_json',
         ]
@@ -443,6 +445,9 @@ class ModaoPrototypeSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'pages', 'confirmations', 'generation_gate',
             'merged_testcases_json', 'merged_smoke_json',
         ]
+
+    def get_version_name(self, obj):
+        return obj.version.name if obj.version_id else None
 
     def get_confirmations(self, obj):
         return obj.get_confirmations()

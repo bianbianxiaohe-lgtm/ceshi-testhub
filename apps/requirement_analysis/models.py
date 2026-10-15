@@ -602,6 +602,9 @@ class ModaoPrototype(models.Model):
     excel_path = models.CharField(max_length=500, blank=True, verbose_name='Excel路径')
     merged_testcases_json = models.TextField(blank=True, verbose_name='汇总-已采纳合并用例')
     merged_smoke_json = models.TextField(blank=True, verbose_name='汇总-已采纳合并冒烟')
+    # 自愈闭环(P0)：AI 原始生成的用例快照，于 P3 生成完成后一次性写入，不随人工编辑/采纳变化。
+    # 供「AI 生成 vs 最终采纳」偏差对比（冗余/疏漏/改写分析）使用，与 merged_testcases_json 配对。
+    ai_testcases_json = models.TextField(blank=True, verbose_name='AI原始-用例快照(自愈用)')
     stage_confirmations = models.TextField(default='{}', verbose_name='阶段确认JSON')
     stage4_decision = models.CharField(max_length=20, blank=True, verbose_name='阶段4决策')
     error_message = models.TextField(blank=True, verbose_name='错误信息')
@@ -747,6 +750,8 @@ class ModaoPage(models.Model):
     page_testcases_json = models.TextField(blank=True, verbose_name='画布级-阶段3用例')
     page_smoke_json = models.TextField(blank=True, verbose_name='画布级-阶段3冒烟')
     page_approved = models.BooleanField(default=False, verbose_name='画布用例是否已采纳')
+    # 自愈闭环(P0)：本画布 AI 原始用例快照，run_design_phase2 写入后不再变化，供任务级聚合与对比。
+    page_ai_testcases_json = models.TextField(blank=True, verbose_name='画布级-AI原始用例快照(自愈用)')
 
     class Meta:
         db_table = 'modao_page'

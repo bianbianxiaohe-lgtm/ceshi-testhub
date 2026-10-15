@@ -2388,3 +2388,386 @@ class AIModelService:
             f'跳过已存在{skipped}条, 输入{len(confirmed_answers)}条问答'
         )
         return result
+
+    # ------------------------------------------------------------------
+    # 墨刀线自愈闭环 第 4 环：人工采纳结果 → 项目知识库回流
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sh_norm(s):
+        return (s or '').strip().lower()
+
+    @staticmethod
+    def _sh_case_inner(c):
+        """用例可能是 {testcase:{...}, module, _raw} 嵌套结构，统一展开取真实用例体。"""
+        if not isinstance(c, dict):
+            return {}
+        inner = c.get('testcase', c)
+        return inner if isinstance(inner, dict) else c
+
+    @staticmethod
+    def _sh_bigrams(s):
+        s = AIModelService._sh_norm(s)
+        if len(s) <= 1:
+            return {s} if s else set()
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+
+    @staticmethod
+    def _sh_jaccard(a, b):
+        ga, gb = AIModelService._sh_bigrams(a), AIModelService._sh_bigrams(b)
+        if not ga and not gb:
+            return 1.0
+        if not ga or not gb:
+            return 0.0
+        return len(ga & gb) / len(ga | gb)
+
+    @staticmethod
+    def _sh_key(tc):
+        inner = AIModelService._sh_case_inner(tc)
+        return (AIModelService._sh_norm(inner.get('title', '')) + '\n'
+                + AIModelService._sh_norm(inner.get('description', '')))
+
+    @staticmethod
+    def diff_ai_vs_adopted(proto):
+        """对比「AI 原始生成」与「人工采纳后」的用例，返回 missing/rewritten/redundant。
+
+        口径与 scripts/_diff_ai_vs_adopted.py 一致：以 (title+description) 的字符 2-gram
+        Jaccard 相似度匹配，≥0.6 视为同一条，避免措辞变化误判为疏漏。
+        """
+        import json as _json
+
+        def _load(raw):
+            try:
+                v = _json.loads(raw or '[]')
+            except Exception:
+                return []
+            return v if isinstance(v, list) else []
+
+        ai = _load(proto.ai_testcases_json)
+        if not ai:
+            for p in proto.pages.all():
+                ai.extend(_load(p.page_ai_testcases_json))
+        merged = _load(proto.merged_testcases_json)
+        if not ai or not merged:
+            return {'skipped': True, 'ai_n': len(ai), 'merged_n': len(merged),
+                    'missing': [], 'rewritten': [], 'redundant': [], 'manual_n': 0}
+
+        ai_keys = [AIModelService._sh_key(t) for t in ai]
+        merged_keys = [AIModelService._sh_key(t) for t in merged]
+        # ⚠️ 人工补充条目（_manual=True）是**明确的人工意图**，不再参与相似度推断：
+        # 否则它一旦与某条 AI 用例相似度 ≥0.6，就会被判成"已采纳的 AI 用例"，
+        # 结果既不算人工补充、也不算人工改写，在对比里静默消失（人工补了却沉淀不了）。
+        manual_flags = [bool(isinstance(t, dict) and t.get('_manual')) for t in merged]
+        missing, rewritten, redundant = [], [], []
+
+        for i, t in enumerate(ai):
+            best_j, best_s = -1, 0.0
+            for j, mk in enumerate(merged_keys):
+                if manual_flags[j]:
+                    continue  # 人工补充不等价于"AI 用例被采纳/被改写"
+                s = AIModelService._sh_jaccard(ai_keys[i], mk)
+                if s > best_s:
+                    best_s, best_j = s, j
+            if best_s < 0.6:
+                # 附「最近似的采纳项 + 相似度」：相似度高=疑似同义重复被合并，
+                # 相似度极低/无相近项=疑似跑偏，供人工判断原因（系统无法自行区分）
+                nearest = merged[best_j] if 0 <= best_j < len(merged) else None
+                redundant.append({'ai': t, 'nearest': nearest,
+                                  'similarity': round(float(best_s), 2)})
+            elif best_j >= 0:
+                a_exp = AIModelService._sh_norm(
+                    AIModelService._sh_case_inner(t).get('expected', ''))
+                m_exp = AIModelService._sh_norm(
+                    AIModelService._sh_case_inner(merged[best_j]).get('expected', ''))
+                if a_exp and m_exp and AIModelService._sh_jaccard(a_exp, m_exp) < 0.6:
+                    rewritten.append({'ai': t, 'adopted': merged[best_j]})
+
+        for j, t in enumerate(merged):
+            if manual_flags[j]:
+                missing.append(t)  # 人工补充：直接计入，无需相似度判定
+                continue
+            best_s = 0.0
+            for ak in ai_keys:
+                s = AIModelService._sh_jaccard(merged_keys[j], ak)
+                if s > best_s:
+                    best_s = s
+            if best_s < 0.6:
+                missing.append(t)
+
+        return {'skipped': False, 'ai_n': len(ai), 'merged_n': len(merged),
+                'missing': missing, 'rewritten': rewritten, 'redundant': redundant,
+                'manual_n': sum(1 for f in manual_flags if f)}
+
+    @staticmethod
+    def _adoption_kb_items(proto, max_missing=10, max_rewritten=10, max_redundant=10):
+        """把「AI 原始 vs 人工采纳」的偏差转换成**待沉淀**的知识条目（**只读，不写库**）。
+
+        返回 (diff, items)。items 每项形如
+        {'category', 'title', 'content',
+         'ref': {'type': 'missing'|'rewritten'|'redundant', 'index': [n, ...]}}
+        ref.index 是该条目在 diff['missing'] / diff['rewritten'] / diff['redundant']
+        中的下标，供人工勾选后按 index 精确回流（保证"预览看到的"与"实际写入的"一致）。
+
+        三类偏差口径：
+          - missing   人工补充（AI 没生成）        → test_focus  （必须覆盖清单）
+          - rewritten 人工改写预期结果            → notes       （人工断言写法）
+          - redundant 未采纳＝人工判定无效        → constraints （勿再生成负面清单）
+        """
+        d = AIModelService.diff_ai_vs_adopted(proto)
+        if d.get('skipped'):
+            return d, []
+
+        def _title_of(tc, limit=30):
+            return (AIModelService._sh_case_inner(tc).get('title') or '未命名用例')[:limit]
+
+        def _module_of(tc):
+            if isinstance(tc, dict) and tc.get('module'):
+                return str(tc['module'])[:12]
+            return str(AIModelService._sh_case_inner(tc).get('module') or '通用')[:12]
+
+        items = []
+        # ⚠️ 默认**按模块聚合**后再交给人工：一条用例一条知识会让条目数 O(用例数) 增长，
+        # 召回时互相挤占 top-3；聚合后条目数 ≈ O(模块数)，且产出的是
+        # 「该模块必须覆盖的场景清单」，比抄一条具体用例更可泛化。人工仍可在弹窗里改文案。
+        groups = {}
+        order = []
+        for i, t in enumerate(d['missing'][:max_missing]):
+            mod = _module_of(t)
+            if mod not in groups:
+                groups[mod] = []
+                order.append(mod)
+            groups[mod].append((i, t, AIModelService._sh_case_inner(t)))
+
+        for mod in order:
+            rows = groups[mod]
+            lines = []
+            for n, (_, _, inner) in enumerate(rows, 1):
+                exp = (inner.get('expected') or '').strip().replace('\n', ' ')[:80]
+                desc = (inner.get('description') or '').strip().replace('\n', ' ')[:60]
+                line = f"{n}. {inner.get('title', '')}"
+                if desc:
+                    line += f"｜场景：{desc}"
+                if exp:
+                    line += f"｜预期：{exp}"
+                lines.append(line)
+            items.append({
+                'category': 'test_focus',
+                'manual': any(bool(t.get('_manual')) for _, t, _ in rows),
+                'title': f"【{mod}】人工补充测试重点（{len(rows)} 条场景）",
+                'content': (
+                    f"模块：{mod}\n"
+                    f"以下场景由人工补充（AI 未生成），后续同类需求必须覆盖：\n"
+                    + '\n'.join(lines) + "\n"
+                    f"（来源：墨刀自愈闭环 · 原型 #{proto.pk}）"
+                ),
+                'ref': {'type': 'missing', 'index': [i for i, _, _ in rows]},
+            })
+
+        for i, w in enumerate(d['rewritten'][:max_rewritten]):
+            a = AIModelService._sh_case_inner(w['ai'])
+            m = AIModelService._sh_case_inner(w['adopted'])
+            items.append({
+                'category': 'notes',
+                'title': f"人工修正【{_module_of(w['ai'])}】：{_title_of(w['ai'])}",
+                'content': (
+                    f"用例：{a.get('title', '')}\n"
+                    f"AI 原预期：{(a.get('expected') or '')[:250]}\n"
+                    f"人工修正为：{(m.get('expected') or '')[:250]}\n"
+                    f"（来源：墨刀自愈闭环——后续生成同类用例请采用人工修正后的断言粒度与写法）"
+                ),
+                'ref': {'type': 'rewritten', 'index': [i]},
+            })
+
+        # 未采纳（AI 生成但采纳结果里没有）＝**人工判定无效的用例**。
+        # ⚠️ 口径（人工确认）：merged 已经是"向量去重后的最终 AI 用例"，人工在偏差对比时
+        # 剩下的未匹配项一律视为未采纳，即人工认为无效，**不再区分"人工删除 / 系统自动合并"**。
+        # ⇒ 按负面清单沉淀（constraints），让后续生成避开同类无效用例。
+        # 仍保留「最近似采纳项 + 相似度」供人工核对（相似度高的多为同义重复被合并）。
+        r_groups, r_order = {}, []
+        for i, entry in enumerate(d['redundant'][:max_redundant]):
+            t = entry['ai'] if isinstance(entry, dict) else entry
+            mod = _module_of(t)
+            if mod not in r_groups:
+                r_groups[mod] = []
+                r_order.append(mod)
+            r_groups[mod].append((i, entry))
+
+        for mod in r_order:
+            rows = r_groups[mod]
+            lines = []
+            for n, (_, entry) in enumerate(rows, 1):
+                t = entry['ai'] if isinstance(entry, dict) else entry
+                inner = AIModelService._sh_case_inner(t)
+                line = f"{n}. {inner.get('title', '')}"
+                sim = entry.get('similarity', 0) if isinstance(entry, dict) else 0
+                nearest = entry.get('nearest') if isinstance(entry, dict) else None
+                if nearest is not None and sim >= 0.45:
+                    # 相似度接近 0.6 阈值：大概率是同义重复被合并，可作为"勿再生成"
+                    nt = AIModelService._sh_case_inner(nearest).get('title', '')
+                    line += f"｜与已采纳项「{(nt or '')[:40]}」相似度 {sim}（疑似同义重复）"
+                elif nearest is not None:
+                    # 相似度低：不是重复，是内容本身没被采纳（与需求无关 / 跑偏 / 粒度问题）
+                    nt = AIModelService._sh_case_inner(nearest).get('title', '')
+                    line += (f"｜最接近的已采纳项「{(nt or '')[:40]}」相似度仅 {sim}"
+                             f"（非重复，判为与需求无关 / 跑偏 / 粒度不当）")
+                else:
+                    line += "｜采纳结果中无相近用例（与需求无关 / 跑偏）"
+                lines.append(line)
+            items.append({
+                'category': 'constraints',
+                'kind': 'redundant',
+                'default_checked': True,
+                'title': f"【{mod}】人工判定无效的用例（{len(rows)} 条，后续勿再生成）",
+                'content': (
+                    f"模块：{mod}\n"
+                    f"以下用例 AI 已生成，但人工采纳时被判定为无效（未采纳），"
+                    f"后续同类需求不要生成同类用例：\n"
+                    + '\n'.join(lines) + "\n"
+                    f"人工判定：无效（未采纳）。"
+                    f"如需补充原因可改写本行（同义重复 / 与需求无关·跑偏 / 粒度太细碎 / 其他）\n"
+                    f"（来源：墨刀自愈闭环 · 原型 #{proto.pk}）"
+                ),
+                'ref': {'type': 'redundant', 'index': [i for i, _ in rows]},
+            })
+        return d, items
+
+    @staticmethod
+    def preview_kb_from_adoption(proto, max_missing=10, max_rewritten=10,
+                                 max_redundant=10):
+        """自愈闭环第 4 环【人工触发·预览】：只算偏差、不写任何库表。
+
+        前端据此展示"AI 漏了什么 / 人工改了什么 / 什么被判定无效"，
+        由人工确认后再调 backfill_kb_from_adoption。
+        """
+        if not proto or not proto.project_id:
+            return {'skipped': True, 'reason': '任务未关联项目', 'items': []}
+        d, items = AIModelService._adoption_kb_items(
+            proto, max_missing, max_rewritten, max_redundant)
+        if d.get('skipped'):
+            return {'skipped': True,
+                    'reason': 'AI 原始快照或采纳结果为空',
+                    'diff': {'ai_n': d['ai_n'], 'merged_n': d['merged_n']},
+                    'items': []}
+        return {
+            'skipped': False,
+            'diff': {'ai_n': d['ai_n'], 'merged_n': d['merged_n'],
+                     'missing': len(d['missing']), 'rewritten': len(d['rewritten']),
+                     'redundant': len(d['redundant']), 'manual_n': d.get('manual_n', 0)},
+            'items': items,
+            'note': ('missing=人工补充→测试重点；rewritten=人工改写→注意事项；'
+                     'redundant=人工判定无效（未采纳）→约束条件（勿再生成）。'),
+        }
+
+    @staticmethod
+    def backfill_kb_from_adoption(proto, user_id=None, selected=None,
+                                  max_missing=10, max_rewritten=10, items=None,
+                                  max_redundant=10):
+        """自愈闭环第 4 环：把「人工采纳 vs AI 原始」的偏差沉淀为项目知识条目。
+
+        ⚠️ **只由人工显式触发**（`POST /modao/<pk>/backfill-kb/`），不在采纳链路里自动写库：
+        知识会被后续所有生成召回，静默沉淀等于让系统自行改写自己的输入，不可审计。
+
+        沉淀三类偏差（均为人工在预览弹窗里确认/改写后的意图）：
+          - missing（人工新增、AI 没生成）→ category=test_focus：后续必须覆盖，直接补覆盖率
+          - rewritten（AI 生成但预期结果被人工改写）→ category=notes：记住人工偏好的断言写法
+          - redundant（AI 有、采纳里没有＝人工判定无效）→ category=constraints：
+            负面清单，后续同类需求勿再生成这类用例
+
+        selected：人工勾选结果，形如 {'missing': [0, 2], 'rewritten': [1], 'redundant': [0]}；
+        为 None 表示全选（脚本/批量场景）。
+
+        items：人工在预览弹窗里**整理/改写后**的最终文案
+        [{title, content, category, ref}, ...]。传了它就以人工文案为准写库，
+        但仍用 ref 校验该条目确实来自本轮偏差，避免写入与本轮无关的伪造内容。
+        """
+        if not proto or not proto.project_id:
+            return {'created_count': 0, 'skipped': True, 'reason': '任务未关联项目'}
+
+        d, base_items = AIModelService._adoption_kb_items(
+            proto, max_missing, max_rewritten, max_redundant)
+        if d.get('skipped'):
+            return {'created_count': 0, 'skipped': True,
+                    'reason': 'AI 原始快照或采纳结果为空',
+                    'diff': {'ai_n': d['ai_n'], 'merged_n': d['merged_n']}}
+
+        # 合法 ref 白名单：本轮真实存在的偏差下标
+        valid_refs = {}
+        for x in base_items:
+            valid_refs.setdefault(x['ref']['type'], set()).update(
+                int(k) for k in (x['ref']['index'] or []))
+
+        if items:
+            # 人工整理后的文案：仍校验 ref 来源，只替换 title/content/category
+            cleaned = []
+            for x in items or []:
+                ref = x.get('ref') or {}
+                idxs = [int(k) for k in (ref.get('index') or [])]
+                if ref.get('type') not in valid_refs:
+                    continue
+                if not any(k in valid_refs[ref['type']] for k in idxs):
+                    continue
+                if not (x.get('title') or '').strip() or not (x.get('content') or '').strip():
+                    continue
+                cleaned.append({
+                    'title': (x.get('title') or '').strip()[:200],
+                    'content': (x.get('content') or '').strip(),
+                    'category': x.get('category') or 'test_focus',
+                    'ref': ref,
+                })
+            items = cleaned
+        else:
+            items = base_items
+            if selected:
+                allow = set()
+                for i in (selected.get('missing') or []):
+                    allow.add(('missing', int(i)))
+                for i in (selected.get('rewritten') or []):
+                    allow.add(('rewritten', int(i)))
+                for i in (selected.get('redundant') or []):
+                    allow.add(('redundant', int(i)))
+                items = [x for x in items
+                         if any((x['ref']['type'], int(k)) in allow
+                                for k in (x['ref']['index'] or []))]
+
+        created, skipped = [], 0
+        for item in items:
+            title = (item.get('title') or '').strip()[:200]
+            content = (item.get('content') or '').strip()
+            if not title or not content:
+                continue
+            if ProjectKnowledge.objects.filter(
+                    project_id=proto.project_id, title=title).exists():
+                skipped += 1
+                continue
+            try:
+                entry = ProjectKnowledge.objects.create(
+                    project_id=proto.project_id,
+                    title=title,
+                    category=item['category'],
+                    content=content,
+                    is_active=True,
+                    sort_order=0,
+                    source='modao_adopt',
+                    created_by_id=user_id,
+                )
+                AIModelService.sync_kb_entry_to_vector(entry, 'upsert')
+                created.append({'id': entry.id, 'title': title, 'category': item['category']})
+            except Exception as e:
+                logger.warning(f'[自愈回流] 创建知识条目失败({title}): {e}')
+                skipped += 1
+
+        logger.info(
+            f'[自愈回流] proto{proto.pk} 项目{proto.project_id}: '
+            f"人工补充{len(d['missing'])} 人工改写{len(d['rewritten'])} "
+            f"人工判定无效{len(d['redundant'])} → 新增知识{len(created)}条, "
+            f"已存在跳过{skipped}条"
+        )
+        return {
+            'created_count': len(created),
+            'skipped_count': skipped,
+            'entries': created,
+            'skipped': False,
+            'diff': {'ai_n': d['ai_n'], 'merged_n': d['merged_n'],
+                     'missing': len(d['missing']), 'rewritten': len(d['rewritten']),
+                     'redundant': len(d['redundant']), 'manual_n': d.get('manual_n', 0)},
+        }

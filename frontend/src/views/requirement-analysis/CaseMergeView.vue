@@ -30,7 +30,7 @@
       </el-select>
       <el-input v-model="keywordFilter" placeholder="搜索用例标题..." clearable size="small" style="width: 200px" />
       <div class="filter-stats">
-        共 {{ filteredCases.length }} 条 / 已选 {{ selectedCases.length }} 条 / 已采纳 {{ adoptedCount }} 条
+        共 {{ displayCases.length }} 条 / 已选 {{ selectedCases.length }} 条 / 已采纳(已隐藏) {{ adoptedCount }} 条
       </div>
     </div>
 
@@ -43,19 +43,38 @@
       <el-button size="small" type="success" :loading="adoptingAll" @click="onAdoptAll">
          采纳全部用例
       </el-button>
+      <el-button size="small" type="warning" plain @click="openAdoptionDiff">
+         🧠 AI 偏差对比 · 回流知识库
+      </el-button>
+      <el-button size="small" type="primary" plain @click="openCreate">
+         ➕ 新增用例（人工补充）
+      </el-button>
       <span class="batch-hint">
-        已采纳/已编辑的用例会以最新内容入库；若某条已被采纳，再次提交将自动跳过（幂等）。
+        单条 / 选中 / 全部均可采纳；若某条已入库，再次采纳会以最新内容覆盖更新（同项目+同模块+同标题视为同一条）。
       </span>
     </div>
 
     <!-- 用例列表 -->
-    <el-table ref="table" :data="filteredCases" size="small" border stripe max-height="600" @selection-change="onSelectionChange">
+    <el-table ref="table" :data="displayCases" size="small" border stripe max-height="600" @selection-change="onSelectionChange">
       <el-table-column type="selection" width="50" :selectable="isRowSelectable" />
       <el-table-column type="index" width="50" />
-      <el-table-column prop="module" label="模块" width="140" show-overflow-tooltip />
+      <el-table-column label="关联项目" width="110" show-overflow-tooltip>
+        <template #default="{ row }">{{ proto.project_name || '-' }}</template>
+      </el-table-column>
+      <el-table-column label="关联版本" width="100" align="center">
+        <template #default="{ row }">
+          <el-tag v-if="proto.version_name" size="mini">{{ proto.version_name }}</el-tag>
+          <span v-else>-</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="module" label="功能模块" width="140" show-overflow-tooltip />
+      <el-table-column label="测试点" min-width="140" show-overflow-tooltip>
+        <template #default="{ row }">{{ row.testpoint || '-' }}</template>
+      </el-table-column>
       <el-table-column label="用例标题" min-width="220">
         <template #default="{ row }">
           <span :class="{ 'row-adopted': adoptedKeys[row._key] }">{{ row.title || '（未命名）' }}</span>
+          <el-tag v-if="row._manual" size="mini" type="warning" class="row-tag">人工补充</el-tag>
           <el-tag v-if="editedKeys[row._key]" size="mini" type="warning" class="row-tag">已编辑</el-tag>
           <el-tag v-if="adoptedKeys[row._key]" size="mini" type="success" class="row-tag">已采纳</el-tag>
         </template>
@@ -83,9 +102,8 @@
             size="mini"
             type="success"
             :loading="!!adoptingKeys[row._key]"
-            :disabled="!!adoptedKeys[row._key]"
             @click="onAdoptSingle(row)"
-          >{{ adoptedKeys[row._key] ? '已采纳' : '采纳' }}</el-button>
+          >采纳</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -93,9 +111,21 @@
     <!-- 冒烟用例 -->
     <div v-if="filteredSmoke.length" class="smoke-section">
       <h4>冒烟用例 ({{ filteredSmoke.length }})</h4>
-      <el-table ref="smokeTable" :data="filteredSmoke" size="small" border stripe max-height="400">
+      <el-table ref="smokeTable" :data="displaySmoke" size="small" border stripe max-height="400">
         <el-table-column type="index" width="50" />
-        <el-table-column prop="module" label="模块" width="140" show-overflow-tooltip />
+        <el-table-column label="关联项目" width="110" show-overflow-tooltip>
+          <template #default="{ row }">{{ proto.project_name || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="关联版本" width="100" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="proto.version_name" size="mini">{{ proto.version_name }}</el-tag>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="module" label="功能模块" width="140" show-overflow-tooltip />
+        <el-table-column label="测试点" min-width="140" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.testpoint || '-' }}</template>
+        </el-table-column>
         <el-table-column label="用例标题" min-width="240">
           <template #default="{ row }">
             <span :class="{ 'row-adopted': adoptedKeys[row._key] }">{{ row.title || '（未命名）' }}</span>
@@ -136,7 +166,7 @@
     <!-- 详情 / 编辑弹窗 -->
     <el-dialog
       v-model="detailVisible"
-      :title="detailMode === 'edit' ? '✏️ 编辑用例（可修改后直接采纳）' : '📄 用例详情（可直接修改后采纳）'"
+      :title="detailMode === 'create' ? '➕ 新增用例（人工补充，确认后一并采纳）' : (detailMode === 'edit' ? '✏️ 编辑用例（可修改后直接采纳）' : '📄 用例详情（可直接修改后采纳）')"
       width="860px"
       top="5vh"
       :close-on-click-modal="false"
@@ -224,17 +254,82 @@
 
       <template #footer>
         <div class="dialog-footer">
-          <span class="footer-hint">「保存并采纳」会按当前内容写入用例库（同项目+同模块+同标题去重）</span>
+          <span class="footer-hint">
+            {{ detailMode === 'create'
+              ? '「加入列表」仅暂存为人工补充，可与其他用例一起勾选后统一采纳；「新增并采纳」立即写入用例库'
+              : '「保存并采纳」会按当前内容写入用例库（同项目+同模块+同标题去重）' }}
+          </span>
           <div>
             <el-button size="small" @click="detailVisible = false">取消</el-button>
-            <el-button size="small" :loading="saving" @click="saveEdit">保存</el-button>
+            <el-button size="small" :loading="saving" @click="saveEdit">
+              {{ detailMode === 'create' ? '加入列表' : '保存' }}
+            </el-button>
             <el-button
               size="small"
               type="primary"
               :loading="savingAdopt"
-              :disabled="!!adoptedKeys[currentKey]"
               @click="saveAndAdopt"
-            >{{ adoptedKeys[currentKey] ? '已采纳' : '保存并采纳' }}</el-button>
+            >{{ detailMode === 'create' ? '新增并采纳' : '保存并采纳' }}</el-button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
+
+    <!-- AI 偏差对比：只读预览 + 人工勾选后才回流知识库 -->
+    <el-dialog v-model="diffVisible" title="🧠 AI 偏差对比（人工确认后回流知识库）" width="860px" top="6vh">
+      <div v-loading="diffLoading" class="diff-wrap">
+        <div v-if="diffData && diffData.skipped" class="diff-empty">
+          {{ diffData.reason || '暂无可对比的数据（需先完成 AI 生成与人工采纳）' }}
+        </div>
+        <template v-else-if="diffData">
+          <el-alert
+            type="info"
+            show-icon
+            :closable="false"
+            :title="`AI 原始 ${diffData.diff.ai_n} 条 / 人工采纳后 ${diffData.diff.merged_n} 条`"
+            :description="`人工补充 ${diffData.diff.missing} 条（其中人工标记 ${diffData.diff.manual_n || 0} 条）· 人工改写 ${diffData.diff.rewritten} 条 · 人工判定无效（未采纳）${diffData.diff.redundant} 条`"
+          />
+          <div class="diff-tip">
+            已按模块整理为 {{ (diffEdit || []).length }} 条候选知识：人工补充合成「必须覆盖清单」、人工改写逐条保留、未采纳合成「勿再生成」负面清单。
+            <b>可直接修改标题与正文、删除或取消勾选不需要的条目</b>，确认后才写入项目知识库。
+          </div>
+          <div class="diff-list">
+            <div v-for="(it, idx) in diffEdit" :key="idx" class="diff-item">
+              <div class="diff-head">
+                <el-checkbox v-model="it.checked" />
+                <el-tag size="mini" :type="diffTagType(it.ref.type)">
+                  {{ diffTagText(it.ref.type) }}
+                </el-tag>
+                <el-tag v-if="it.manual" size="mini" type="success">人工标记</el-tag>
+                <el-input v-model="it.title" size="mini" class="diff-title-input" placeholder="知识条目标题" />
+                <el-button size="mini" type="text" @click="removeDiffItem(idx)">删除</el-button>
+              </div>
+              <el-input
+                v-model="it.content"
+                type="textarea"
+                :rows="6"
+                size="mini"
+                class="diff-content-input"
+                placeholder="知识条目正文"
+              />
+            </div>
+            <div v-if="!(diffEdit || []).length" class="diff-empty">本轮没有可沉淀的偏差</div>
+          </div>
+        </template>
+      </div>
+      <template #footer>
+        <div class="dialog-footer">
+          <span class="footer-hint">确认后写入项目知识库并被后续 AI 生成召回（未点确认不会写入）</span>
+          <div>
+            <el-button size="small" :loading="diffLoading" @click="openAdoptionDiff">重新对比</el-button>
+            <el-button size="small" @click="diffVisible = false">取消</el-button>
+            <el-button
+              size="small"
+              type="primary"
+              :loading="backfilling"
+              :disabled="!checkedCount"
+              @click="submitBackfill"
+            >确认写入 {{ checkedCount }} 条</el-button>
           </div>
         </div>
       </template>
@@ -270,14 +365,26 @@ export default {
       form: { module: '', title: '', priority: 'P2', type: '功能', precondition: '', steps: [], expected: '', notes: '' },
       saving: false,
       savingAdopt: false,
+      // 人工新增用例（人工补充）：暂存后随「采纳选中」一并入库
+      manualCases: [],
+      manualSeq: 0,
       // 行状态：key = `${pageId}#${index}`（冒烟加 smoke# 前缀）
       adoptedKeys: {},
       editedKeys: {},
       adoptingKeys: {},
+      // AI 偏差对比（只读预览 → 人工整理/改写 → 确认后才回流知识库）
+      diffVisible: false,
+      diffLoading: false,
+      diffData: null,
+      diffEdit: [],
+      backfilling: false,
       typeOptions: TYPE_OPTIONS,
     }
   },
   computed: {
+    checkedCount() {
+      return (this.diffEdit || []).filter(x => x.checked && x.title && x.content).length
+    },
     folderGroups() {
       const map = new Map()
       for (const p of this.pages) {
@@ -306,7 +413,8 @@ export default {
           }))
         })
       }
-      return out
+      // 人工补充用例排在最后，便于一起勾选采纳
+      return out.concat(this.manualCases)
     },
     allSmoke() {
       const out = []
@@ -354,6 +462,13 @@ export default {
         if (this.moduleFilter && c.module !== this.moduleFilter) return false
         return true
       })
+    },
+    /** 已采纳（已入库）的用例直接隐藏，避免重复采纳 */
+    displayCases() {
+      return this.filteredCases.filter(c => !this.adoptedKeys[c._key])
+    },
+    displaySmoke() {
+      return this.filteredSmoke.filter(c => !this.adoptedKeys[c._key])
     },
     adoptedCount() {
       return Object.keys(this.adoptedKeys).length
@@ -426,6 +541,7 @@ export default {
         stepsList: this.toStepsList(d.steps || d.test_steps || d.testSteps),
         expected: d.expected || d.pass_criteria || d.expected_result || '',
         notes: d.notes || d.requirement_ref || '',
+        testpoint: d.testpoint || d.test_point || d.source_testpoint || '',
         requirementRef: d.requirement_ref || '',
         sourceCanvas: meta.sourceCanvas,
         sourceFolder: meta.sourceFolder,
@@ -438,6 +554,11 @@ export default {
         const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
         this.proto = res.data
         this.pages = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
+        // 预填已采纳标记（后端按 项目+标题+模块 判定已入库用例），刷新后仍可隐藏已采纳行
+        const keys = {}
+        for (const k of (res.data.adopted_keys || [])) keys[k] = true
+        this.adoptedKeys = keys
+        this.selectedCases = []
       } catch (e) {
         this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
       } finally {
@@ -511,30 +632,113 @@ export default {
         notes: this.form.notes || '',
       }
     },
+    // ---------- 人工补充（新增用例） ----------
+    openCreate() {
+      this.current = null
+      this.detailMode = 'create'
+      this.form = {
+        module: this.moduleFilter || '',
+        title: '',
+        priority: 'P2',
+        type: '功能',
+        precondition: '',
+        steps: [''],
+        expected: '',
+        notes: '',
+      }
+      this.detailVisible = true
+    },
+    /** 把表单内容包装成一条「人工补充」行，加入列表待采纳（尚未入库） */
+    addManualCase(payload) {
+      this.manualSeq += 1
+      const row = {
+        _key: `manual#${this.manualSeq}`,
+        _manual: true,
+        _pageId: null,
+        _pageIndex: null,
+        _isSmoke: false,
+        caseId: '',
+        module: payload.module,
+        title: payload.title,
+        priority: payload.priority,
+        type: payload.type,
+        precondition: payload.precondition,
+        stepsList: payload.steps,
+        expected: payload.expected,
+        notes: payload.notes,
+        testpoint: '',
+        requirementRef: '',
+        sourceCanvas: '人工补充',
+        sourceFolder: '人工补充',
+      }
+      this.manualCases = this.manualCases.concat([row])
+      return row
+    },
     saveEdit() {
-      if (!this.current) return
       const payload = this.collectForm()
       if (!payload.title) {
         this.$message.warning('用例标题不能为空')
         return
       }
+      // 新增模式：「保存」= 暂存为人工补充行，等人工确认后统一采纳
+      if (this.detailMode === 'create') {
+        this.addManualCase(payload)
+        this.$message.success('已加入列表（人工补充，尚未入库）')
+        this.detailVisible = false
+        return
+      }
+      if (!this.current) return
       this.editedKeys = { ...this.editedKeys, [this.current._key]: payload }
       this.$message.success('已保存修改（尚未采纳）')
     },
     async saveAndAdopt() {
-      if (!this.current || !this.collectForm().title) {
+      const payload = this.collectForm()
+      if (!payload.title) {
         this.$message.warning('用例标题不能为空')
         return
       }
-      const key = this.current._key
       this.savingAdopt = true
-      this.editedKeys = { ...this.editedKeys, [key]: this.collectForm() }
       try {
-        const row = this.current
-        await this.postAdoptSingle(row)
+        // 新增模式：立即把这条人工补充写入用例库（并并入汇总）
+        if (this.detailMode === 'create') {
+          const row = this.addManualCase(payload)
+          await this.postAdoptManual(row)
+          this.detailVisible = false
+          return
+        }
+        if (!this.current) return
+        const key = this.current._key
+        this.editedKeys = { ...this.editedKeys, [key]: payload }
+        await this.postAdoptSingle(this.current)
         this.detailVisible = false
       } finally {
         this.savingAdopt = false
+      }
+    },
+    /** 采纳人工补充用例：走 /adopt/ 的 cases（不带 _ref，后端据此识别为人工新增） */
+    async postAdoptManual(row) {
+      const payload = this.payloadForSubmit(row)
+      this.adoptingKeys = { ...this.adoptingKeys, [row._key]: true }
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/adopt/`,
+          method: 'post',
+          data: { cases: [{ ...payload, _manual: true }] },
+        })
+        const d = res.data || {}
+        this.adoptedKeys = { ...this.adoptedKeys, [row._key]: true }
+        this.$message.success(d.detail || '人工补充用例已入库')
+        await this.loadDetail()
+        // 人工补充会改变采纳结果 → 偏差对比需立即重算（弹窗开着时自动刷新）
+        if (this.diffVisible) this.openAdoptionDiff()
+        return true
+      } catch (e) {
+        this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
+        return false
+      } finally {
+        const m = { ...this.adoptingKeys }
+        delete m[row._key]
+        this.adoptingKeys = m
       }
     },
     // ---------- 采纳 ----------
@@ -544,7 +748,8 @@ export default {
      */
     payloadForSubmit(row) {
       const e = this.editedKeys[row._key]
-      if (!e && !row._isSmoke) return null
+      // 人工补充行没有编辑缓存，但必须带完整内容提交（否则会退化成按 ref 定位、定位不到）
+      if (!e && !row._isSmoke && !row._manual) return null
       const src = e || {
         module: row.module,
         title: row.title,
@@ -572,6 +777,8 @@ export default {
     caseRefOf(row) {
       // 冒烟用例不在普通用例索引中，不做 ref 定位（否则会错误命中同页普通用例）
       if (row._isSmoke) return null
+      // 人工新增用例没有画布来源：必须返回 null，让后端识别为「人工补充」而非编辑某条 AI 用例
+      if (row._pageId == null || row._pageIndex == null) return null
       return { page_id: row._pageId, page_index: row._pageIndex }
     },
     async postAdoptSingle(row) {
@@ -601,10 +808,6 @@ export default {
       }
     },
     async onAdoptSingle(row) {
-      if (this.adoptedKeys[row._key]) {
-        this.$message.info('该用例已采纳，无需重复采纳')
-        return
-      }
       const ok = await this.postAdoptSingle(row)
       if (ok) this.selectedCases = this.selectedCases.filter(c => c._key !== row._key)
     },
@@ -635,12 +838,14 @@ export default {
           this.adoptedKeys = { ...this.adoptedKeys, [row._key]: true }
         }
         let msg = `已采纳 ${d.testcases || 0} 条用例`
-        if (d.skipped) msg += `，跳过已存在 ${d.skipped} 条`
+        if (d.updated) msg += `，更新 ${d.updated} 条`
+        if (d.skipped) msg += `，一致跳过 ${d.skipped} 条`
         if (d.failed) msg += `，失败 ${d.failed} 条`
         if (d.modules) msg += `，新建模块 ${d.modules} 个`
         this.$message.success(msg)
         this.selectedCases = []
         this.selectAll = false
+        this.loadDetail()
       } catch (e) {
         this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
       } finally {
@@ -657,16 +862,87 @@ export default {
         })
         const d = res.data || {}
         let msg = `已采纳 ${d.testcases || 0} 条用例`
-        if (d.skipped) msg += `，跳过已存在 ${d.skipped} 条`
+        if (d.updated) msg += `，更新 ${d.updated} 条`
+        if (d.skipped) msg += `，一致跳过 ${d.skipped} 条`
         if (d.modules) msg += `，新建模块 ${d.modules} 个`
         this.$message.success(msg)
-        const keys = {}
-        for (const row of [...this.allCases, ...this.allSmoke]) keys[row._key] = true
-        this.adoptedKeys = { ...this.adoptedKeys, ...keys }
-      } catch (e) {
+        await this.loadDetail()
+      if (this.diffVisible) this.openAdoptionDiff()
+    } catch (e) {
         this.$message.error('采纳失败：' + (e.response?.data?.detail || e.message))
       } finally {
         this.adoptingAll = false
+      }
+    },
+    async openAdoptionDiff() {
+      this.diffVisible = true
+      this.diffLoading = true
+      this.diffData = null
+      this.diffEdit = []
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/adoption-diff/`,
+          method: 'get',
+        })
+        const d = res.data || {}
+        this.diffData = d
+        // 后端已按模块聚合整理；这里转成可编辑副本，人工改完再确认写入
+        this.diffEdit = (d.items || []).map(it => ({
+          checked: it.default_checked !== false,
+          title: it.title || '',
+          content: it.content || '',
+          category: it.category || 'test_focus',
+          ref: it.ref,
+          manual: !!it.manual,
+        }))
+      } catch (e) {
+        this.$message.error('偏差对比失败：' + (e.response?.data?.detail || e.message))
+        this.diffVisible = false
+      } finally {
+        this.diffLoading = false
+      }
+    },
+    diffTagType(type) {
+      return { missing: 'danger', rewritten: 'warning', redundant: 'info' }[type] || 'info'
+    },
+    diffTagText(type) {
+      return {
+        missing: '人工补充 → 测试重点',
+        rewritten: '人工改写 → 注意事项',
+        redundant: '人工判定无效 → 勿再生成',
+      }[type] || type
+    },
+    removeDiffItem(idx) {
+      this.diffEdit = (this.diffEdit || []).filter((_, i) => i !== idx)
+    },
+    async submitBackfill() {
+      // 以人工整理后的文案为准提交（后端仍会按 ref 校验来源，防止写入无关内容）
+      const items = (this.diffEdit || [])
+        .filter(x => x.checked && (x.title || '').trim() && (x.content || '').trim())
+        .map(x => ({
+          title: x.title,
+          content: x.content,
+          category: x.category,
+          ref: x.ref,
+        }))
+      if (!items.length) {
+        this.$message.warning('没有勾选任何条目')
+        return
+      }
+      this.backfilling = true
+      try {
+        const res = await request({
+          url: `${this.base()}/${this.protoId}/backfill-kb/`,
+          method: 'post',
+          data: { items },
+        })
+        const d = res.data || {}
+        this.$message.success(d.detail || `已沉淀 ${d.created_count || 0} 条知识`)
+        this.diffVisible = false
+      } catch (e) {
+        this.$message.error('回流失败：' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.backfilling = false
       }
     },
     goBack() {
@@ -772,6 +1048,55 @@ export default {
     align-items: center;
     gap: 12px;
     .footer-hint { color: #909399; font-size: 12px; text-align: left; }
+  }
+
+  .diff-wrap {
+    min-height: 120px;
+    .diff-list {
+      margin-top: 12px;
+      max-height: 46vh;
+      overflow: auto;
+    }
+    .diff-item {
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      border: 1px solid #ebeef5;
+      border-radius: 6px;
+      background: #fafafa;
+    }
+    .diff-tip {
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: #f4f4f5;
+      border-radius: 4px;
+      font-size: 12px;
+      line-height: 1.7;
+      color: #606266;
+    }
+    .diff-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .diff-title-input { flex: 1; }
+    .diff-content-input { margin-top: 8px; }
+    .diff-content {
+      margin: 8px 0 0;
+      padding: 8px 10px;
+      background: #fff;
+      border-radius: 4px;
+      font-size: 12px;
+      line-height: 1.7;
+      color: #606266;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .diff-empty {
+      padding: 24px 0;
+      text-align: center;
+      color: #909399;
+      font-size: 13px;
+    }
   }
 }
 </style>

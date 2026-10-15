@@ -21,6 +21,8 @@ import uuid as uuid_lib
 import threading
 import traceback
 import logging
+import re
+from apps.versions.models import Version
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -298,6 +300,47 @@ def _tc_fields(tc_obj):
     }
 
 
+def _append_manual_cases(proto, cases):
+    """把「人工补充」用例并入任务汇总 merged_testcases_json（打标 _manual=True）。
+
+    目的：人工新增的用例必须进入汇总，才会被后续的「AI 原始 vs 人工采纳」偏差对比识别为
+    missing（AI 没生成、人工补的），从而在人工确认后沉淀为知识、提升下轮覆盖率。
+    只入库不进汇总的话，这条人工智慧对闭环完全不可见。
+    按 (title, module) 去重，保证重复采纳幂等。
+    """
+    import json as _json
+
+    def _key(c):
+        if not isinstance(c, dict):
+            return ('', '')
+        inner = c.get('testcase', c)
+        inner = inner if isinstance(inner, dict) else c
+        return (str(inner.get('title') or '').strip(),
+                str(c.get('module') or inner.get('module') or '').strip())
+
+    try:
+        merged = _json.loads(proto.merged_testcases_json or '[]')
+    except Exception:
+        merged = []
+    if not isinstance(merged, list):
+        merged = []
+    existed = {_key(m) for m in merged if isinstance(m, dict)}
+    added = 0
+    for c in cases:
+        item = dict(c)
+        item['_manual'] = True
+        k = _key(item)
+        if not k[0] or k in existed:
+            continue
+        merged.append(item)
+        existed.add(k)
+        added += 1
+    if added:
+        proto.merged_testcases_json = _json.dumps(merged, ensure_ascii=False)
+        proto.save(update_fields=['merged_testcases_json'])
+    return added
+
+
 def _merged_case_entries(proto):
     """构建全局用例索引，顺序与前端「用例合并采纳」列表完全一致。
 
@@ -364,10 +407,95 @@ def _find_case_entry(entries, ref):
     return None
 
 
-def _adopt_one_case(proto, user, tc_obj, mname, sort_order, desc_suffix='逐条采纳', extra_tags=None):
-    """把一条（可能已被前端编辑过的）用例写入用例库。幂等：项目 + 标题 + 模块 去重。"""
+def _adopted_entry_keys(proto):
+    """返回已入库用例在前端「用例合并采纳」中的 key 集合。
+
+    普通 = "pageId#index"；冒烟 = "smoke#pageId#index"。判据与采纳入库完全一致
+    （同项目 + 同标题 + 同归一化功能模块），使前端刷新后仍能隐藏已采纳行，避免重复采纳。
+    """
+    keys = set()
+    if not proto.project_id:
+        return keys
+    project = proto.project
+    pages = list(proto.pages.exclude(page_testcases_json='').exclude(page_testcases_json__isnull=True))
+    pages.sort(key=lambda p: (p.page_no or 0))
+
+    def _in_lib(c):
+        tc_obj = c.get('testcase', c) if isinstance(c, dict) else c
+        f = _tc_fields(tc_obj)
+        if not f['title']:
+            return False
+        mname = _canonical_module_name(_module_of(c), proto=proto, project=project)
+        # 只读判定：这里绝不能 get_or_create。DETAIL 等 GET 接口会调用本函数，
+        # get_or_create 会因缺少 created_by 触发 IntegrityError(1048)，且给只读请求带来写副作用。
+        # 模块尚不存在 ⇒ 该用例必然未挂到该模块下 ⇒ 直接判为未入库。
+        fm = FeatureModule.objects.filter(project=project, name=mname).first()
+        if not fm:
+            return False
+        return TestCase.objects.filter(project=project, title=f['title'], feature_modules=fm).exists()
+
+    def _smoke_list(s):
+        v = _safe_json_list(s)
+        if v:
+            return v
+        # page_smoke_json 顶层可能是 {smoke_testcases:[...]}
+        try:
+            obj = json.loads(s) if isinstance(s, str) else (s or {})
+        except Exception:
+            return []
+        if isinstance(obj, dict):
+            for k in ('smoke_testcases', 'smoke_cases', 'smoke_list', 'testcases'):
+                if isinstance(obj.get(k), list):
+                    return obj[k]
+        return []
+
+    for p in pages:
+        for idx, c in enumerate(_safe_json_list(p.page_testcases_json)):
+            if _in_lib(c):
+                keys.add(f"{p.id}#{idx}")
+        for idx, sc in enumerate(_smoke_list(p.page_smoke_json)):
+            if _in_lib(sc):
+                keys.add(f"smoke#{p.id}#{idx}")
+    return keys
+
+
+def _resolve_adopt_version(proto):
+    """采纳入库时确定要关联的版本。
+
+    - proto 已关联版本：直接用它；
+    - proto 未关联版本：尝试从标题里提取 x.y.z 版本号，在项目版本中精确匹配（仅当唯一命中时），
+      以兼容「阶段0漏选版本」的情况，避免采纳的用例因无版本而在「测试用例」页按版本筛选时被排除。
+    匹配不到返回 None（沿用旧行为：不挂版本）。
+    """
+    if proto.version_id:
+        return proto.version
+    if not proto.project_id:
+        return None
+    m = re.search(r'(\d+\.\d+(?:\.\d+)?)', proto.title or '')
+    if not m:
+        return None
+    token = m.group(1)
+    matches = [v for v in Version.objects.filter(projects=proto.project) if token in v.name]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _adopt_one_case(proto, user, tc_obj, mname, sort_order, desc_suffix='逐条采纳',
+                    extra_tags=None, source='ai'):
+    """把一条（可能已被前端编辑过的）用例写入用例库。幂等：项目 + 标题 + 模块 去重。
+
+    source：用例来源（'ai'=AI生成 / 'manual'=人工编写）。
+    人工补充（_manual / 无 _ref）必须传 'manual'，否则用例库来源列会错标成「AI生成」，
+    进而污染 AI 采纳率 / 真实覆盖率统计。
+    """
     if not proto.project_id:
         return {'ok': False, 'detail': '请先在阶段0关联项目，再采纳到用例库'}
+    target_version = _resolve_adopt_version(proto)
+    # 解析到版本则写回 proto，保证后续采纳/列表筛选一致
+    if not proto.version_id and target_version:
+        proto.version = target_version
+        proto.save(update_fields=['version'])
     f = _tc_fields(tc_obj)
     title = f['title'] or f'用例#{sort_order}'
     mname = _canonical_module_name(mname or '未分组', proto=proto, project=proto.project) or '未分组'
@@ -379,37 +507,51 @@ def _adopt_one_case(proto, user, tc_obj, mname, sort_order, desc_suffix='逐条�
             'parent': proto.feature_module,
         },
     )
-    if proto.version_id:
-        fm.versions.add(proto.version)
+    if target_version:
+        fm.versions.add(target_version)
+
 
     existing = TestCase.objects.filter(project=proto.project, title=title, feature_modules=fm).first()
     if existing:
+        # 重复采纳 = 以最新内容覆盖更新（同项目+同标题+同模块 视为同一条用例）
+        changed_fields = []
+        for field, val in (
+            ('preconditions', f['preconditions']), ('steps', f['steps_txt']),
+            ('expected_result', f['expected']), ('priority', f['priority']),
+            ('test_type', f['test_type']), ('description', f['description']),
+        ):
+            if getattr(existing, field) != val:
+                setattr(existing, field, val)
+                changed_fields.append(field)
         if extra_tags:
             merged = list(existing.tags or [])
-            changed = False
             for t in extra_tags:
                 if t not in merged:
                     merged.append(t)
-                    changed = True
-            if changed:
-                existing.tags = merged
-                existing.save(update_fields=['tags'])
+                    changed_fields.append('tags')
+        if changed_fields:
+            existing.save(update_fields=changed_fields)
+        # 已存在用例补挂版本（避免之前漏选版本导致按版本筛选查不到）
+        if target_version and not existing.versions.filter(pk=target_version.pk).exists():
+            existing.versions.add(target_version)
+            existing._adopt_updated = True
         return {
-            'ok': True, 'testcases': 0, 'skipped': 1, 'modules': int(created),
+            'ok': True, 'testcases': 0, 'skipped': 0,
+            'updated': 1 if changed_fields else 0, 'modules': int(created),
             'testcase_id': existing.id, 'created': False, 'title': title,
-            'detail': f'用例「{title}」已存在（跳过）',
+            'detail': (f'已更新「{title}」' if changed_fields else f'用例「{title}」内容一致（无需更新）'),
         }
 
     tc = TestCase(
         project=proto.project, title=title,
         preconditions=f['preconditions'], steps=f['steps_txt'], expected_result=f['expected'],
         priority=f['priority'], test_type=f['test_type'], description=f['description'],
-        status='draft', author=user, source='ai', sort_order=sort_order or 1,
+        status='draft', author=user, source=source or 'ai', sort_order=sort_order or 1,
         tags=list(extra_tags or []),
     )
     tc.save()
-    if proto.version_id:
-        tc.versions.add(proto.version)
+    if target_version:
+        tc.versions.add(target_version)
     try:
         tc.feature_modules.add(fm)
     except Exception:
@@ -444,6 +586,10 @@ def _sync_stage3(proto, user):
     if not proto.project_id:
         return {'modules': 0, 'testpoints': 0, 'testcases': 0}
     parent = proto.feature_module
+    target_version = _resolve_adopt_version(proto)
+    if not proto.version_id and target_version:
+        proto.version = target_version
+        proto.save(update_fields=['version'])
     modules = _extract_modules(proto.module_split)
     counts = {'modules': 0, 'testpoints': 0, 'testcases': 0}
 
@@ -470,8 +616,8 @@ def _sync_stage3(proto, user):
             project=proto.project, name=mname, parent=parent,
             defaults={'description': m.get('description') or '墨刀流程子模块', 'created_by': user},
         )
-        if proto.version_id:
-            child.versions.add(proto.version)
+        if target_version:
+            child.versions.add(target_version)
         counts['modules'] += 1
 
 
@@ -518,8 +664,8 @@ def _sync_stage3(proto, user):
                 source='ai',
             )
             tc.save()
-            if proto.version_id:
-                tc.versions.add(proto.version)
+            if target_version:
+                tc.versions.add(target_version)
             tc.feature_modules.add(child)
             counts['testcases'] += 1
 
@@ -646,7 +792,10 @@ def modao_reset(request, pk):
                         status=http_status.HTTP_409_CONFLICT)
 
     _reset_modao_workflow(proto)
-    return Response(ModaoPrototypeSerializer(proto).data)
+    data = ModaoPrototypeSerializer(proto).data
+    # 前端「用例合并采纳」隐藏已采纳行用：已入库用例的 key 集合（普通=pageId#index，冒烟=smoke#pageId#index）
+    data['adopted_keys'] = sorted(_adopted_entry_keys(proto))
+    return Response(data)
 
 
 @api_view(['POST'])
@@ -897,7 +1046,81 @@ def modao_approve_pages(request, pk):
         n = job()
     except Exception as e:
         return Response({'detail': f'采纳失败：{e}'}, status=http_status.HTTP_500_INTERNAL_ERROR)
-    return Response({'detail': f'已采纳 {n} 个画布用例，汇总已更新', 'approved_pages': n})
+    # 自愈闭环第 3 环（只读）：采纳后顺带算一次「AI 原始 vs 人工采纳」偏差概览返回给前端，
+    # **不写任何库表**。是否沉淀为知识库由人工在偏差确认页显式触发
+    # （POST /modao/<pk>/backfill-kb/）。
+    diff = {'skipped': True, 'reason': '未计算'}
+    try:
+        from apps.requirement_analysis.models import AIModelService
+        proto.refresh_from_db()
+        prev = AIModelService.preview_kb_from_adoption(proto)
+        diff = {'skipped': prev.get('skipped', True),
+                'reason': prev.get('reason', ''),
+                'diff': prev.get('diff', {}),
+                'pending_count': len(prev.get('items') or [])}
+    except Exception as e:
+        logger.warning(f'[偏差对比] proto {pk} 预览失败（不影响采纳）: {e}')
+    return Response({'detail': f'已采纳 {n} 个画布用例，汇总已更新',
+                     'approved_pages': n, 'adoption_diff': diff})
+
+
+@api_view(['GET'])
+def modao_adoption_diff(request, pk):
+    """自愈闭环第 3 环（只读）：预览「AI 原始 vs 人工采纳」的偏差。
+
+    返回已**按模块聚合整理**的候选知识条目（人工补充按模块合成"必须覆盖清单"、
+    人工改写逐条保留、未采纳按模块合成"勿再生成"负面清单），
+    人工可增删改文案后再调 backfill-kb 确认写入。
+    同时给出 missing/rewritten/redundant 计数。本接口**不写任何库表**。
+    """
+    from apps.requirement_analysis.models import AIModelService
+
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    try:
+        prev = AIModelService.preview_kb_from_adoption(proto)
+    except Exception as e:
+        logger.warning(f'[偏差对比] proto {pk} 预览失败: {e}')
+        return Response({'detail': f'偏差对比失败：{e}'},
+                        status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+    return Response(prev)
+
+
+@api_view(['POST'])
+def modao_backfill_kb(request, pk):
+    """自愈闭环第 4 环【人工触发】：把**人工整理后确认**的偏差沉淀为项目知识条目。
+
+    请求体（可选，两种方式二选一）：
+      A. {'items': [{title, content, category, ref}, ...]}  ← 前端推荐
+         人工在预览弹窗里整理/改写后的最终文案，后端按 ref 校验来源后原样写入
+      B. {'selected': {'missing': [0, 2], 'rewritten': [1], 'redundant': [0]}}
+         只沉淀勾选条目（用后端原始文案）。redundant = 人工判定无效（未采纳）
+      都不传 = 全选（用后端原始文案，脚本/批量场景）
+
+    ⚠️ 预览接口返回的是**按模块聚合整理后**的候选（不是逐条用例罗列），
+    人工可增删改文案后再确认写入；只有本接口会写库 + 同步向量库。
+    """
+    from apps.requirement_analysis.models import AIModelService
+
+    proto = get_object_or_404(ModaoPrototype, pk=pk)
+    selected = request.data.get('selected')
+    items = request.data.get('items')
+    if selected is not None and not isinstance(selected, dict):
+        return Response({'detail': 'selected 必须是 {"missing": [下标...], "rewritten": [下标...]}'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    if items is not None and not isinstance(items, list):
+        return Response({'detail': 'items 必须是 [{title, content, category, ref}, ...]'},
+                        status=http_status.HTTP_400_BAD_REQUEST)
+    try:
+        res = AIModelService.backfill_kb_from_adoption(
+            proto, user_id=request.user.id, selected=selected, items=items)
+    except Exception as e:
+        logger.warning(f'[自愈回流] proto {pk} 回流失败: {e}')
+        return Response({'detail': f'回流失败：{e}'},
+                        status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+    if res.get('skipped'):
+        return Response({'detail': res.get('reason') or '无可沉淀的偏差', **res})
+    return Response({'detail': f"已沉淀 {res.get('created_count', 0)} 条知识到项目知识库",
+                     **res})
 
 
 @api_view(['POST'])
@@ -1302,7 +1525,10 @@ def modao_detail(request, pk):
         title = proto.title
         proto.delete()
         return Response({'detail': f'已删除「{title}」'})
-    return Response(ModaoPrototypeSerializer(proto).data)
+    data = ModaoPrototypeSerializer(proto).data
+    # 前端「用例合并采纳」隐藏已采纳行用：已入库用例的 key 集合（普通=pageId#index，冒烟=smoke#pageId#index）
+    data['adopted_keys'] = sorted(_adopted_entry_keys(proto))
+    return Response(data)
 
 
 @api_view(['GET'])
@@ -1323,8 +1549,12 @@ def _adopt_to_library(proto, user, include_smoke=False):
     """
     if not proto.project_id:
         return {'ok': False, 'detail': '请先在阶段0关联项目，再采纳到用例库'}
-    counts = {'modules': 0, 'testcases': 0, 'skipped': 0, 'smoke': 0}
+    counts = {'modules': 0, 'testcases': 0, 'skipped': 0, 'updated': 0, 'smoke': 0}
     parent = proto.feature_module
+    target_version = _resolve_adopt_version(proto)
+    if not proto.version_id and target_version:
+        proto.version = target_version
+        proto.save(update_fields=['version'])
 
     def _module_of(c):
         if not isinstance(c, dict):
@@ -1340,7 +1570,24 @@ def _adopt_to_library(proto, user, include_smoke=False):
         # 幂等去重：同一项目下相同标题且已关联到该模块的用例不重复创建，返回已有对象供打标签
         existing = TestCase.objects.filter(project=proto.project, title=title, feature_modules=fm).first()
         if existing:
-            existing._adopt_existing = True  # 标记：已存在，供调用方区分新建/跳过
+            # 重复采纳 = 以最新内容覆盖更新
+            changed_fields = []
+            for field, val in (
+                ('preconditions', f['preconditions']), ('steps', f['steps_txt']),
+                ('expected_result', f['expected']), ('priority', f['priority']),
+                ('test_type', f['test_type']), ('description', f['description']),
+            ):
+                if getattr(existing, field) != val:
+                    setattr(existing, field, val)
+                    changed_fields.append(field)
+            if changed_fields:
+                existing.save(update_fields=changed_fields)
+            # 已存在用例补挂版本
+            if target_version and not existing.versions.filter(pk=target_version.pk).exists():
+                existing.versions.add(target_version)
+                existing._adopt_updated = True
+            existing._adopt_existing = True       # 供调用方区分新建/更新
+            existing._adopt_updated = bool(getattr(existing, '_adopt_updated', False) or changed_fields)
             return existing
         tc = TestCase(
             project=proto.project, title=title, preconditions=f['preconditions'],
@@ -1351,8 +1598,8 @@ def _adopt_to_library(proto, user, include_smoke=False):
             sort_order=sort_order,
         )
         tc.save()
-        if proto.version_id:
-            tc.versions.add(proto.version)
+        if target_version:
+            tc.versions.add(target_version)
         try:
             tc.feature_modules.add(fm)
         except Exception:
@@ -1375,12 +1622,15 @@ def _adopt_to_library(proto, user, include_smoke=False):
         )
         if created:
             counts['modules'] += 1
-        if proto.version_id:
-            fm.versions.add(proto.version)
+        if target_version:
+            fm.versions.add(target_version)
         tc_obj = c.get('testcase', c) if isinstance(c, dict) else c
         tc = _make_tc(tc_obj, fm, sort_order=sort_order)
         if getattr(tc, '_adopt_existing', False):
-            counts['skipped'] += 1
+            if getattr(tc, '_adopt_updated', False):
+                counts['updated'] += 1
+            else:
+                counts['skipped'] += 1
         else:
             counts['testcases'] += 1
 
@@ -1408,8 +1658,8 @@ def _adopt_to_library(proto, user, include_smoke=False):
                 project=proto.project, name=mname,
                 defaults={'description': f'墨刀流程「{proto.title}」一键采纳自动创建', 'created_by': user, 'parent': parent},
             )
-            if proto.version_id:
-                fm.versions.add(proto.version)
+            if target_version:
+                fm.versions.add(target_version)
             tc = _make_tc(tc_obj, fm, sort_order=smoke_base + smoke_idx)
             if tc:
                 # 给冒烟用例打标签（直接用刚创建的 tc 对象，避免 project/feature_modules 类型不匹配）
@@ -1446,8 +1696,10 @@ def modao_adopt(request, pk):
             'modules': counts.get('modules', 0),
             'testcases': counts.get('testcases', 0),
             'skipped': counts.get('skipped', 0),
+            'updated': counts.get('updated', 0),
             'smoke': counts.get('smoke', 0),
             'failed': counts.get('failed', 0),
+            'manual': counts.get('manual', 0),
             'project': project,
         })
 
@@ -1468,28 +1720,38 @@ def modao_adopt(request, pk):
         return f"id{ref.get('case_id')}"
 
     if edited_cases or refs:
-        counts = {'modules': 0, 'testcases': 0, 'skipped': 0, 'smoke': 0, 'failed': 0}
+        counts = {'modules': 0, 'testcases': 0, 'skipped': 0, 'updated': 0,
+                  'smoke': 0, 'failed': 0, 'manual': 0}
         handled_keys = set()
+        manual_cases = []
         for i, item in enumerate(edited_cases):
             data = dict(item)
             ref = data.pop('_ref', None)
             ref = ref if isinstance(ref, dict) else {}
             handled_keys.add(_ref_key(ref))
             is_smoke = bool(data.pop('is_smoke', False))
+            # 人工补充（无 _ref / 显式 _manual）：不是"编辑某条 AI 用例"，需并入汇总
+            is_manual = bool(data.pop('_manual', False)) or not ref
             entry = _find_case_entry(entries, ref)
             sort_order = entry['ordinal'] if entry else len(entries) + i + 1
             mname = data.get('module') or (entry['module'] if entry else '未分组')
             r = _adopt_one_case(proto, request.user, data, mname, sort_order,
-                                desc_suffix='编辑后采纳',
-                                extra_tags=['冒烟'] if is_smoke else None)
+                                desc_suffix='人工补充采纳' if is_manual else '编辑后采纳',
+                                extra_tags=['冒烟'] if is_smoke else None,
+                                source='manual' if is_manual else 'ai')
             if not r.get('ok'):
                 counts['failed'] += 1
                 continue
             counts['modules'] += r['modules']
             counts['testcases'] += r['testcases']
-            counts['skipped'] += r['skipped']
+            counts['skipped'] += r.get('skipped', 0)
+            counts['updated'] += r.get('updated', 0)
             if is_smoke:
                 counts['smoke'] += 1
+            if is_manual:
+                manual_cases.append(data)
+        if manual_cases:
+            counts['manual'] = _append_manual_cases(proto, manual_cases)
         for ref in refs:
             if _ref_key(ref) in handled_keys:
                 continue  # 该用例已按编辑后内容采纳，避免重复
@@ -1504,8 +1766,9 @@ def modao_adopt(request, pk):
                 continue
             counts['modules'] += r['modules']
             counts['testcases'] += r['testcases']
-            counts['skipped'] += r['skipped']
-        if not counts['testcases'] and not counts['skipped']:
+            counts['skipped'] += r.get('skipped', 0)
+            counts['updated'] += r.get('updated', 0)
+        if not counts['testcases'] and not counts['skipped'] and not counts['updated']:
             return Response({'detail': '未能定位到任何指定用例（请刷新页面后重试）'},
                             status=http_status.HTTP_400_BAD_REQUEST)
         return _finish(counts, '已采纳选中用例', proto.project.name if proto.project else '')
@@ -1519,6 +1782,7 @@ def modao_adopt(request, pk):
         'modules': result['counts']['modules'],
         'testcases': result['counts']['testcases'],
         'skipped': result['counts']['skipped'],
+        'updated': result['counts'].get('updated', 0),
         'smoke': result['counts']['smoke'],
         'failed': 0,
         'project': result.get('project', ''),
