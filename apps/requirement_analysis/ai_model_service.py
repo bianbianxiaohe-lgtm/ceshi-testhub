@@ -793,6 +793,16 @@ class AIModelService:
             raise Exception(
                 f"{provider_name}({config.model_name}) API请求超时，请稍后再试或检查网络连接"
             )
+        except asyncio.CancelledError:
+            # 任务被外部取消：最常见是上层 asyncio.wait_for 超时触发，或整个生成被用户/请求中止。
+            # 必须原样上抛，绝不能包成普通 Exception —— 否则会：
+            #   1) 污染错误语义（把"调用超时/被取消"伪装成"API 调用失败"）；
+            #   2) 破坏 asyncio.wait_for 的超时→TimeoutError 转换（wait_for 取消内部协程后，
+            #      若内部把 CancelledError 吞掉并改抛别的异常，wait_for 就无法干净地转成 TimeoutError）；
+            #   3) 阻止整个生成任务被真正取消（用户点了停止却因取消被吞而挂死）。
+            # Python 3.12 的 wait_for 在超时取消后会将 CancelledError 规范化为 asyncio.TimeoutError，
+            # 这样上层 _llm 的 `except asyncio.TimeoutError` 与 run_design_phase1 的降级逻辑才能正确工作。
+            raise
         except BaseException as e:
             provider_name = config.get_model_type_display()
             # Use repr(e) to capture the full exception type and message, especially if str(e) is empty

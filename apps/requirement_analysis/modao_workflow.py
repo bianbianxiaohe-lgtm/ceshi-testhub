@@ -558,9 +558,13 @@ class ModaoWorkflow:
         return analyzer, writer, embedder
 
     # ---------- LLM / 向量 基础 ----------
-    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 300, temperature: float = None, return_meta: bool = False):
+    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 600, temperature: float = None, return_meta: bool = False):
         """调用 LLM。带超时保护：单条调用超过 timeout 秒即抛 asyncio.TimeoutError，
         由上层（run_design_phase1 模块级 try/except）捕获并降级，避免窗口永久卡死。
+
+        timeout 默认 600s：阶段1 结构化分析（analyzer=DeepSeek deepseek-chat）在大型原型上
+        单页 prompt 可达数万字符，供应商偶发慢响应（瞬时繁忙）会在 300s 内无返回而被误杀，
+        加长到 600s 可覆盖"慢但能返回"的正常情况，仅真正卡死才超时降级。
 
         temperature: None=沿用config.temperature, 0=确定性输出(推荐用于结构化生成)。
         return_meta: True 时返回 dict(content, finish_reason)，便于上层检测 max_tokens 截断；
