@@ -742,64 +742,88 @@ class AIModelService:
         logger.info(f"模型名称: {config.model_name}")
         logger.info(f"请求参数: max_tokens={actual_max_tokens}, temperature={config.temperature}, top_p={config.top_p}")
 
-        try:
-            # 增加HTTP超时时间到900秒（15分钟），支持大文档生成
-            # 禁用HTTP/2，使用HTTP/1.1以提高兼容性
-            # 显式设置所有超时参数，避免默认的连接超时导致请求失败
-            # 若调用方显式传了 timeout（如覆盖率分析辅助判断），则用它覆盖读取超时
-            read_timeout = timeout if timeout is not None else 900.0
-            timeout_config = httpx.Timeout(
-                connect=60.0,      # 连接超时：60秒
-                read=read_timeout, # 读取超时：默认900秒（15分钟），可被调用方覆盖
-                write=60.0,        # 写入超时：60秒
-                pool=60.0          # 连接池超时：60秒
-            )
-            async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
-                logger.info(f"发送POST请求到: {url}")
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json=data
+        provider_name = config.get_model_type_display()
+        max_retries = 3
+        retry_delays = [2, 5, 10]
+        # 增加HTTP超时时间到900秒（15分钟），支持大文档生成
+        # 禁用HTTP/2，使用HTTP/1.1以提高兼容性
+        # 显式设置所有超时参数，避免默认的连接超时导致请求失败
+        # 若调用方显式传了 timeout（如覆盖率分析辅助判断），则用它覆盖读取超时
+        read_timeout = timeout if timeout is not None else 900.0
+        timeout_config = httpx.Timeout(
+            connect=60.0,      # 连接超时：60秒
+            read=read_timeout, # 读取超时：默认900秒（15分钟），可被调用方覆盖
+            write=60.0,        # 写入超时：60秒
+            pool=60.0          # 连接池超时：60秒
+        )
+
+        for attempt in range(max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
+                    if attempt > 0:
+                        logger.info(f"第 {attempt}/{max_retries} 次重试发送POST请求到: {url}")
+                    else:
+                        logger.info(f"发送POST请求到: {url}")
+                    response = await client.post(
+                        url,
+                        headers=headers,
+                        json=data
+                    )
+
+                    logger.info(f"收到响应: status_code={response.status_code}")
+
+                    if response.status_code in (429, 502, 503, 504) and attempt < max_retries:
+                        delay = retry_delays[attempt]
+                        logger.warning(
+                            f"{provider_name}({config.model_name}) 遇到临时服务状态 {response.status_code}，"
+                            f"将在 {delay} 秒后进行第 {attempt+1}/{max_retries} 次重试..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        logger.error(f"API调用返回错误: Status={response.status_code}, Body={error_detail}")
+
+                    response.raise_for_status()
+                    result = response.json()
+                    # 兼容推理模型（如 DeepSeek deepseek-v4-pro）：正文可能在 reasoning_content，content 为空
+                    try:
+                        _message = result['choices'][0].get('message') or {}
+                        if not _message.get('content') and _message.get('reasoning_content'):
+                            _message['content'] = _message['reasoning_content']
+                    except Exception:
+                        pass
+                    logger.info(f"API调用成功，响应内容: {str(result)[:200]}...")
+                    return result
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.NetworkError) as e:
+                if attempt < max_retries:
+                    delay = retry_delays[attempt]
+                    logger.warning(
+                        f"{provider_name}({config.model_name}) 网络连接抖动/中断: {repr(e)}，"
+                        f"将在 {delay} 秒后进行第 {attempt+1}/{max_retries} 次重试..."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(f"{provider_name}({config.model_name}) 已重试 {max_retries} 次仍网络失败: {repr(e)}")
+                raise Exception(f"{provider_name}({config.model_name}) 网络连接失败（已重试{max_retries}次）: {repr(e)}")
+            except httpx.HTTPStatusError as e:
+                error_msg = (
+                    f"{provider_name}({config.model_name}) API返回错误 "
+                    f"{e.response.status_code}: {e.response.text}"
                 )
-
-                logger.info(f"收到响应: status_code={response.status_code}")
-
-                if response.status_code != 200:
-                    error_detail = response.text
-                    logger.error(f"API调用返回错误: Status={response.status_code}, Body={error_detail}")
-
-                response.raise_for_status()
-                result = response.json()
-                # 兼容推理模型（如 DeepSeek deepseek-v4-pro）：正文可能在 reasoning_content，content 为空
-                try:
-                    _message = result['choices'][0].get('message') or {}
-                    if not _message.get('content') and _message.get('reasoning_content'):
-                        _message['content'] = _message['reasoning_content']
-                except Exception:
-                    pass
-                logger.info(f"API调用成功，响应内容: {str(result)[:200]}...")
-                return result
-        except httpx.HTTPStatusError as e:
-            provider_name = config.get_model_type_display()
-            error_msg = (
-                f"{provider_name}({config.model_name}) API返回错误 "
-                f"{e.response.status_code}: {e.response.text}"
-            )
-            logger.error(error_msg)
-            raise Exception(error_msg)
-        except httpx.TimeoutException as e:
-            provider_name = config.get_model_type_display()
-            logger.error(f"{provider_name}({config.model_name}) API请求超时: {repr(e)}")
-            raise Exception(
-                f"{provider_name}({config.model_name}) API请求超时，请稍后再试或检查网络连接"
-            )
-        except BaseException as e:
-            provider_name = config.get_model_type_display()
-            # Use repr(e) to capture the full exception type and message, especially if str(e) is empty
-            logger.error(f"{provider_name}({config.model_name}) API调用失败: {repr(e)}")
-            raise Exception(
-                f"{provider_name}({config.model_name}) API调用失败: {str(e) or repr(e)}"
-            )
+                logger.error(error_msg)
+                raise Exception(error_msg)
+            except httpx.TimeoutException as e:
+                logger.error(f"{provider_name}({config.model_name}) API请求超时: {repr(e)}")
+                raise Exception(
+                    f"{provider_name}({config.model_name}) API请求超时，请稍后再试或检查网络连接"
+                )
+            except BaseException as e:
+                logger.error(f"{provider_name}({config.model_name}) API调用失败: {repr(e)}")
+                raise Exception(
+                    f"{provider_name}({config.model_name}) API调用失败: {str(e) or repr(e)}"
+                )
     
     @staticmethod
     async def embed_texts(config: AIModelConfig, texts: List[str]) -> List[List[float]]:

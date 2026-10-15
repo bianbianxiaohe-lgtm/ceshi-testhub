@@ -5,12 +5,22 @@
         <b>{{ icon }} {{ title }}</b>
         <div class="ac-actions">
           <template v-if="!editing">
-            <span v-if="itemCount" class="ac-count">{{ itemCount }} 条</span>
+            <!-- 需求结构化视图切换（可视化 vs YAML 原文） -->
+            <el-radio-group
+              v-if="isSummary && rawText"
+              v-model="summaryViewMode"
+              size="small"
+              class="ac-view-toggle"
+            >
+              <el-radio-button label="visual">👁️ 可视化</el-radio-button>
+              <el-radio-button label="raw">📜 YAML</el-radio-button>
+            </el-radio-group>
+            <span v-if="itemCount" class="ac-count">{{ itemCount }} {{ isSummary ? '个模块' : '条' }}</span>
             <el-button size="small" type="primary" plain @click="startEdit">✏️ 编辑</el-button>
           </template>
           <template v-else>
             <el-button size="small" @click="cancelEdit">取消</el-button>
-            <el-button v-if="isJson" size="small" @click="formatDraft">格式化</el-button>
+            <el-button v-if="isJson || isSummary" size="small" @click="formatDraft">格式化</el-button>
             <el-button size="small" type="primary" :loading="saving" @click="saveDraft">💾 保存</el-button>
           </template>
         </div>
@@ -21,6 +31,8 @@
     <div v-if="editing" class="ac-edit">
       <el-alert v-if="!jsonValid" type="error" :closable="false" show-icon
         title="当前内容不是合法 JSON，保存会被后端拒绝" />
+      <el-alert v-if="!yamlValid" type="error" :closable="false" show-icon
+        title="当前内容不是合法 YAML，保存后可能导致后续分析无法识别" />
       <div class="ac-tip">
         编辑的是<b>本画布</b>的产物；保存后任务级合并视图会自动重算。
       </div>
@@ -59,6 +71,11 @@
         <el-button size="small" type="primary" :loading="saving" class="ci-save" @click="saveClarify">💾 保存全部结论</el-button>
       </template>
       <el-empty v-else description="暂无澄清项（已确认无需澄清或已删除）" :image-size="60" />
+    </div>
+
+    <!-- 需求结构化可视化卡片视图 -->
+    <div v-else-if="isSummary && summaryViewMode === 'visual'" class="ac-summary-visual">
+      <RequirementSummaryViewer :raw="rawText" />
     </div>
 
     <!-- 结构化卡片视图（测试点 / 用例 / 冒烟 / 其它 JSON） -->
@@ -106,6 +123,8 @@
 
 <script>
 import request from '@/utils/api'
+import { load as yamlLoad, dump as yamlDump } from 'js-yaml'
+import RequirementSummaryViewer from './RequirementSummaryViewer.vue'
 
 /** 字段名 → 中文标签（未命中的字段直接显示原名） */
 const FIELD_LABELS = {
@@ -126,6 +145,9 @@ const MAX_STRUCTURED_ITEMS = 60
 
 export default {
   name: 'CanvasArtifactCard',
+  components: {
+    RequirementSummaryViewer,
+  },
   props: {
     /** 卡片标题 */
     title: { type: String, required: true },
@@ -146,6 +168,7 @@ export default {
       saving: false,
       clarifyItems: [],
       clarifyReplies: [],
+      summaryViewMode: 'visual',
     }
   },
   computed: {
@@ -155,11 +178,39 @@ export default {
     isJson() {
       return String(this.field).endsWith('_json')
     },
+    isSummary() {
+      return this.field === 'page_summary' || this.field === 'requirement_summary' || this.kind === 'summary'
+    },
     jsonValid() {
       if (!this.isJson) return true
       const t = (this.draft || '').trim()
       if (!t) return true
       try { JSON.parse(t); return true } catch (e) { return false }
+    },
+    yamlValid() {
+      if (!this.isSummary) return true
+      const t = (this.draft || '').trim()
+      if (!t) return true
+      try {
+        let clean = t
+        const m = clean.match(/^```(?:yaml|yml)?\s*[\r\n]+([\s\S]*?)(?:[\r\n]+```|$)/i)
+        if (m) clean = m[1].trim()
+        yamlLoad(clean)
+        return true
+      } catch (e) {
+        return false
+      }
+    },
+    summaryModulesCount() {
+      if (!this.isSummary || !this.rawText) return 0
+      try {
+        let clean = this.rawText.trim()
+        const m = clean.match(/^```(?:yaml|yml)?\s*[\r\n]+([\s\S]*?)(?:[\r\n]+```|$)/i)
+        if (m) clean = m[1].trim()
+        const obj = yamlLoad(clean)
+        if (obj && Array.isArray(obj.modules)) return obj.modules.length
+      } catch (e) {}
+      return 0
     },
     /** 解析出的 JSON 数组（用于条数统计与结构化展示） */
     parsedArray() {
@@ -174,12 +225,13 @@ export default {
       return []
     },
     structuredItems() {
-      if (this.kind === 'clarify') return []
+      if (this.kind === 'clarify' || this.isSummary) return []
       return this.parsedArray.filter(x => x && typeof x === 'object')
         .slice(0, MAX_STRUCTURED_ITEMS)
     },
     itemCount() {
       if (this.kind === 'clarify') return this.clarifyItems.length
+      if (this.isSummary) return this.summaryModulesCount
       return this.parsedArray.length
     },
   },
@@ -280,6 +332,19 @@ export default {
       this.draft = ''
     },
     formatDraft() {
+      if (this.isSummary) {
+        try {
+          let clean = this.draft.trim()
+          const m = clean.match(/^```(?:yaml|yml)?\s*[\r\n]+([\s\S]*?)(?:[\r\n]+```|$)/i)
+          if (m) clean = m[1].trim()
+          const obj = yamlLoad(clean)
+          this.draft = yamlDump(obj, { indent: 2 })
+          this.$message.success('YAML 已格式化')
+        } catch (e) {
+          this.$message.warning('无法格式化：当前内容不是合法 YAML')
+        }
+        return
+      }
       try {
         this.draft = JSON.stringify(JSON.parse(this.draft), null, 2)
       } catch (e) {
@@ -289,6 +354,10 @@ export default {
     saveDraft() {
       if (!this.jsonValid) {
         this.$message.error('内容不是合法 JSON，请先修正')
+        return
+      }
+      if (!this.yamlValid) {
+        this.$message.error('内容不是合法 YAML，请先修正')
         return
       }
       this.saveValue(this.draft).then(ok => { if (ok) this.editing = false })
@@ -426,7 +495,13 @@ export default {
     display: flex;
     align-items: center;
     gap: 8px;
+    .ac-view-toggle {
+      margin-right: 4px;
+    }
     .ac-count { color: #909399; font-size: 12px; }
+  }
+  .ac-summary-visual {
+    width: 100%;
   }
   .ac-edit {
     .ac-tip { font-size: 12px; color: #909399; margin: 8px 0; }

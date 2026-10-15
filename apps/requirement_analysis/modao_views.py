@@ -530,6 +530,10 @@ def _run_in_thread(proto, target):
     """在守护线程中执行阶段任务，异常写入 prototype.error_message。"""
     def wrapper():
         try:
+            proto.refresh_from_db()
+            if proto.error_message:
+                proto.error_message = ''
+                proto.save(update_fields=['error_message'])
             target()
         except Exception as e:
             try:
