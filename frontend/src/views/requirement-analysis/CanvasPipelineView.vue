@@ -163,8 +163,8 @@ export default {
         0: { label: '待读取', type: 'info' },
         1: { label: '已结构化', type: 'success' },
         2: { label: '已澄清', type: 'success' },
-        3: { label: '已生成用例', type: 'success' },
-        4: { label: '已冒烟', type: 'success' },
+        3: { label: '已生成测试点', type: 'success' },
+        4: { label: '已冒烟决策', type: 'success' },
       }
       return map[stage] || { label: '阶段' + stage, type: 'info' }
     },

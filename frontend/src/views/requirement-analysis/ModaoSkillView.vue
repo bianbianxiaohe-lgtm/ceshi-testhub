@@ -1139,7 +1139,7 @@ export default {
     // ---------- A2-b 画布级进度展示与回退 ----------
     canvasStageLabel(c) {
       const st = c.current_stage || 0
-      const labels = ['待读取', '已结构化', '已澄清', '已生成用例', '已冒烟决策']
+      const labels = ['待读取', '已结构化', '已澄清', '已生成测试点', '已冒烟决策']
       let label = labels[st] || '待读取'
       if (c.stage_status === 'needs_rerun') label = '需重跑·' + label
       if (c.stage_status === 'failed') label = '失败·' + label
