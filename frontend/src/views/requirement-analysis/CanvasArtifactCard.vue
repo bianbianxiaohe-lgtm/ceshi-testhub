@@ -274,6 +274,15 @@ export default {
           if (Array.isArray(v) && v.length) return v
         } catch (e) { /* noop */ }
       }
+      // 容错兜底：若 JSON 列表被截断（末尾缺少 ]），尝试截取至最后一个完整对象的 '}' 并闭合
+      const lastBrace = text.lastIndexOf('}')
+      const firstBracket = text.indexOf('[')
+      if (firstBracket !== -1 && lastBrace > firstBracket) {
+        try {
+          const salvaged = JSON.parse(text.slice(firstBracket, lastBrace + 1) + '\n]')
+          if (Array.isArray(salvaged) && salvaged.length) return salvaged
+        } catch (e) { /* noop */ }
+      }
       return []
     },
     /** 把新数组文本写回原文：纯 JSON 整体替换；markdown 包裹时只替换其中的 JSON 片段 */
