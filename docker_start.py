@@ -240,6 +240,8 @@ for col, ddl in (
     ('folder', "ALTER TABLE modao_page ADD COLUMN folder VARCHAR(500) NOT NULL DEFAULT ''"),
     # 画布父级分组（2026-09-17 新增，用于层级展示）
     ('parent_name', "ALTER TABLE modao_page ADD COLUMN parent_name VARCHAR(200) NOT NULL DEFAULT ''"),
+    # 自愈闭环(P0)：画布级 AI 原始用例快照，run_design_phase2 写入后不再随人工编辑变化。
+    ('page_ai_testcases_json', "ALTER TABLE modao_page ADD COLUMN page_ai_testcases_json LONGTEXT NOT NULL"),
 ):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
@@ -309,7 +311,7 @@ for col in ('feature_module_id', 'version_id'):
         print(f'{col} already exists')
 
 # 确保 modao_prototype 有汇总采纳字段（A2-c：已采纳画布用例合并视图）
-for col in ('merged_testcases_json', 'merged_smoke_json'):
+for col in ('merged_testcases_json', 'merged_smoke_json', 'ai_testcases_json'):
     cur.execute(
         "SELECT 1 FROM information_schema.columns "
         "WHERE table_schema = DATABASE() AND table_name = 'modao_prototype' AND column_name = %s",

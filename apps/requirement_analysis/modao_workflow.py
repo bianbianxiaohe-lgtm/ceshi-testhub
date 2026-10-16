@@ -558,9 +558,13 @@ class ModaoWorkflow:
         return analyzer, writer, embedder
 
     # ---------- LLM / 向量 基础 ----------
-    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 300, temperature: float = None, return_meta: bool = False):
+    def _llm(self, config, prompt: str, max_tokens: int = 8000, timeout: int = 600, temperature: float = None, return_meta: bool = False):
         """调用 LLM。带超时保护：单条调用超过 timeout 秒即抛 asyncio.TimeoutError，
         由上层（run_design_phase1 模块级 try/except）捕获并降级，避免窗口永久卡死。
+
+        timeout 默认 600s：阶段1 结构化分析（analyzer=DeepSeek deepseek-chat）在大型原型上
+        单页 prompt 可达数万字符，供应商偶发慢响应（瞬时繁忙）会在 300s 内无返回而被误杀，
+        加长到 600s 可覆盖"慢但能返回"的正常情况，仅真正卡死才超时降级。
 
         temperature: None=沿用config.temperature, 0=确定性输出(推荐用于结构化生成)。
         return_meta: True 时返回 dict(content, finish_reason)，便于上层检测 max_tokens 截断；
@@ -2325,6 +2329,16 @@ class ModaoWorkflow:
         cases, smoke = self._merge_page_testcases()
         self.prototype.testcases_json = json.dumps(cases, ensure_ascii=False)
         self.prototype.smoke_json = json.dumps(smoke, ensure_ascii=False) if smoke else self.prototype.smoke_json
+        # 自愈闭环(P0)：聚合各画布 AI 原始快照为任务级快照（此时人工尚未编辑，内容即 AI 首版）
+        ai_agg = []
+        for _p in pages:
+            try:
+                _ai = json.loads(_p.page_ai_testcases_json or '[]')
+            except Exception:
+                _ai = []
+            if isinstance(_ai, list):
+                ai_agg.extend(_ai)
+        self.prototype.ai_testcases_json = json.dumps(ai_agg, ensure_ascii=False)
         self.prototype.status = 'done'
         self.prototype.current_stage = 3
         self.prototype.save()
@@ -2359,11 +2373,27 @@ class ModaoWorkflow:
         self.merge_approved()
         return n
 
+    @staticmethod
+    def _case_dedup_key(c):
+        """(title, module) 去重键，用于人工补充用例的幂等合并。"""
+        if not isinstance(c, dict):
+            return None
+        inner = c.get('testcase', c)
+        inner = inner if isinstance(inner, dict) else c
+        return (str(inner.get('title') or '').strip(),
+                str(c.get('module') or inner.get('module') or '').strip())
+
     def merge_approved(self):
         """把所有 page_approved=True 的画布用例合并去重，写入全局 merged_testcases_json / merged_smoke_json。"""
         approved = list(self.prototype.pages.filter(page_approved=True))
         merged_cases, merged_smoke = [], []
         # 跨画布向量去重：复用 _vector_dedup（按标题/描述语义去重）
+        def _case_inner(c):
+            """用例可能是 {testcase:{...}, module, _raw} 嵌套结构，统一展开取真实用例体。"""
+            if not isinstance(c, dict):
+                return {}
+            inner = c.get('testcase', c)
+            return inner if isinstance(inner, dict) else c
         all_for_dedup = []
         for p in approved:
             try:
@@ -2374,11 +2404,12 @@ class ModaoWorkflow:
                 continue
             for c in cs:
                 if isinstance(c, dict):
+                    inner = _case_inner(c)
                     all_for_dedup.append({
-                        'id': c.get('id') or f"{p.page_name}-{len(all_for_dedup)}",
-                        'title': c.get('title', ''),
-                        'description': c.get('description', ''),
-                        'priority': c.get('priority', 'P1'),
+                        'id': inner.get('id') or c.get('id') or f"{p.page_name}-{len(all_for_dedup)}",
+                        'title': inner.get('title') or '',
+                        'description': inner.get('description') or '',
+                        'priority': inner.get('priority', c.get('priority', 'P1')),
                         'source': ['page', p.page_name],
                         '_page': p.page_name,
                     })
@@ -2397,7 +2428,10 @@ class ModaoWorkflow:
                 cs = []
             match = None
             for c in cs:
-                if isinstance(c, dict) and c.get('title') == d.get('title') and c.get('description') == d.get('description'):
+                if not isinstance(c, dict):
+                    continue
+                inner = _case_inner(c)
+                if (inner.get('title') or '') == (d.get('title') or '') and (inner.get('description') or '') == (d.get('description') or ''):
                     match = c
                     break
             if match:
@@ -2409,6 +2443,22 @@ class ModaoWorkflow:
                 sj = {}
             if isinstance(sj, dict) and sj.get('smoke_testcases'):
                 merged_smoke.extend(sj['smoke_testcases'])
+        # 保留「人工补充」用例（_manual=True）：否则重新汇总会把人工新增的用例冲掉，
+        # 偏差对比就永远看不到人工补充，自愈闭环断在第 2 环。
+        try:
+            prev = json.loads(self.prototype.merged_testcases_json or '[]')
+        except Exception:
+            prev = []
+        if isinstance(prev, list):
+            base_keys = {self._case_dedup_key(c) for c in merged_cases}
+            for c in prev:
+                if not (isinstance(c, dict) and c.get('_manual')):
+                    continue
+                k = self._case_dedup_key(c)
+                if k is None or k in base_keys:
+                    continue  # 画布里已有同名同模块用例，不重复并入
+                base_keys.add(k)
+                merged_cases.append(c)
         self.prototype.merged_testcases_json = json.dumps(merged_cases, ensure_ascii=False)
         self.prototype.merged_smoke_json = json.dumps({'smoke_testcases': merged_smoke}, ensure_ascii=False) if merged_smoke else ''
         self.prototype.save(update_fields=['merged_testcases_json', 'merged_smoke_json'])
@@ -2817,6 +2867,9 @@ class ModaoWorkflow:
                         'description': t.get('description', ''),
                         'priority': t.get('priority', 'P1'),
                         'source': t.get('source', ['draft']),
+                        # 透传 p2 生成的功能级判据：此前该字段在此处被静默丢弃，
+                        # 导致 p7/p3 只能自行编造断言，最终回退为「页面展示正常」类兜底句。
+                        'pass_criteria': t.get('pass_criteria') or '',
                     })
                 self._log(f'  模块[{mod_name}] 合并前：{len(draft_tps)} draft + {len(risk_ext)} risk = {len(combined)}')
                 deduped, dedup_count, audit = self._vector_dedup(combined)
@@ -3233,9 +3286,10 @@ class ModaoWorkflow:
                     case_prompt = (render_prompt(P3_CASE_GEN,
                                                  test_point_yaml=json.dumps(batch_tps, ensure_ascii=False),
                                                  module_context=mod_ctx)
-                                   + "\n\n### 附加指令\n请为上面列出的【每一条】最终测试点生成一条结构化测试用例，"
-                                     "以 YAML 列表返回，列表项为 `testcase:` 字典（字段同 p3 输出规范）。"
-                                   + self._kb_suffix(query_hint=mod_name))
+                                  + "\n\n### 附加指令\n请为上面列出的【每一条】最终测试点生成一条结构化测试用例，"
+                                    "以 YAML 列表返回，列表项为 `testcase:` 字典（字段同 p3 输出规范）。"
+                                    "每条用例必须额外携带 `testpoint` 字段，值为该用例来源测试点的 title（原样照抄，便于追溯）。"
+                                  + self._kb_suffix(query_hint=mod_name))
                     if confirmed_ctx:
                         case_prompt += (
                             "\n\n### 已确认的待确认问题答案与风险处置结论（人工已确认，请务必作为用例设计依据）\n"
@@ -3301,7 +3355,9 @@ class ModaoWorkflow:
         all_cases = flat_cases
         if page is not None:
             page.page_testcases_json = json.dumps(all_cases, ensure_ascii=False)
-            page.save(update_fields=['page_testcases_json'])
+            # 自愈闭环(P0)：快照 AI 原始用例（人工编辑前一次性写入，此后不随人工修改变化）
+            page.page_ai_testcases_json = json.dumps(all_cases, ensure_ascii=False)
+            page.save(update_fields=['page_testcases_json', 'page_ai_testcases_json'])
         else:
             self.prototype.testcases_json = json.dumps(all_cases, ensure_ascii=False)
         self._log(f'3.4 用例生成完成，共 {len(all_cases)} 条用例')

@@ -1,6 +1,7 @@
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 from django.db import models
@@ -12,6 +13,8 @@ from .serializers import (
 )
 from apps.projects.models import Project
 from apps.core.mixins import ProjectScopedMixin
+
+
 
 class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
     queryset = TestCase.objects.all()
@@ -37,10 +40,20 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
         if version:
             qs = qs.filter(versions__id=version)
         
-        # 功能模块筛选
+        # 功能模块筛选（含子孙模块：按父模块筛选时也能查到其下子模块的用例）
         feature_module = self.request.query_params.get('feature_module', None)
         if feature_module:
-            qs = qs.filter(feature_modules__id=feature_module)
+            from apps.feature_modules.models import FeatureModule as _FM
+            fm_ids = {int(feature_module)}
+            # 递归收集所有子孙模块 id
+            stack = [int(feature_module)]
+            while stack:
+                pid = stack.pop()
+                for cid in _FM.objects.filter(parent_id=pid).values_list('id', flat=True):
+                    if cid not in fm_ids:
+                        fm_ids.add(cid)
+                        stack.append(cid)
+            qs = qs.filter(feature_modules__id__in=fm_ids)
         
         # 测试点筛选
         test_point = self.request.query_params.get('test_point', None)
@@ -166,3 +179,134 @@ class TestCaseExecutionListView(generics.ListAPIView):
         return TestCaseExecution.objects.filter(
             testcase_id=testcase_id
         ).select_related('executed_by').order_by('-executed_at')
+
+
+class TestCaseImportView(ProjectScopedMixin, APIView):
+    """
+    批量导入测试用例（Excel 经前端解析后传 JSON 数组）。
+
+    强制要求：
+      - project_id（所属项目）：必填，且用户需有该项目的写入权限
+      - version_ids（关联版本）：必填且至少 1 个，且必须全部归属于所选项目
+    这两个值会应用到文件中的每一条用例；文件内的"关联项目 / 关联版本"列被忽略。
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    # 中文显示值 → 模型 code 的双向映射（同时接受中文与英文）
+    PRIORITY_MAP = {
+        '低': 'low', '中': 'medium', '高': 'high', '紧急': 'critical',
+        'low': 'low', 'medium': 'medium', 'high': 'high', 'critical': 'critical',
+    }
+    STATUS_MAP = {
+        '草稿': 'draft', '激活': 'active', '废弃': 'deprecated',
+        'draft': 'draft', 'active': 'active', 'deprecated': 'deprecated',
+    }
+    TYPE_MAP = {
+        '功能测试': 'functional', '集成测试': 'integration', 'API测试': 'api',
+        'UI测试': 'ui', '性能测试': 'performance', '安全测试': 'security',
+        'functional': 'functional', 'integration': 'integration', 'api': 'api',
+        'ui': 'ui', 'performance': 'performance', 'security': 'security',
+    }
+
+    def _norm_list(self, value):
+        """将 '、' 或 ',' 分隔的字符串 / 列表统一为字符串列表。"""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return [v.strip() for v in str(value).replace('、', ',').split(',') if v.strip()]
+
+    def post(self, request):
+        project_id = request.data.get('project_id')
+        version_ids = request.data.get('version_ids') or []
+        cases = request.data.get('cases') or []
+
+        if not project_id:
+            return Response({'error': '必须选择所属项目'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(version_ids, list) or len(version_ids) == 0:
+            return Response({'error': '必须至少选择一个关联版本'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(cases, list) or len(cases) == 0:
+            return Response({'error': '没有可导入的用例数据，请先上传包含用例的 Excel'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 校验项目写入权限
+        accessible = self.get_accessible_projects()
+        try:
+            project = accessible.get(id=project_id)
+        except Project.DoesNotExist:
+            return Response({'error': '项目不存在，或你没有该项目的写入权限'}, status=status.HTTP_403_FORBIDDEN)
+
+        # 校验版本归属该项目
+        from apps.versions.models import Version
+        versions = list(Version.objects.filter(id__in=version_ids, projects=project))
+        found_ids = {v.id for v in versions}
+        invalid = [vid for vid in version_ids if vid not in found_ids]
+        if invalid:
+            return Response(
+                {'error': f'以下版本不存在或未关联到所选项目：{invalid}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        created = 0
+        errors = []
+        from apps.feature_modules.models import FeatureModule, TestPoint
+
+        for idx, item in enumerate(cases, start=1):
+            title = (item.get('title') or '').strip()
+            expected = (item.get('expected_result') or item.get('expectedResult') or '').strip()
+            if not title:
+                errors.append({'row': idx, 'error': '用例标题不能为空'})
+                continue
+            if not expected:
+                errors.append({'row': idx, 'error': '预期结果不能为空'})
+                continue
+
+            priority = self.PRIORITY_MAP.get((item.get('priority') or '').strip(), 'medium')
+            st = self.STATUS_MAP.get((item.get('status') or '').strip(), 'draft')
+            ttype = self.TYPE_MAP.get(
+                (item.get('test_type') or item.get('testType') or '').strip(), 'functional'
+            )
+            tags = self._norm_list(item.get('tags'))
+
+            tc = TestCase.objects.create(
+                project=project,
+                title=title,
+                description=(item.get('description') or '').strip(),
+                preconditions=(item.get('preconditions') or '').strip(),
+                steps=(item.get('steps') or '').strip(),
+                expected_result=expected,
+                priority=priority,
+                status=st,
+                test_type=ttype,
+                source='manual',
+                tags=tags,
+                author=user,
+            )
+            tc.versions.set(versions)
+
+            # 按名称解析功能模块 / 测试点（best-effort，找不到则跳过，不阻断导入）
+            fm_names = self._norm_list(item.get('feature_modules') or item.get('featureModules'))
+            fm_ids = []
+            if fm_names:
+                for name in fm_names:
+                    fm = FeatureModule.objects.filter(project=project, name=name).first()
+                    if fm:
+                        fm_ids.append(fm.id)
+                if fm_ids:
+                    tc.feature_modules.set(fm_ids)
+
+            tp_name = (item.get('test_point') or item.get('testPoint') or '').strip()
+            if tp_name and fm_ids:
+                tp = TestPoint.objects.filter(feature_module_id__in=fm_ids, name=tp_name).first()
+                if tp:
+                    tc.test_point = tp
+                    tc.save(update_fields=['test_point'])
+
+            created += 1
+
+        return Response({
+            'message': f'成功导入 {created} 条测试用例' + (f'，{len(errors)} 条因数据不完整被跳过' if errors else ''),
+            'created': created,
+            'failed': len(errors),
+            'errors': errors[:50],
+        })

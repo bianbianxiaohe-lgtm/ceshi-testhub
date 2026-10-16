@@ -38,6 +38,13 @@ Say "baseline_exit=$LASTEXITCODE"
 Say '--- baseline md5 (2026-10-13 prompt + zentao coverage fix) ---'
 docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
 
+Say '--- baseline md5 (2026-10-14 modao p2/p3/p7 prompt) ---'
+docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md
+Say '--- baseline md5 (2026-10-15 modao p0 底模降噪 prompt) ---'
+docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md
+Say '--- baseline anchors (old fallback sentence should be 1 before sync; new dimension 0) ---'
+docker exec testhub-backend sh -c "grep -c '历史缺陷高发维度' /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md"
+
 Say '--- recent modao tasks ---'
 docker exec testhub-backend python -c "import os,sys,django;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');django.setup();from apps.requirement_analysis.models import ModaoPrototype;print(ModaoPrototype.objects.filter(status__in=['running','processing','extracting']).count());print(list(ModaoPrototype.objects.order_by('-id').values_list('id','status','current_stage')[:3]))"
 
@@ -86,6 +93,14 @@ $code = curl.exe -s -o NUL -w '%{http_code}' http://localhost:8000/api/
 Say "GET /api/ -> $code   (expect 404 = healthy, 000 = process dead)"
 if ($code -ne '404') { Fail "health check returned $code" }
 
+# 2026-10-15: drf-spectacular generates the whole schema eagerly, so ANY bad
+# filterset_fields/filterset_class makes /api/schema/ return 500 (the real bug we hit:
+# PageObjectViewSet declared a non-existent 'execution_mode'). Health check alone
+# cannot catch it -> check the schema endpoint too.
+$schCode = curl.exe -s -o NUL -w '%{http_code}' --max-time 120 http://localhost:8000/api/schema/
+Say "GET /api/schema/ -> $schCode   (expect 200; 500 = some ViewSet declares a bad filter field)"
+if ($schCode -ne '200') { Fail "Swagger schema returned $schCode" }
+
 Say '--- modao_workflow.py ---'
 docker exec testhub-backend md5sum /app/apps/requirement_analysis/modao_workflow.py
 docker exec testhub-backend wc -l /app/apps/requirement_analysis/modao_workflow.py
@@ -111,7 +126,7 @@ docker exec testhub-backend ls -la /app/apps/ui_automation/migrations/0015_aiexe
 $roles = curl.exe -s -o NUL -w '%{http_code}' http://localhost:8000/api/projects/roles/
 Say "GET /api/projects/roles/ -> $roles   (expect 401 = route exists, 404 = still old code)"
 
-Say '=== STEP 5 verify 2026-10-13 prompt + zentao coverage fix ==='
+Say '=== STEP 5 verify prompts + zentao coverage fix (md5 expectation table) ==='
 # Expected md5 = host files via: Get-FileHash <file> -Algorithm MD5
 # If a host file changes on purpose, update the hash below in the same commit.
 $Expect = @{
@@ -119,9 +134,27 @@ $Expect = @{
   '/app/tester_pro.md'                                                    = '147696BB6324666F7005FB50971AB56D';
   '/app/apps/requirement_analysis/independent_skill/prompts/tester.md'     = 'ABFDD8548E5B852C3143F844EED62764';
   '/app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md' = 'FAF9D37D6361CD1A7C1F9089A40A433E';
-  '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61'
+  '/app/apps/zentao/services.py'                                          = '7FBAD39D20E81331E890FCC63F3A5E61';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md' = '2A183D64FEE02FE01ECB6C3C3A877759';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md'      = '6596C958C826F7003F7003197AB8B428';
+  '/app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md' = 'AF4D46C137E031D8EB6B6EB063E7A438';
+  # 2026-10-15: p0 底模降噪（第 23/24 条）+ p2 展示型/回归型/埋点型测试点（第 11/12 条）
+  '/app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md' = '63CD0947D95E4831C247418C520C0708';
+  # 2026-10-14: 用例合并采纳页补列 + 采纳挂版本/子孙模块筛选 + 采纳覆盖更新 + adopted_keys
+  # 2026-10-14 hotfix: _adopted_entry_keys/_in_lib 去掉 get_or_create（GET detail 1048 created_by_id 不能为 null）
+  # 2026-10-14 晚: 自愈闭环人工触发（adoption-diff / backfill-kb）+ 人工补充采纳 source='manual'
+  '/app/apps/requirement_analysis/modao_views.py'                         = 'CA155DA9D8CECD70F869FE367E0FC279';
+  '/app/apps/requirement_analysis/serializers.py'                         = '8935EEEDB95043128F5815793ACEE9C2';
+  # 2026-10-15: 跨画布澄清归属隔离（run_clarify 写回按画布过滤）+ 提取后默认不全选
+  # 2026-10-15: _llm 默认超时 300->600（analyzer=DeepSeek deepseek-chat 大原型偶发慢响应误杀）
+  '/app/apps/requirement_analysis/modao_workflow.py'                      = 'A50E091707A0E4A392F55A01F06E7E9F';
+  # 2026-10-14 晚: 自愈闭环第 3/4 环（diff_ai_vs_adopted / _adoption_kb_items / backfill_kb_from_adoption）
+  # 2026-10-15: call_openai_compatible_api 增加有界重试（供应商瞬断/超时/5xx/429 自动恢复；硬错误与取消不重试）
+  '/app/apps/requirement_analysis/ai_model_service.py'                    = '14C379C1748695726545DFCA62178362';
+  # 2026-10-15: PageObjectViewSet.filterset_fields 去掉不存在的 execution_mode（Swagger /api/schema/ 500）
+  '/app/apps/ui_automation/views.py'                                      = 'E2DAF94F92ACF8D61911AC4F59C9BF86'
 }
-$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py
+$md5Raw = docker exec testhub-backend md5sum /app/tester.md /app/tester_pro.md /app/apps/requirement_analysis/independent_skill/prompts/tester.md /app/apps/requirement_analysis/independent_skill/prompts/tester_pro.md /app/apps/zentao/services.py /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md /app/apps/requirement_analysis/modao_skill/prompts/p2_testpoint_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p3_case_gen.md /app/apps/requirement_analysis/modao_skill/prompts/p7_merge_dedup.md /app/apps/requirement_analysis/modao_views.py /app/apps/requirement_analysis/serializers.py /app/apps/requirement_analysis/modao_workflow.py /app/apps/requirement_analysis/ai_model_service.py /app/apps/ui_automation/views.py
 $md5Bad = 0
 foreach ($line in $md5Raw) {
   $parts = ($line -split '\s+') | Where-Object { $_ -ne '' }
@@ -132,7 +165,19 @@ foreach ($line in $md5Raw) {
   else { Say "MD5 MISMATCH $f : image=$h expected=$($Expect[$f])"; $md5Bad++ }
 }
 if ($md5Bad -gt 0) { Fail "$md5Bad file(s) did NOT make it into the image" }
-Say 'all 5 md5 match -> prompts + zentao/services.py are baked into the image'
+
+Say '--- 2026-10-14 晚 anchors (self-heal loop + manual source) ---'
+# md5 only proves the file was copied; these prove the new code paths are really there.
+# (no spaces in the patterns, so PS does not mangle the docker exec argv)
+docker exec testhub-backend grep -c max_redundant /app/apps/requirement_analysis/ai_model_service.py
+docker exec testhub-backend grep -c source=source /app/apps/requirement_analysis/modao_views.py
+Say '--- 2026-10-15 anchor (p0 底模降噪条款在位；ui_automation 由 STEP4 的 /api/schema/ 200 覆盖) ---'
+# NOTE: do NOT use `grep -c execution_mode` here -- that string legitimately appears
+# (serializer fields etc.). The real regression guard is the STEP4 schema check.
+docker exec testhub-backend grep -c ui_screen /app/apps/requirement_analysis/modao_skill/prompts/p0_requirement_struct.md
+# 2026-10-14: was hardcoded to 'all 5 md5 match' and silently went stale when two
+# modao prompts were added. Derive the count from the table so it cannot drift.
+Say "all $($Expect.Count) md5 match -> prompts + zentao/services.py are baked into the image"
 
 Say '--- runtime constants loaded by the rebuilt image (expect 600 / 600 / 0.0) ---'
 docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.zentao import services as s;print('JUDGE_CASE_CHARS=%s'%s.JUDGE_CASE_CHARS);print('JUDGE_BUG_CHARS=%s'%s.JUDGE_BUG_CHARS);print('JUDGE_TEMPERATURE=%s'%s.JUDGE_TEMPERATURE)"
@@ -143,6 +188,21 @@ docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');o
 
 Say '--- cross-version knowledge entries (expect >= 16 after report#29 promote) ---'
 docker exec testhub-backend python -c "import os,sys;sys.path.insert(0,'/app');os.environ.setdefault('DJANGO_SETTINGS_MODULE','backend.settings');import django;django.setup();from apps.projects.models import ProjectKnowledge;print('global=%d'%ProjectKnowledge.objects.filter(version__isnull=True).count());print('confirmed=%d'%ProjectKnowledge.objects.filter(needs_review=False).count())"
+
+Say '=== STEP 6 modao p2/p3 prompt runtime check ==='
+# The modao prompts live in files (NOT in PromptConfig) and are cached in a module-level
+# _CACHE inside modao_prompts.py: get_prompt() reads disk ONCE, then never again.
+# So verifying the file exists is NOT enough - we must call get_prompt() and check the
+# anchors are actually visible to the running process.
+# The script writes its own report to /tmp and prints nothing to stdout, because
+# `docker exec python -c` output does not land in this log file.
+docker exec testhub-backend python /app/scripts/_verify_modao_prompts.py
+if ($LASTEXITCODE -ne 0) { Fail 'modao prompt verify script failed (is scripts/ in the image?)' }
+$vp = docker exec testhub-backend cat /tmp/_verify_modao_prompts.txt
+Add-Content -Path $Log -Value $vp -Encoding UTF8
+Write-Output $vp
+if (($vp -join "`n") -notmatch 'RESULT=SYNCED') { Fail 'modao p2/p3 prompts NOT synced in the rebuilt image' }
+Say 'modao p2/p3 prompts verified in the running container'
 
 Say '=== DONE ==='
 Say "log file = $Log"

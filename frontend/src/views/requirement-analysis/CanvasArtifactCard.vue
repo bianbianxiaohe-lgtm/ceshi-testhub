@@ -80,8 +80,8 @@
 
     <!-- 结构化卡片视图（测试点 / 用例 / 冒烟 / 其它 JSON） -->
     <div v-else-if="structuredItems.length" class="ac-structured">
-      <div v-for="(item, i) in structuredItems" :key="i" class="obj-card">
-        <div class="obj-head">
+      <div v-for="(item, i) in structuredItems" :key="i" class="obj-card" :class="{ 'obj-expanded': isExpanded(i) }">
+        <div class="obj-head" @click="toggleItem(i)">
           <div class="obj-head-left">
             <span class="obj-no">#{{ i + 1 }}</span>
             <span v-if="item.id" class="obj-id-tag">{{ item.id }}</span>
@@ -95,15 +95,26 @@
             plain
             class="obj-delete-btn"
             :loading="saving"
-            @click="deleteStructuredItem(i)"
+            @click.stop="deleteStructuredItem(i)"
           >
             🗑️ 删除
           </el-button>
         </div>
-        <div class="obj-rows">
+        <!-- 收起态：只显示 标题 / 描述 -->
+        <div v-if="!isExpanded(i)" class="obj-rows">
+          <div v-for="(row, j) in summaryRows(item)" :key="'s' + j" class="obj-row">
+            <label>{{ row[0] }}</label><span>{{ row[1] }}</span>
+          </div>
+          <div v-if="hiddenRowCount(item) > 0" class="obj-toggle" @click="toggleItem(i)">
+            展开全部字段（还有 {{ hiddenRowCount(item) }} 项）▾
+          </div>
+        </div>
+        <!-- 展开态：全部字段 + 收起入口 -->
+        <div v-else class="obj-rows">
           <div v-for="(row, j) in flatten(item)" :key="j" class="obj-row">
             <label>{{ row[0] }}</label><span>{{ row[1] }}</span>
           </div>
+          <div class="obj-toggle" @click="toggleItem(i)">收起 ▴</div>
         </div>
       </div>
       <div v-if="itemCount > structuredItems.length" class="ac-more">
@@ -169,6 +180,8 @@ export default {
       clarifyItems: [],
       clarifyReplies: [],
       summaryViewMode: 'visual',
+      /** 默认收起：记录已展开条目的下标 */
+      expandedIndexes: [],
     }
   },
   computed: {
@@ -242,6 +255,41 @@ export default {
     },
   },
   methods: {
+    /** 收起态摘要行：只取 标题 / 描述 类字段 */
+    summaryRows(item) {
+      const keys = ['title', 'name', 'case_name', 'description', 'desc']
+      const out = []
+      for (const [k, v] of Object.entries(item || {})) {
+        if (!keys.includes(k)) continue
+        if (v === null || v === undefined || v === '') continue
+        const label = this.lbl(k)
+        if (Array.isArray(v)) {
+          const txt = v.map(x => (x && typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' / ')
+          if (txt) out.push([label, txt])
+        } else if (typeof v === 'object') {
+          out.push(...this.flatten(v, label))
+        } else {
+          out.push([label, String(v)])
+        }
+      }
+      if (!out.length) out.push(['内容', JSON.stringify(item).slice(0, 120)])
+      return out
+    },
+    /** 收起时被隐藏的字段数（顶层） */
+    hiddenRowCount(item) {
+      const keys = ['title', 'name', 'case_name', 'description', 'desc']
+      return Object.entries(item || {})
+        .filter(([k, v]) => !keys.includes(k) && v !== null && v !== undefined && v !== '')
+        .length
+    },
+    isExpanded(i) {
+      return this.expandedIndexes.includes(i)
+    },
+    toggleItem(i) {
+      const idx = this.expandedIndexes.indexOf(i)
+      if (idx >= 0) this.expandedIndexes.splice(idx, 1)
+      else this.expandedIndexes.push(i)
+    },
     base() {
       return '/requirement-analysis/api/modao'
     },
@@ -615,6 +663,15 @@ export default {
       label { flex: 0 0 88px; color: #909399; }
       span { flex: 1; color: #303133; word-break: break-word; white-space: pre-wrap; }
     }
+    .obj-toggle {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #409eff;
+      cursor: pointer;
+      user-select: none;
+      &:hover { text-decoration: underline; }
+    }
+    .obj-head { cursor: pointer; }
   }
   .ac-more { font-size: 12px; color: #909399; }
 }
