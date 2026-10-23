@@ -972,6 +972,8 @@ export default {
       xmindPreviewVisible: false,
       xmindPreviewTree: [],
       pollTimer: null,
+      // 轮询连续失败次数：达到上限自动停止，防止接口持续 500 时把后端打死
+      pollFailCount: 0,
       smokeDecision: '',
       rejectEmail: '',
       history: [],
@@ -1447,6 +1449,8 @@ export default {
     },
     startPoll() {
       if (this.pollTimer) clearInterval(this.pollTimer)
+      // 每次开始新一轮轮询都重置失败计数
+      this.pollFailCount = 0
       this.pollTimer = setInterval(() => this.refresh(), 3000)
     },
     stopPoll() {
@@ -1489,11 +1493,31 @@ export default {
           this.$message.error(this.friendlyError(res.data.error_message))
         }
         this._prevProtoStatus = s
+        // 成功了一次就清零失败计数，避免偶发抖动累积到上限
+        this.pollFailCount = 0
         if (!['extracting', 'structuring', 'clarifying', 'designing'].includes(s)) {
           this.stopPoll()
           this.busy = false
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        // ⚠️ 这里原来是无条件 `catch (e) { /* ignore */ }` —— 静默吞掉所有错误，
+        // 导致接口持续 500 时轮询永远不会停止。2026-10-22 生产事故：
+        // modao/89 每 3 秒 500 一次、多个标签页并发，把 MySQL 连接打满到 151 上限，
+        // 之后连登录接口都连不上库，形成「越 500 越轮询」的死循环。
+        // 现在加连续失败上限：超过阈值就停轮询并明确告知用户，绝不静默续命。
+        this.pollFailCount = (this.pollFailCount || 0) + 1
+        const MAX_POLL_FAILS = 5
+        if (this.pollFailCount >= MAX_POLL_FAILS) {
+          this.stopPoll()
+          this.busy = false
+          const status = e && e.response && e.response.status
+          this.$message.error(
+            status
+              ? `服务端连续 ${MAX_POLL_FAILS} 次请求失败（HTTP ${status}），已停止自动刷新。请稍后手动刷新页面重试。`
+              : `网络异常，已连续 ${MAX_POLL_FAILS} 次无法获取任务状态，已停止自动刷新。请检查网络后手动刷新页面。`
+          )
+        }
+      }
     },
     goStep(n) { this.step = n },
     // ---------- 内容编辑 ----------
