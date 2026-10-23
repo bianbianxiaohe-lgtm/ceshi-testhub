@@ -506,23 +506,58 @@
           <el-button size="small" type="info" plain @click.stop="openLogViewer(currentReport)">查看分析日志</el-button>
         </div>
 
-        <h4 style="margin: 18px 0 10px">提高覆盖率建议</h4>
-        <el-button
-          v-if="currentReport.status === 'success' && currentReport.uncovered_bugs > 0"
-          type="primary"
-          plain
-          size="small"
-          :loading="pushingKnowledge"
-          style="margin-bottom: 8px"
-          @click="pushKnowledge"
-        >将未覆盖缺陷+调优建议写入知识库</el-button>
-        <el-input
-          v-if="currentReport.improvement_suggestions"
-          type="textarea"
-          :model-value="currentReport.improvement_suggestions"
-          :rows="10"
-          readonly
-        />
+        <div class="suggest-header">
+          <h4 style="margin: 18px 0 10px">提高覆盖率建议</h4>
+          <div class="suggest-actions">
+            <el-tag v-if="suggestionsDirty" type="warning" size="small" effect="plain">已修改未保存</el-tag>
+            <el-tag v-else-if="currentReport.suggestions_edited_by" type="info" size="small" effect="plain">
+              人工编辑：{{ currentReport.suggestions_edited_by }} · {{ formatTime(currentReport.suggestions_edited_at) }}
+            </el-tag>
+            <template v-if="suggestionsEditable">
+              <el-button v-if="suggestionsDirty" size="small" @click="resetSuggestionsEdit">撤销修改</el-button>
+              <el-button size="small" :loading="savingSuggestions" @click="saveSuggestions">保存修改</el-button>
+            </template>
+            <el-button
+              v-if="suggestionsEditable && currentReport.improvement_suggestions_ai"
+              size="small"
+              text
+              @click="restoreAiSuggestions"
+            >恢复 AI 原文</el-button>
+            <el-button
+              v-if="currentReport.status === 'success' && currentReport.uncovered_bugs > 0"
+              type="primary"
+              plain
+              size="small"
+              :loading="pushingKnowledge"
+              @click="pushKnowledge"
+            >{{ suggestionsDirty ? '保存并写入知识库' : '将未覆盖缺陷+调优建议写入知识库' }}</el-button>
+          </div>
+        </div>
+        <template v-if="suggestionsEditable">
+          <el-input
+            v-model="suggestionsDraft"
+            type="textarea"
+            :rows="12"
+            placeholder="可直接编辑 AI 建议后再写入知识库；也可在下方追加补充要求"
+          />
+          <div class="suggest-append">
+            <el-input
+              v-model="suggestionsAppend"
+              type="textarea"
+              :rows="2"
+              placeholder="追加补充（可选）：例如「补充：iqoo neo9 之外，iqoo 全系加入必测矩阵」"
+            />
+            <el-button
+              size="small"
+              :disabled="!suggestionsAppend.trim()"
+              @click="appendSuggestion"
+            >追加到建议</el-button>
+          </div>
+          <div class="form-tip">
+            编辑仅影响本报告与「写入知识库」的内容，原始 AI 建议已留档，可随时「恢复 AI 原文」。
+          </div>
+        </template>
+        <pre v-else-if="currentReport.improvement_suggestions" class="suggest-readonly">{{ currentReport.improvement_suggestions }}</pre>
         <el-empty v-else description="暂无建议" />
       </div>
     </el-drawer>
@@ -598,6 +633,7 @@ import api from '@/utils/api'
 import {
   createZentaoConfig,
   deleteCoverageReport,
+  editReportSuggestions,
   getCoverageReport,
   getCoverageReportLogs,
   getCoverageReports,
@@ -676,6 +712,17 @@ function causePercent(n) {
   return Math.round((n / total) * 100)
 }
 const pushingKnowledge = ref(false)
+// 提高覆盖率建议：支持人工编辑后再写入知识库
+const suggestionsDraft = ref('')
+const suggestionsOrigin = ref('')
+const suggestionsAppend = ref('')
+const savingSuggestions = ref(false)
+const suggestionsEditable = computed(
+  () => !!currentReport.value && currentReport.value.status === 'success'
+)
+const suggestionsDirty = computed(
+  () => suggestionsEditable.value && suggestionsDraft.value !== suggestionsOrigin.value
+)
 const reviewDialog = ref(false)
 const reviewItem = ref(null)
 const reviewForm = ref({ covered: true, note: '' })
@@ -1222,7 +1269,7 @@ async function pollReport(reportId) {
         // 分析结束，停止实时日志轮询并拉取最终日志
         stopLogPolling()
         await fetchReportLogs()
-        currentReport.value = report
+        setCurrentReport(report)
         reportDrawer.value = true
         if (report.status === 'failed') {
           ElMessage.error(report.error_message || '分析失败')
@@ -1258,11 +1305,72 @@ async function loadReports() {
 async function openReport(row) {
   try {
     const res = await getCoverageReport(row.id)
-    currentReport.value = res.data
+    setCurrentReport(res.data)
     reportDrawer.value = true
   } catch (e) {
     ElMessage.error('加载报告失败')
   }
+}
+
+// 统一入口：设置当前报告并同步「提高覆盖率建议」编辑草稿
+function setCurrentReport(report) {
+  currentReport.value = report
+  suggestionsOrigin.value = report?.improvement_suggestions || ''
+  suggestionsDraft.value = suggestionsOrigin.value
+  suggestionsAppend.value = ''
+}
+
+function resetSuggestionsEdit() {
+  suggestionsDraft.value = suggestionsOrigin.value
+}
+
+function appendSuggestion() {
+  const extra = suggestionsAppend.value.trim()
+  if (!extra) return
+  suggestionsDraft.value = suggestionsDraft.value.trim()
+    ? `${suggestionsDraft.value.trimEnd()}\n\n${extra}`
+    : extra
+  suggestionsAppend.value = ''
+}
+
+async function saveSuggestions(silent = false) {
+  if (!currentReport.value) return null
+  savingSuggestions.value = true
+  try {
+    const res = await editReportSuggestions(currentReport.value.id, {
+      content: suggestionsDraft.value,
+    })
+    const content = res.data.improvement_suggestions ?? suggestionsDraft.value
+    currentReport.value.improvement_suggestions = content
+    currentReport.value.suggestions_edited_by = res.data.edited_by
+    currentReport.value.suggestions_edited_at = res.data.edited_at
+    suggestionsOrigin.value = content
+    suggestionsDraft.value = content
+    if (!silent) ElMessage.success('建议已保存')
+    return content
+  } catch (e) {
+    ElMessage.error(e.response?.data?.error || '保存建议失败')
+    return null
+  } finally {
+    savingSuggestions.value = false
+  }
+}
+
+async function restoreAiSuggestions() {
+  const ai = currentReport.value?.improvement_suggestions_ai
+  if (ai == null) return
+  try {
+    await ElMessageBox.confirm('将用 AI 原文覆盖当前建议（含人工编辑内容），确定吗？', '恢复 AI 原文', {
+      type: 'warning',
+      confirmButtonText: '恢复',
+      cancelButtonText: '取消',
+    })
+  } catch (e) {
+    return
+  }
+  suggestionsDraft.value = ai
+  await saveSuggestions(true)
+  ElMessage.success('已恢复为 AI 原文')
 }
 
 async function deleteReport(row) {
@@ -1293,7 +1401,17 @@ async function pushKnowledge() {
   if (!currentReport.value) return
   pushingKnowledge.value = true
   try {
-    const res = await pushReportToKnowledge(currentReport.value.id)
+    // 有未保存的编辑时，连同编辑后的正文一起提交，保证写入的是人工确认版
+    const payload = suggestionsDirty.value
+      ? { improvement_suggestions: suggestionsDraft.value }
+      : {}
+    const res = await pushReportToKnowledge(currentReport.value.id, payload)
+    if (suggestionsDirty.value) {
+      // 后端已落库本次提交的建议，同步本地编辑态
+      currentReport.value.improvement_suggestions = suggestionsDraft.value
+      suggestionsOrigin.value = suggestionsDraft.value
+      if (res.data.edited_by) currentReport.value.suggestions_edited_by = res.data.edited_by
+    }
     ElMessage.success(res.data.message || '已写入知识库')
   } catch (e) {
     ElMessage.error(e.response?.data?.error || '写入知识库失败')
@@ -1322,7 +1440,11 @@ async function submitReview() {
     // 重新拉取整个报告，确保明细标签、理由、覆盖率统计全部刷新
     try {
       const refreshed = await getCoverageReport(currentReport.value.id)
-      currentReport.value = refreshed.data
+      // 复核只影响判定明细，保留建议编辑草稿，避免用户未保存的编辑被覆盖
+      const draft = suggestionsDraft.value
+      const origin = suggestionsOrigin.value
+      setCurrentReport(refreshed.data)
+      if (draft !== origin) suggestionsDraft.value = draft
     } catch (e) {
       // 拉取失败则就地更新，避免整页刷新丢失上下文
       reviewItem.value.covered = reviewForm.value.covered
@@ -1484,5 +1606,39 @@ onMounted(() => {
 .scene-examples {
   color: #909399;
   flex: 1;
+}
+.suggest-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.suggest-header h4 {
+  margin-right: auto;
+}
+.suggest-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.suggest-append {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+}
+.suggest-readonly {
+  margin: 0;
+  padding: 12px 14px;
+  background: #f5f7fa;
+  border: 1px solid #ebeef5;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #303133;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

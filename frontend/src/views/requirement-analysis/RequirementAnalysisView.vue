@@ -119,9 +119,82 @@
       </div>
     </div>
 
+    <!-- 历史缺陷测试点 - 全局设置（方案 A：默认不注入，不选就完全不影响生成） -->
+    <div class="output-mode-section" v-if="!isGenerating && !showResults">
+      <div class="output-mode-card">
+        <h3>🧭 历史缺陷测试点</h3>
+        <p class="mode-section-desc">
+          可选。选中后会把该产品历史上的高频缺陷测试点注入生成链路，让用例覆盖"以前踩过的坑"。
+          需求与历史缺陷无关时会自动跳过，不影响本次生成。
+        </p>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <select
+            v-model="globalDefectReview"
+            class="defect-global-select"
+            @change="onGlobalDefectReviewChange"
+            :disabled="defectReviewLoading"
+          >
+            <option :value="null">不使用（仅按本次需求生成）</option>
+            <option v-for="dr in defectReviewOptions" :key="dr.id" :value="dr.id">
+              {{ dr.project_name ? '[' + dr.project_name + '] ' : '' }}{{ dr.name || ('报告#' + dr.id) }}（{{ dr.testpoint_count }} 个测试点 / {{ dr.bug_total }} 条缺陷）
+            </option>
+          </select>
+          <button
+            class="quick-create-ver-btn"
+            @click="openGlobalDefectPreview"
+            :disabled="!globalDefectReview"
+            title="预览将被注入的内容"
+          >👁 预览</button>
+          <span v-if="defectReviewLoading" class="defect-global-hint">加载历史缺陷报告…</span>
+          <span v-else-if="!defectReviewOptions.length" class="defect-global-hint">
+            暂无已完成的缺陷复盘报告（可先在「禅道 → 缺陷复盘」创建）
+          </span>
+        </div>
+
+        <div v-if="globalDefectReview && (defectPreviewBlock || defectPreviewMeta)" class="defect-preview-box" style="margin-top:10px">
+          <div class="defect-preview-head">
+            <span>将注入的内容</span>
+            <span
+              v-if="defectPreviewMeta && defectPreviewMeta.relevance"
+              class="defect-preview-tag"
+              :class="defectPreviewMeta.relevance.relevant ? 'ok' : 'warn'"
+            >
+              {{ defectPreviewMeta.relevance.relevant
+                ? ('注入 ' + (defectPreviewMeta.used_count || 0) + ' 条 / 约 ' + (defectPreviewMeta.estimated_tokens || 0) + ' tokens')
+                : '已拦截，不注入' }}
+            </span>
+          </div>
+          <div v-if="defectPreviewLoading" class="defect-preview-loading">预览生成中…</div>
+          <template v-else>
+            <div
+              v-if="defectPreviewMeta && defectPreviewMeta.relevance && !defectPreviewMeta.relevance.relevant"
+              class="defect-preview-reason"
+            >{{ defectPreviewMeta.relevance.reason }}</div>
+            <pre v-else class="defect-preview-body">{{ defectPreviewBlock }}</pre>
+          </template>
+        </div>
+      </div>
+    </div>
+
     <div class="main-content">
+      <!-- 生成方式分页：一次只展示一种入口，避免多个上传表单堆在一页搞混 -->
+      <div class="gen-source-tabs" v-if="!isGenerating && !showResults">
+        <button
+          v-for="tab in cleanGenerateTabs"
+          :key="tab.value"
+          :class="['gen-source-tab', { active: generateSource === tab.value }]"
+          @click="switchGenerateSource(tab.value)"
+        >
+          <span class="gst-icon">{{ tab.icon }}</span>
+          <span class="gst-body">
+            <span class="gst-title">{{ tab.label }}</span>
+            <span class="gst-desc">{{ tab.desc }}</span>
+          </span>
+        </button>
+      </div>
+
       <!-- 手动输入需求描述区域 -->
-      <div class="manual-input-section" v-if="!isGenerating && !showResults">
+      <div class="manual-input-section" v-if="!isGenerating && !showResults && generateSource === 'manual'">
         <div class="manual-input-card">
           <h2>✍️ 手动输入需求描述</h2>
           <div class="input-form">
@@ -151,7 +224,7 @@
             
             <div class="form-group">
               <label>关联项目（可选）</label>
-              <select v-model="manualInput.selectedProject" class="form-select">
+              <select v-model="manualInput.selectedProject" class="form-select" @change="reloadDefectOptionsForProject">
                 <option value="">请选择项目</option>
                 <option v-for="project in projects" :key="project.id" :value="project.id">
                   {{ project.name }}
@@ -169,6 +242,10 @@
                   </option>
                 </select>
                 <button class="quick-create-ver-btn" @click="openQuickCreateVersion(manualInput.selectedProject)" title="快速新建版本">+</button>
+              </div>
+              <!-- 选了项目但该项目下没有版本时，明确提示而不是给一个空下拉 -->
+              <div v-if="manualInput.selectedProject && !availableVersions.length" class="version-empty-hint">
+                该项目下暂无版本，可点右侧「+」快速新建
               </div>
             </div>
 
@@ -419,13 +496,8 @@
         </div>
       </div>
 
-      <!-- 分隔线 -->
-      <div class="divider" v-if="!isGenerating && !showResults">
-        <span>或</span>
-      </div>
-
       <!-- 文档上传区域 -->
-      <div class="upload-section" v-if="!isGenerating && !showResults">
+      <div class="upload-section" v-if="!isGenerating && !showResults && generateSource === 'upload'">
         <div class="upload-card">
           <h2>📄 上传需求文档</h2>
           <div class="upload-area" 
@@ -506,13 +578,8 @@
         </div>
       </div>
 
-      <!-- 分隔线2 -->
-      <div class="divider" v-if="!isGenerating && !showResults">
-        <span>或</span>
-      </div>
-
       <!-- 需求文档生成区域（后门流程） -->
-      <div class="req-doc-section" v-if="!isGenerating && !showResults">
+      <div class="req-doc-section" v-if="!isGenerating && !showResults && generateSource === 'reqdoc'">
         <div class="req-doc-card">
           <div class="req-doc-header">
             <h2>📋 需求文档生成</h2>
@@ -738,7 +805,7 @@
       </div>
 
       <!-- 历史需求文档 面板 -->
-      <div class="history-section" v-if="!isGenerating && !showResults">
+      <div class="history-section" v-if="!isGenerating && !showResults && generateSource === 'history'">
         <div class="history-card">
           <div class="history-header">
             <div class="history-tabs">
@@ -943,6 +1010,62 @@
               </select>
               <button class="quick-create-ver-btn" style="margin-left:8px;vertical-align:middle" @click="openQuickCreateTestPoint(generateConfirmForm.feature_module_id)" :disabled="!generateConfirmForm.feature_module_id" title="快速新建测试点">+</button>
             </div>
+
+            <!-- 历史缺陷复盘测试点：方案 A 任务级开关，默认不注入 -->
+            <div class="form-group">
+              <label>
+                历史缺陷测试点
+                <span style="color:#999;font-weight:400;font-size:0.8rem">（可选）</span>
+              </label>
+              <select
+                v-model="generateConfirmForm.defect_review"
+                class="form-select"
+                @change="onDefectReviewChange"
+                :disabled="defectReviewLoading"
+              >
+                <option :value="null">不使用（仅按本次需求生成）</option>
+                <option v-for="dr in defectReviewOptions" :key="dr.id" :value="dr.id">
+                  {{ dr.name || ('报告#' + dr.id) }}（{{ dr.testpoint_count }} 个测试点 / {{ dr.bug_total }} 条缺陷）
+                </option>
+              </select>
+              <button
+                class="quick-create-ver-btn"
+                style="margin-left:8px;vertical-align:middle"
+                @click="openDefectPreview"
+                :disabled="!generateConfirmForm.defect_review"
+                title="预览将被注入的内容"
+              >👁</button>
+              <div v-if="defectReviewLoading" style="color:#999;font-size:0.8rem;margin-top:4px">
+                加载历史缺陷报告…
+              </div>
+              <div v-else-if="!generateConfirmForm.project_id" style="color:#999;font-size:0.8rem;margin-top:4px">
+                请先选择归属项目，再选择历史缺陷报告
+              </div>
+              <div v-else-if="!defectReviewOptions.length" style="color:#999;font-size:0.8rem;margin-top:4px">
+                当前项目暂无已完成的缺陷复盘报告（可在「禅道 → 缺陷复盘」中先创建一份）
+              </div>
+              <div v-else style="color:#999;font-size:0.8rem;margin-top:4px">
+                选中后会把该产品的历史高频缺陷测试点注入生成链路；需求与历史缺陷无关时自动跳过，不会污染本次生成。
+              </div>
+            </div>
+
+            <!-- 注入预览：让用户先看到 AI 会收到什么，再决定是否生成 -->
+            <div v-if="generateConfirmForm.defect_review && (defectPreviewBlock || defectPreviewMeta)" class="defect-preview-box">
+              <div class="defect-preview-head">
+                <span>将注入的内容</span>
+                <span v-if="defectPreviewMeta && defectPreviewMeta.relevance" class="defect-preview-tag"
+                      :class="defectPreviewMeta.relevance.relevant ? 'ok' : 'warn'">
+                  {{ defectPreviewMeta.relevance.relevant ? ('注入 ' + (defectPreviewMeta.used_count || 0) + ' 条 / 约 ' + (defectPreviewMeta.estimated_tokens || 0) + ' tokens') : '已拦截，不注入' }}
+                </span>
+              </div>
+              <div v-if="defectPreviewLoading" class="defect-preview-loading">预览生成中…</div>
+              <template v-else>
+                <div v-if="defectPreviewMeta && defectPreviewMeta.relevance && !defectPreviewMeta.relevance.relevant" class="defect-preview-reason">
+                  {{ defectPreviewMeta.relevance.reason }}
+                </div>
+                <pre v-else class="defect-preview-body">{{ defectPreviewBlock }}</pre>
+              </template>
+            </div>
           </div>
           <div class="quick-version-actions">
             <button class="toolbar-btn" @click="showGenerateConfirm = false">取消</button>
@@ -1079,6 +1202,56 @@
             </div>
           </div>
 
+          <!--
+            历史缺陷测试点注入审计：回答「这次生成到底用了哪几条历史测试点」。
+            此前只写后端日志，用户无法追溯；现在由任务上的 defect_review_used 快照提供。
+          -->
+          <div
+            v-if="generationResult && generationResult.defect_review"
+            class="defect-audit"
+          >
+            <div class="defect-audit-head" @click="showDefectAudit = !showDefectAudit">
+              <span class="defect-audit-title">🧩 历史缺陷测试点</span>
+              <template v-if="defectAudit">
+                <el-tag
+                  :type="defectAudit.injected ? 'success' : 'warning'"
+                  size="small"
+                >
+                  {{ defectAudit.injected
+                    ? `注入 ${defectAudit.used_count} 条`
+                    : '未注入' }}
+                </el-tag>
+                <span v-if="defectAudit.matched_domains?.length" class="defect-audit-meta">
+                  命中功能域：{{ defectAudit.matched_domains.join('、') }}
+                </span>
+              </template>
+              <span v-else class="defect-audit-meta">暂无审计记录（该任务早于审计功能上线）</span>
+              <span class="defect-audit-toggle">{{ showDefectAudit ? '收起' : '展开' }}</span>
+            </div>
+            <template v-if="showDefectAudit && defectAudit">
+              <div class="defect-audit-reason">
+                判定依据：{{ defectAudit.reason || '-' }}
+                <span v-if="defectAudit.detail_level">
+                  （详略 {{ defectAudit.detail_level }}，
+                  候选 {{ defectAudit.candidate_count }} 条，
+                  {{ defectAudit.prompt_chars }} 字符）
+                </span>
+              </div>
+              <el-table
+                v-if="defectAudit.items?.length"
+                :data="defectAudit.items"
+                size="small"
+                border
+                style="margin-top: 8px"
+              >
+                <el-table-column prop="domain" label="功能域" width="150" />
+                <el-table-column prop="scene" label="维度" width="160" />
+                <el-table-column prop="title" label="注入的测试点" />
+                <el-table-column prop="count" label="历史缺陷" width="100" />
+              </el-table>
+            </template>
+          </div>
+
           <!-- 流式内容实时显示区域 -->
           <div v-if="streamedContent" class="stream-content-display">
             <div class="stream-header">
@@ -1204,6 +1377,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft } from '@element-plus/icons-vue'
 import * as XLSX from 'xlsx'
 import { useUserStore } from '@/stores/user'
+import { getDefectReviews, previewDefectReviewPrompt } from '@/api/zentao'
 import {
   getAnalysisResults,
   getAnalysisResultDetail,
@@ -1277,8 +1451,29 @@ export default {
         version_id: null,
         feature_module_id: null,
         test_point_id: null,
-        generation_mode: 'smart'
+        generation_mode: 'smart',
+        // 历史缺陷复盘测试点：默认不注入（方案 A：任务级显式开关，不选就不影响生成）
+        defect_review: null,
+        defect_review_detail_level: ''
       },
+      // 生成方式分页：一次只展示一种入口，避免 4 个上传表单堆在一页让人选错
+      generateSource: 'manual',
+      cleanGenerateTabs: [
+        { value: 'manual', icon: '✍️', label: '手动输入', desc: '直接写需求标题与描述' },
+        { value: 'upload', icon: '📄', label: '上传文档', desc: 'PDF / Word / TXT / Markdown' },
+        { value: 'reqdoc', icon: '📋', label: '需求文档生成', desc: '先整理成结构化文档再生成' },
+        { value: 'history', icon: '🗂️', label: '历史文档', desc: '复用已保存的需求文档' }
+      ],
+      // 全局选择的历史缺陷复盘报告（null = 不使用）。弹窗打开时会同步到 generateConfirmForm
+      globalDefectReview: null,
+      // 可选的历史缺陷复盘报告（只列 status=success 的）
+      defectReviewOptions: [],
+      defectReviewLoading: false,
+      // 注入预览
+      defectPreviewVisible: false,
+      defectPreviewLoading: false,
+      defectPreviewBlock: '',
+      defectPreviewMeta: null,
       generationModes: [
         { value: 'smart', label: '智能', icon: '🤖', desc: 'AI评估' },
         { value: 'quick', label: '快速', icon: '⚡', desc: '10~20条' },
@@ -1332,6 +1527,8 @@ export default {
       // 生成结果
       showResults: false,
       generationResult: null,
+      // 历史缺陷测试点注入审计面板是否展开
+      showDefectAudit: false,
 
       // AI配置状态
       configStatus: {
@@ -1425,6 +1622,11 @@ export default {
       if (!this.reqDoc.files.length) return false
       return this.reqDoc.files.every(f => f.extracted || f.isImagePdf)
     },
+    // 本次任务实际注入的历史缺陷测试点审计快照
+    defectAudit() {
+      const t = this.generationResult
+      return (t && t.defect_review_used) || null
+    },
     hasImagePdfFiles() {
       return this.reqDoc.files.some(f => f.isImagePdf)
     },
@@ -1476,16 +1678,24 @@ export default {
       }
       return sections
     },
+    // 手动输入区的版本下拉：必须跟随「关联项目」联动
+    // ⚠️ 原来直接 return allVersions，导致选了项目后版本下拉仍列出所有项目的版本，
+    // 用户可能把 A 项目的版本绑到 B 项目的用例上（2026-10-22 用户反馈）。
+    // Version.projects 是 M2M（一个版本可关联多个项目），所以用 some 判断归属。
     availableVersions() {
-      return this.allVersions
+      const pid = this.manualInput.selectedProject ? Number(this.manualInput.selectedProject) : null
+      if (!pid) return this.allVersions
+      return this.allVersions.filter(v =>
+        Array.isArray(v.projects) && v.projects.some(p => Number(p.id) === pid)
+      )
     },
+
     // 生成确认弹窗的版本列表（根据选择的项目过滤）
     generateConfirmVersions() {
-      if (!this.generateConfirmForm.project_id) {
-        return this.allVersions
-      }
+      const pid = this.generateConfirmForm.project_id ? Number(this.generateConfirmForm.project_id) : null
+      if (!pid) return this.allVersions
       return this.allVersions.filter(v =>
-        !v.projects || v.projects.length === 0 || v.projects.some(p => p.id === this.generateConfirmForm.project_id)
+        Array.isArray(v.projects) && v.projects.some(p => Number(p.id) === pid)
       )
     },
     generateConfirmFeatureModules() {
@@ -1530,7 +1740,20 @@ export default {
     }
   },
   
+  watch: {
+    // 生成确认弹窗打开时统一刷新一次历史缺陷报告列表。
+    // ⚠️ 不用 onConfirmProjectChange 触发：实测只有 1/6 的入口会走那条路径，
+    // 其余 5 个入口（预览文档/需求文档/手工输入/上传文档/拆解结果）直接
+    // `showGenerateConfirm = true`，若只挂在 change 事件上，下拉永远为空，
+    // 用户会以为"入口没做"。监听弹窗可见性才是覆盖全部入口的做法。
+    showGenerateConfirm(val) {
+      if (val) this.onGenerateConfirmOpened()
+    }
+  },
+
   mounted() {
+    // 主页面「历史缺陷测试点」卡片需要立刻能选，不能等弹窗打开才加载
+    this.loadAllDefectReviewOptions()
     this.loadProjects()
     this.loadVersions()
     this.loadFeatureModules()
@@ -1601,15 +1824,29 @@ export default {
       }
     },
 
-    async loadVersions() {
-      try {
-        const response = await api.get('/versions/')
-        this.allVersions = response.data.results || response.data || []
-      } catch (error) {
-        console.error('加载版本失败:', error)
-        this.allVersions = []
-      }
-    },
+        async loadVersions() {
+          try {
+            // ⚠️ /versions/ 是分页接口（PAGE_SIZE=20），必须翻页拉全。
+            // 实测库里有 32+ 个版本，只取第一页会导致部分项目的版本下拉是空的
+            // （用户选了项目却看不到任何版本）。与 loadFeatureModules 同样处理。
+            const all = []
+            let page = 1
+            while (true) {
+              const response = await api.get('/versions/', { params: { page } })
+              const data = response.data || {}
+              const items = data.results || data || []
+              if (Array.isArray(items)) all.push(...items)
+              if (!data.next || !items.length || !Array.isArray(items)) break
+              page += 1
+              if (page > 50) break   // 防御性上限，避免异常分页导致死循环
+            }
+            this.allVersions = all
+            console.log(`[versions] 已加载 ${all.length} 个版本（共 ${page} 页）`)
+          } catch (error) {
+            console.error('加载版本失败:', error)
+            this.allVersions = []
+          }
+        },
 
     async loadFeatureModules() {
       try {
@@ -2121,7 +2358,9 @@ export default {
           version_id: this.selectedVersion || null,
           feature_module_id: null,
           test_point_id: null,
-          generation_mode: 'smart'
+          generation_mode: 'smart',
+          defect_review: null,
+          defect_review_detail_level: ''
         }
         // 触发项目切换副作用
         this.onConfirmProjectChange()
@@ -2147,7 +2386,9 @@ export default {
         version_id: this.selectedVersion || null,
         feature_module_id: null,
         test_point_id: null,
-        generation_mode: 'smart'
+        generation_mode: 'smart',
+        defect_review: null,
+        defect_review_detail_level: ''
       }
       this.showGenerateConfirm = true
     },
@@ -2158,6 +2399,176 @@ export default {
       this.generateConfirmForm.feature_module_id = null
       this.generateConfirmForm.test_point_id = null
       this.moduleTestPoints = []
+      // 缺陷复盘报告是按项目维度产出的，切项目必须重载列表。
+      // 但如果主页面已经全局选过一份，就继续沿用它（否则用户会疑惑"我明明选了怎么又空了"）；
+      // 只有在主页没选时才清空。
+      if (!this.globalDefectReview) {
+        this.generateConfirmForm.defect_review = null
+        this.resetDefectPreview()
+      } else {
+        this.generateConfirmForm.defect_review = this.globalDefectReview
+      }
+      this.loadDefectReviewOptions()
+    },
+
+    // 打开生成确认弹窗后统一拉取一次报告列表。
+    // ⚠️ 不能只依赖 onConfirmProjectChange（那只是"切项目"事件）：
+    // 实测有 5 处打开弹窗的路径（预览文档/需求文档/手工输入/上传文档/拆解结果）
+    // 并不会触发项目切换事件，若只在 change 里加载，下拉永远是空的。
+    onGenerateConfirmOpened() {
+      this.resetDefectPreview()
+      // 主页面上已选了报告时，带进弹窗（弹窗里仍可改）
+      if (this.globalDefectReview && !this.generateConfirmForm.defect_review) {
+        this.generateConfirmForm.defect_review = this.globalDefectReview
+      }
+      this.loadDefectReviewOptions()
+    },
+
+    // 切换生成方式分页：只切显示，不清空已填内容（用户切回来还在）
+    switchGenerateSource(source) {
+      this.generateSource = source
+    },
+
+    // 生成成功后复位「历史缺陷测试点」为不使用（方案 B，2026-10-22 用户确认）。
+    // 目的：避免"选一次就污染之后所有生成"。历史缺陷测试点属于强上下文，
+    // 应该针对本次需求显式选择，而不是长期挂着一个隐式开关。
+    resetDefectReviewAfterGenerate() {
+      this.globalDefectReview = null
+      this.generateConfirmForm.defect_review = null
+      // 弹窗里选过的档位也一并清掉，避免下次自动套用
+      this.generateConfirmForm.defect_review_detail_level = ''
+      this.resetDefectPreview()
+      console.log('[DEFECT-TP] 生成完成后已复位为「不使用」')
+    },
+
+    // 主页面「历史缺陷测试点」卡片：切换时清空预览
+    onGlobalDefectReviewChange() {
+      this.resetDefectPreview()
+    },
+
+    // 主页面预览：此时还没确定项目，用项目列表里已选的或后端兜底
+    async openGlobalDefectPreview() {
+      const reportId = this.globalDefectReview
+      if (!reportId) return
+      this.defectPreviewLoading = true
+      this.defectPreviewBlock = ''
+      this.defectPreviewMeta = null
+      try {
+        // 主页面上取需求文本：优先手工输入，其次需求文档，都没有则让后端按"全量"给出
+        const reqText = (this.manualInput && this.manualInput.description)
+          || (this.reqDoc && this.reqDoc.markdown)
+          || ''
+        const res = await previewDefectReviewPrompt({
+          report_id: reportId,
+          requirement_text: reqText,
+          max_points: 20
+        })
+        this.defectPreviewBlock = res.data.prompt_block || ''
+        this.defectPreviewMeta = res.data
+      } catch (e) {
+        ElMessage.error(e.response?.data?.error || '预览失败')
+      } finally {
+        this.defectPreviewLoading = false
+      }
+    },
+
+    // 主页面用：此时还没定项目，列出全部已完成报告（选项里带项目名便于区分）
+    async loadAllDefectReviewOptions() {
+      this.defectReviewLoading = true
+      try {
+        const res = await getDefectReviews({})
+        const list = res.data?.results || res.data || []
+        this.defectReviewOptions = list.filter((r) => r.status === 'success' && r.testpoint_count > 0)
+      } catch (e) {
+        this.defectReviewOptions = []
+      } finally {
+        this.defectReviewLoading = false
+      }
+    },
+
+    // 主页面选项目后收窄：避免选到别的项目的报告（跨项目注入会把不相关的坑带进来）
+    async reloadDefectOptionsForProject() {
+      const pid = this.manualInput && this.manualInput.selectedProject
+      // 关联版本必须跟项目联动清空：否则切换项目后 selectedVersion 仍是上个项目的版本 ID，
+      // 下拉里却找不到它（显示空白），生成时还会把用例绑到错误版本上。
+      const versionStillValid = this.availableVersions.some(
+        v => String(v.id) === String(this.selectedVersion)
+      )
+      if (!versionStillValid) this.selectedVersion = ''
+      if (!pid) {
+        await this.loadAllDefectReviewOptions()
+        return
+      }
+      this.defectReviewLoading = true
+      try {
+        const res = await getDefectReviews({ project_id: pid })
+        const list = res.data?.results || res.data || []
+        this.defectReviewOptions = list.filter((r) => r.status === 'success' && r.testpoint_count > 0)
+      } catch (e) {
+        this.defectReviewOptions = []
+      } finally {
+        this.defectReviewLoading = false
+      }
+      // 原先选的报告不在本项目下则清空，防止跨项目注入
+      const stillValid = this.defectReviewOptions.some((r) => r.id === this.globalDefectReview)
+      if (this.globalDefectReview && !stillValid) {
+        this.globalDefectReview = null
+        this.resetDefectPreview()
+      }
+    },
+
+    // 加载当前项目下已完成的缺陷复盘报告（只列 status=success，避免选到跑失败/跑一半的）
+    async loadDefectReviewOptions() {
+      const projectId = this.generateConfirmForm.project_id
+      this.defectReviewOptions = []
+      if (!projectId) {
+        // 弹窗里还没选项目：退回全量，避免下拉空白让用户以为没做
+        await this.loadAllDefectReviewOptions()
+        return
+      }
+      this.defectReviewLoading = true
+      try {
+        const res = await getDefectReviews({ project_id: projectId })
+        const list = res.data?.results || res.data || []
+        this.defectReviewOptions = list.filter((r) => r.status === 'success' && r.testpoint_count > 0)
+      } catch (e) {
+        this.defectReviewOptions = []
+      } finally {
+        this.defectReviewLoading = false
+      }
+    },
+
+    onDefectReviewChange() {
+      this.resetDefectPreview()
+    },
+
+    resetDefectPreview() {
+      this.defectPreviewVisible = false
+      this.defectPreviewBlock = ''
+      this.defectPreviewMeta = null
+    },
+
+    // 预览注入内容：与真实注入共用后端同一套收窄逻辑，所见即所用
+    async openDefectPreview() {
+      const reportId = this.generateConfirmForm.defect_review
+      if (!reportId) return
+      const payload = this.pendingGeneratePayload || {}
+      this.defectPreviewLoading = true
+      this.defectPreviewBlock = ''
+      this.defectPreviewMeta = null
+      try {
+        const res = await previewDefectReviewPrompt({
+          report_id: reportId,
+          requirement_text: payload.content || '',
+          max_points: 20
+        })
+        this.defectPreviewBlock = res.data.prompt_block || ''
+        this.defectPreviewMeta = res.data
+      } catch (e) {
+        ElMessage.error(e.response?.data?.error || '预览失败')
+      } finally {
+        this.defectPreviewLoading = false
+      }
     },
 
     // 生成确认弹窗：功能模块切换时加载测试点
@@ -2562,7 +2973,9 @@ export default {
         version_id: this.selectedVersion || null,
         feature_module_id: null,
         test_point_id: null,
-        generation_mode: 'smart'
+        generation_mode: 'smart',
+        defect_review: null,
+        defect_review_detail_level: ''
       }
       // 触发项目切换的副作用
       this.onConfirmProjectChange()
@@ -2587,7 +3000,9 @@ export default {
         version_id: this.selectedVersion || null,
         feature_module_id: null,
         test_point_id: null,
-        generation_mode: 'smart'
+        generation_mode: 'smart',
+        defect_review: null,
+        defect_review_detail_level: ''
       }
       // 触发项目切换副作用
       this.onConfirmProjectChange()
@@ -3470,7 +3885,9 @@ export default {
           version_id: this.selectedVersion || null,
           feature_module_id: null,
           test_point_id: null,
-          generation_mode: 'smart'
+          generation_mode: 'smart',
+          defect_review: null,
+          defect_review_detail_level: ''
         }
         this.showGenerateConfirm = true
 
@@ -3516,6 +3933,16 @@ export default {
           use_reviewer_model: this.showReviewStep,
           output_mode: outputMode,  // 添加输出模式参数
           generation_mode: generationMode  // 生成模式
+        }
+
+        // 历史缺陷复盘测试点：只有用户显式选了报告才注入（不选=null，后端完全不碰）。
+        // 兜底取主页面全局选择：弹窗里没动过时也要生效，否则"主页选了却不生效"。
+        const chosenReview = this.generateConfirmForm.defect_review || this.globalDefectReview
+        if (chosenReview) {
+          requestData.defect_review = chosenReview
+          if (this.generateConfirmForm.defect_review_detail_level) {
+            requestData.defect_review_detail_level = this.generateConfirmForm.defect_review_detail_level
+          }
         }
 
         // 将需求拆解阶段确认的问答对传入，供用例生成时作为上下文注入（让AI基于确认结论精准出例）
@@ -3729,6 +4156,9 @@ export default {
         this.showResults = true
         this.isGenerating = false
 
+        // 本次已消费掉历史测试点，复位开关，避免污染下一次生成
+        this.resetDefectReviewAfterGenerate()
+
         // 设置第4步为完成状态
         this.currentStep = 4
 
@@ -3805,6 +4235,9 @@ export default {
             this.generationResult = task
             this.showResults = true
             this.isGenerating = false
+
+            // 本次已消费掉历史测试点，复位开关，避免污染下一次生成
+            this.resetDefectReviewAfterGenerate()
 
             // 设置显示内容（完整输出模式下需要）
             if (task.generated_test_cases) {
@@ -4030,6 +4463,10 @@ export default {
       this.showResults = false;
       this.generationResult = null;
 
+      // 保底：若生成中途失败/取消没走到成功收尾，这里也把历史测试点开关复位，
+      // 避免残留的选中状态影响下一次生成（方案 B）
+      this.resetDefectReviewAfterGenerate();
+
       // 清空流式内容和最终版用例
       this.streamedContent = '';
       this.streamedReviewContent = '';
@@ -4044,7 +4481,10 @@ export default {
       // 改为在当前页面恢复初始状态；根据当前上下文自动重新打开生成确认弹窗。
       const hasReqDocMarkdown = this.reqDoc && this.reqDoc.markdown && this.reqDoc.markdown.trim()
       const hasAnalyzeResult = this.analyzeResult && this.analyzeResult.trim()
+      // 分页后：重置时把标签切回对应的入口，否则用户会停在"上传文档"标签上
+      // 却看到一个需求文档生成的弹窗，以为串了。
       if (hasReqDocMarkdown) {
+        this.generateSource = 'reqdoc'
         // 复用需求文档生成入口，弹窗让用户选项目/版本/模块
         this.useReqDocForGeneration()
       } else if (hasAnalyzeResult && this.currentResultId) {
@@ -4060,7 +4500,9 @@ export default {
           version_id: this.selectedVersion || null,
           feature_module_id: null,
           test_point_id: null,
-          generation_mode: 'smart'
+          generation_mode: 'smart',
+          defect_review: null,
+          defect_review_detail_level: ''
         }
         // 触发项目切换的副作用（清空版本/模块/测试点）
         this.onConfirmProjectChange()
@@ -4073,6 +4515,8 @@ export default {
       } else {
         // 都没数据：提示用户先去生成需求文档
         ElMessage.warning('请先生成或选择一份需求文档，然后再生成测试用例')
+        // 分页后把标签切回默认入口，否则可能停在某个空白标签上不知道从哪开始
+        this.generateSource = 'manual'
         console.log('[DEBUG] resetGeneration 两个分支都没数据')
       }
     },
@@ -5564,6 +6008,42 @@ export default {
   flex-wrap: wrap;
 }
 
+/* 历史缺陷测试点注入审计 */
+.defect-audit {
+  margin-bottom: 20px;
+  padding: 12px 16px;
+  text-align: left;
+  background: #f7f9fc;
+  border: 1px solid #e4e9f2;
+  border-radius: 8px;
+}
+.defect-audit-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.defect-audit-title {
+  font-weight: 600;
+  color: #303133;
+}
+.defect-audit-meta {
+  font-size: 12px;
+  color: #909399;
+}
+.defect-audit-toggle {
+  margin-left: auto;
+  font-size: 12px;
+  color: #409eff;
+}
+.defect-audit-reason {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #606266;
+  line-height: 1.6;
+}
+
 .progress-item {
   display: flex;
   flex-direction: column;
@@ -7004,6 +7484,169 @@ export default {
   gap: 8px;
   cursor: pointer;
   font-size: 0.85rem;
+}
+
+/* 版本下拉空态提示 */
+.version-empty-hint {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+/* 生成方式分页标签 */
+.gen-source-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+@media (max-width: 900px) {
+  .gen-source-tabs {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.gen-source-tab {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+}
+
+.gen-source-tab:hover {
+  border-color: #93c5fd;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.1);
+}
+
+.gen-source-tab.active {
+  border-color: #3b82f6;
+  background: linear-gradient(135deg, #eff6ff 0%, #f8fbff 100%);
+  box-shadow: 0 4px 14px rgba(59, 130, 246, 0.18);
+}
+
+.gst-icon {
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.gst-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.gst-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.gen-source-tab.active .gst-title {
+  color: #1d4ed8;
+}
+
+.gst-desc {
+  font-size: 0.76rem;
+  color: #94a3b8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 主页面「历史缺陷测试点」卡片 */
+.defect-global-select {
+  flex: 1;
+  min-width: 320px;
+  max-width: 640px;
+  padding: 10px 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  background: #fff;
+  box-sizing: border-box;
+  cursor: pointer;
+}
+
+.defect-global-select:disabled {
+  background: #f1f5f9;
+  cursor: not-allowed;
+}
+
+.defect-global-hint {
+  color: #94a3b8;
+  font-size: 0.82rem;
+}
+
+/* 历史缺陷复盘注入预览 */
+.defect-preview-box {
+  margin-top: 4px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.defect-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e2e8f0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.defect-preview-tag {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.defect-preview-tag.ok {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.defect-preview-tag.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.defect-preview-loading,
+.defect-preview-reason {
+  padding: 12px;
+  font-size: 0.82rem;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.defect-preview-body {
+  margin: 0;
+  padding: 12px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: #334155;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .quick-version-body .checkbox-label input[type="checkbox"] {

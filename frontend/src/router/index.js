@@ -126,6 +126,11 @@ const routes = [
         component: () => import('@/views/zentao/ZentaoCoverage.vue')
       },
       {
+        path: 'zentao-defect-review',
+        name: 'ZentaoDefectReview',
+        component: () => import('@/views/zentao/ZentaoDefectReview.vue')
+      },
+      {
         path: 'reviews',
         name: 'Reviews',
         component: () => import('@/views/reviews/ReviewList.vue')

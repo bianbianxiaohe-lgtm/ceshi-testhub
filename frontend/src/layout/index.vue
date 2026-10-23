@@ -25,6 +25,7 @@
               <el-menu-item index="/ai-generation/modao-skill">墨刀需求用例</el-menu-item>
               <el-menu-item index="/ai-generation/prompt-config">提示词配置</el-menu-item>
               <el-menu-item index="/ai-generation/zentao-coverage">禅道覆盖分析</el-menu-item>
+              <el-menu-item index="/ai-generation/zentao-defect-review">历史缺陷复盘</el-menu-item>
             </el-sub-menu>
             <el-menu-item index="/ai-generation/projects">
               <el-icon><Folder /></el-icon>
