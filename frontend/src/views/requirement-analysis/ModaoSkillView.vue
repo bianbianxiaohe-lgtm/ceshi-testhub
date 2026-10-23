@@ -114,7 +114,7 @@
         <!-- 左侧：画布模块列表 -->
         <div class="canvas-list">
           <div class="canvas-list-toolbar">
-            <el-checkbox v-model="checkAll" :indeterminate="canvasIndeterminate" @click.stop>全选</el-checkbox>
+            <el-checkbox v-model="checkAll" :indeterminate="canvasIndeterminate" @change="toggleSelectAll">全选</el-checkbox>
             <span class="canvas-count">已选 {{ canvasSelectedCount }}/{{ canvasPages.length }}</span>
           </div>
           <div
@@ -242,6 +242,15 @@
         <div class="artifact-head">
           <h4>需求摘要</h4>
           <div class="artifact-actions">
+            <el-radio-group
+              v-if="editingField !== 'requirement_summary'"
+              v-model="stage1ViewMode"
+              size="small"
+              class="stage1-view-toggle"
+            >
+              <el-radio-button label="visual">👁️ 可视化</el-radio-button>
+              <el-radio-button label="raw">📜 YAML</el-radio-button>
+            </el-radio-group>
             <el-button size="small" plain @click="beginEdit('requirement_summary')"
               :disabled="editingField && editingField !== 'requirement_summary'">✏️ 编辑</el-button>
             <el-button size="small" plain type="info"
@@ -264,7 +273,10 @@
             <el-button size="small" type="warning" :loading="xmindExporting" @click="onExportXmind">确认无误，下载</el-button>
           </div>
         </el-dialog>
-        <pre v-if="editingField !== 'requirement_summary'" class="md-box">{{ proto.requirement_summary }}</pre>
+        <div v-if="editingField !== 'requirement_summary'" class="stage1-summary-container">
+          <RequirementSummaryViewer v-if="stage1ViewMode === 'visual'" :raw="proto.requirement_summary" />
+          <pre v-else class="md-box">{{ proto.requirement_summary }}</pre>
+        </div>
         <template v-else>
           <el-input v-model="editBuffer" type="textarea" :rows="12" />
           <div class="edit-actions">
@@ -945,10 +957,11 @@
 import request from '@/utils/api'
 import { load as yamlLoad } from 'js-yaml'
 import ModaoQA from './ModaoQA.vue'
+import RequirementSummaryViewer from './RequirementSummaryViewer.vue'
 
 export default {
   name: 'ModaoSkillView',
-  components: { ModaoQA },
+  components: { ModaoQA, RequirementSummaryViewer },
   props: {
     // 二级路由 modao-canvas/:id 传入的任务 id；无则为新建空态
     id: { type: [String, Number], default: null },
@@ -958,6 +971,7 @@ export default {
       step: 0,
       protoId: null,
       proto: null,
+      stage1ViewMode: 'visual',
       canvasConfirmed: false,
       canvasActiveId: null,
       activeShotIdx: 0,
@@ -3597,8 +3611,10 @@ export default {
   font-size: 11px; color: #67c23a; margin-left: auto; white-space: nowrap;
 }
 .artifact h4 { margin: 0 0 4px; color: #1f2937; }
-.artifact-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.artifact-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
 .artifact-head .hint { color: #9ca3af; font-size: 12px; }
+.artifact-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.stage1-summary-container { margin-top: 10px; }
 .clarify-item {
   border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; margin-top: 12px;
   background: #fff;

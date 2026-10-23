@@ -2099,15 +2099,24 @@ class ModaoWorkflow:
             '—— 原文"每次进入默认展示当前月份"中的【每次】已定义重置语义：无论切 Tab、返回还是刷新，重新进入一律重置为当前月，'
             '"保持上次选择"与"重置"不构成两种产品口径，禁止输出。'
         )
-        out = self._llm(self.analyzer_config, prompt, max_tokens=6000, temperature=0)
+        out = self._llm(self.analyzer_config, prompt, max_tokens=8000, temperature=0)
         # 先剥除 markdown code block 包裹（temperature=0 下模型更倾向用 ```json 包裹）
         stripped = _extract_block(out, 'json')
         if not stripped:
             stripped = _extract_block(out, None)
+        raw_to_parse = stripped or out or ''
         try:
-            clarify_items = json.loads(stripped or out)
+            clarify_items = json.loads(raw_to_parse)
         except Exception:
-            clarify_items = None
+            # 容错：当条数过多命中 max_tokens 导致 JSON 列表被截断（末尾缺少 ]）时，截取至最后一个完整对象闭合
+            try:
+                last_brace = raw_to_parse.rfind('},')
+                if last_brace != -1:
+                    clarify_items = json.loads(raw_to_parse[:last_brace+1] + '\n]')
+                else:
+                    clarify_items = None
+            except Exception:
+                clarify_items = None
         if isinstance(clarify_items, list):
             invalid_count = 0
             for item in clarify_items:
