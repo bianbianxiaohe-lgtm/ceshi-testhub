@@ -27,6 +27,43 @@ from apps.requirement_analysis.models import (
 )
 
 
+def _save_defect_review_audit(task, review, relevance, payload):
+    """把「本次实际注入了哪些历史测试点」写到任务上，供界面审计。
+
+    为什么必须落库：此前只写 logger，重启即丢、用户也看不到，
+    导致「生成后想复盘用了哪几条」完全无从查起（2026-10-23 用户提出）。
+
+    审计写入失败**绝不能影响生成主流程**，因此整体 try 包裹后只告警。
+    """
+    try:
+        import datetime as _dt
+        data = {
+            'injected': bool(payload.get('injected')),
+            'reason': (relevance or {}).get('reason') or '',
+            'mode': (relevance or {}).get('mode') or '',
+            'matched_domains': (relevance or {}).get('matched_domains') or [],
+            'matched_scenes': (relevance or {}).get('matched_scenes') or [],
+            'irrelevant_hits': (relevance or {}).get('irrelevant_hits') or [],
+            'items': payload.get('items') or [],
+            'used_count': int(payload.get('used_count') or 0),
+            'candidate_count': int(payload.get('candidate_count') or 0),
+            'detail_level': payload.get('detail_level') or '',
+            'prompt_chars': int(payload.get('prompt_chars') or 0),
+            'review_id': getattr(review, 'id', None),
+            'review_name': getattr(review, 'name', '') or '',
+            'at': _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        # 只更新这一列，避免把任务其他并发修改覆盖回去
+        TestCaseGenerationTask.objects.filter(pk=task.pk).update(
+            defect_review_used=data,
+        )
+    except Exception as exc:  # noqa: BLE001 - 审计失败不影响生成
+        logger.warning(
+            '[DEFECT-TP] 写入注入审计失败 task=%s: %s',
+            getattr(task, 'task_id', '?'), exc,
+        )
+
+
 class AIModelService:
     """AI模型服务类"""
 
@@ -1245,6 +1282,118 @@ class AIModelService:
         return '\n'.join(lines)
 
     @staticmethod
+    def _build_defect_review_section(task: 'TestCaseGenerationTask') -> str:
+        """构建「历史缺陷复盘测试点」注入段（方案 A：任务级显式开关）。
+
+        ⚠️ 隔离设计（2026-10-22 与用户确认）：
+          1. 只有 task.defect_review 非空才注入 —— 不选则返回空串，
+             既有任务行为完全不变，避免"一次复盘污染以后所有生成"。
+          2. 即使关联了，也按**本次需求文本**二次筛选（功能域 + 变更意图），
+             防止"该模块历史 bug 多"就生成一堆与本次改动无关的用例。
+          3. **严格相关性闸门**：需求与该产品历史缺陷体系毫无关联（如"仅调整后端
+             日志格式"）时直接不注入，宁可不注入也不注入无关内容。判断逻辑见
+             `defect_review.assess_defect_relevance(mode='strict')`。
+          4. 测试点只存在于复盘报告里，不写入 ProjectKnowledge，不会被 RAG 全局召回。
+
+        必须在同步上下文（views.py 预取段）调用，避免 async 内懒加载 ORM。
+        """
+        review = getattr(task, 'defect_review', None)
+        if not review:
+            return ''
+        try:
+            from apps.zentao.defect_review import (
+                assess_defect_relevance,
+                build_testpoint_prompt_block_with_meta,
+                detect_change_intent,
+                scope_by_relevance,
+            )
+
+            tps = list(review.testpoints_json or [])
+            if not tps:
+                _save_defect_review_audit(task, review, {
+                    'reason': '复盘报告没有测试点', 'mode': 'strict',
+                    'matched_domains': [], 'matched_scenes': [], 'irrelevant_hits': [],
+                }, {
+                    'injected': False, 'items': [], 'used_count': 0,
+                    'candidate_count': 0, 'detail_level': '', 'prompt_chars': 0,
+                })
+                return ''
+            # 优先用用户勾选的测试点；未勾选则用全部
+            selected = [tp for tp in tps if tp.get('selected')]
+            pool = selected or tps
+
+            requirement_text = task.requirement_text or ''
+            intent = detect_change_intent(requirement_text)
+
+            # ⭐ 相关性闸门（严格模式，2026-10-22 与用户确认）：
+            # 需求与历史缺陷体系无任何关联时不注入。必须用**全量**测试点判断，
+            # 不能用已勾选收窄后的 pool，否则推荐结果会因勾选而失真。
+            relevance = assess_defect_relevance(requirement_text, tps, mode='strict')
+            if not relevance['relevant']:
+                logger.info(
+                    '[DEFECT-TP] 严格模式未注入 task=%s review=%s 原因：%s',
+                    task.task_id, review.id, relevance['reason'],
+                )
+                _save_defect_review_audit(task, review, relevance, {
+                    'injected': False,
+                    'items': [],
+                    'used_count': 0,
+                    'candidate_count': 0,
+                    'detail_level': '',
+                    'prompt_chars': 0,
+                })
+                return ''
+            domains = relevance['matched_domains']
+
+            detail_level = (task.defect_review_detail_level or '').strip()
+            if detail_level not in ('brief', 'standard', 'full'):
+                # 未显式指定：小改动用精简档省预算，其余用标准档
+                detail_level = 'brief' if intent.get('scale') == 'small' else 'standard'
+
+            # ⭐ 相关性收窄必须与预览接口共用同一实现，否则会出现
+            # "预览 1247 字符、真实注入 467 字符"的黑盒落差。
+            scoped_pool, max_points = scope_by_relevance(pool, relevance, 20)
+
+            # 用 _with_meta 版本取回「实际进入 prompt 的条目」，落库供审计
+            block, block_meta = build_testpoint_prompt_block_with_meta(
+                scoped_pool,
+                domains=domains,
+                max_points=max_points,
+                detail_level=detail_level,
+                requirement_text=requirement_text,
+            )
+            if not block:
+                _save_defect_review_audit(task, review, relevance, {
+                    'injected': False,
+                    'items': [],
+                    'used_count': 0,
+                    'candidate_count': len(scoped_pool),
+                    'detail_level': detail_level,
+                    'prompt_chars': 0,
+                })
+                return ''
+            items = block_meta.get('items') or []
+            logger.info(
+                '[DEFECT-TP] 注入历史测试点 task=%s review=%s tps=%d domains=%s detail=%s chars=%d 条数=%d 依据：%s',
+                task.task_id, review.id, len(pool), domains, detail_level, len(block),
+                len(items), relevance['reason'],
+            )
+            _save_defect_review_audit(task, review, relevance, {
+                'injected': True,
+                'items': items,
+                'used_count': len(items),
+                'candidate_count': len(scoped_pool),
+                'detail_level': detail_level,
+                'prompt_chars': len(block),
+            })
+            return block
+        except Exception as exc:
+            # 注入失败不能阻断生成主流程
+            logger.warning('[DEFECT-TP] 构建历史测试点注入段失败 task=%s: %s',
+                           getattr(task, 'task_id', '?'), exc)
+            return ''
+
+    @staticmethod
     def _build_human_feedback_context(task: 'TestCaseGenerationTask') -> str:
         """
         从 task.human_feedback（评审确认卡片）解析出「已真正填写」的人工确认项，
@@ -1310,11 +1459,17 @@ class AIModelService:
         # 异常场景类型统计注入（来自该版本覆盖率报告，按生成模式条件化措辞）
         abnormal_scene_section = getattr(task, '_pre_abnormal_scene', '')
 
+        # 历史缺陷复盘测试点注入（方案 A：仅当本次任务显式关联了复盘报告才有内容）
+        # 位置：知识库之后、异常场景之前——先给"历史坑"，但不抢需求文档的主体地位
+        defect_tp_section = getattr(task, '_pre_defect_testpoints', '')
+        defect_tp_block = f"{defect_tp_section}\n\n" if defect_tp_section else ""
+
         # 构建用户提示
         user_message = (
             f"请深入分析以下需求文档，并设计测试用例。\n\n"
             f"{knowledge_section}"
             f"{confirmed_block}"
+            f"{defect_tp_block}"
             f"{mode_instructions}\n"
             f"{abnormal_scene_section}"
             f"5. **⚠️ 输出顺序要求（必须严格执行）**：\n"
@@ -1444,11 +1599,17 @@ class AIModelService:
         # 异常场景类型统计注入（来自该版本覆盖率报告，按生成模式条件化措辞）
         abnormal_scene_section = getattr(task, '_pre_abnormal_scene', '')
 
+        # 历史缺陷复盘测试点注入（方案 A：仅当本次任务显式关联了复盘报告才有内容）
+        # 位置：知识库之后、异常场景之前——先给"历史坑"，但不抢需求文档的主体地位
+        defect_tp_section = getattr(task, '_pre_defect_testpoints', '')
+        defect_tp_block = f"{defect_tp_section}\n\n" if defect_tp_section else ""
+
         # 构建用户提示
         user_message = (
             f"请深入分析以下需求文档，并设计测试用例。\n\n"
             f"{knowledge_section}"
             f"{confirmed_block}"
+            f"{defect_tp_block}"
             f"{mode_instructions}\n"
             f"{abnormal_scene_section}"
             f"5. **⚠️ 输出顺序要求（必须严格执行）**：\n"

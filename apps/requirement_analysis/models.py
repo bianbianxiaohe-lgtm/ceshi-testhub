@@ -464,6 +464,16 @@ class TestCaseGenerationTask(models.Model):
         verbose_name='测试点注入详略',
         help_text='brief/standard/full；留空则按改动规模自动决定',
     )
+    # 注入审计（2026-10-23 用户提出：生成时要知道「到底用了哪几条」）
+    # 生成侧此前只在日志里记「注入了 N 条、多少字符」，重启即丢且用户看不到。
+    # 这里把**实际进入 prompt 的测试点快照**落到任务上，供任务详情页与报告页反查。
+    # 结构：{injected, reason, matched_domains, items:[{domain,scene,title,count}],
+    #        used_count, candidate_count, detail_level, prompt_chars, at}
+    defect_review_used = models.JSONField(
+        null=True, blank=True,
+        verbose_name='历史测试点注入审计',
+        help_text='本次实际注入的历史测试点快照；NULL 表示未关联复盘或尚未执行',
+    )
     review_count = models.IntegerField(default=0, verbose_name='评审次数')  # 0=未评审, 1=首次, 2+=重新评审
     review_updated_at = models.DateTimeField(null=True, blank=True, verbose_name='最后评审时间')
 
