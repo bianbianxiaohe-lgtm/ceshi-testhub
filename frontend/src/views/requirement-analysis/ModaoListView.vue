@@ -34,8 +34,11 @@
                 <h4>错误信息</h4>
                 <pre class="log-box error-box">{{ row.error_message }}</pre>
               </div>
-              <div v-if="!row.work_log && !row.error_message" class="empty-hint" style="padding:8px 0">
+              <div v-if="!row.work_log && !row.error_message && !row.has_work_log" class="empty-hint" style="padding:8px 0">
                 暂无工作日志
+              </div>
+              <div v-else-if="!row.work_log && row.has_work_log" class="empty-hint" style="padding:8px 0">
+                正在加载工作日志…
               </div>
             </div>
           </template>

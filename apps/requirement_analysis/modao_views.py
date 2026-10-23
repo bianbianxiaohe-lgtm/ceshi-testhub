@@ -35,7 +35,10 @@ from django.http import FileResponse, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.requirement_analysis.models import ModaoPrototype, ModaoPage
-from apps.requirement_analysis.serializers import ModaoPrototypeSerializer, ModaoPageSerializer
+from apps.requirement_analysis.serializers import (
+    ModaoPrototypeSerializer, ModaoPageSerializer, ModaoPrototypeListSerializer,
+    ModaoPrototypeLightSerializer,
+)
 from apps.requirement_analysis.modao_workflow import ModaoWorkflow, _parse_yaml, _extract_block
 from apps.requirement_analysis import modao_xmind
 from apps.feature_modules.models import FeatureModule, TestPoint
@@ -714,9 +717,15 @@ def modao_list(request):
     # 批量回收列表中可能卡死的 designing 状态
     for p in qs.filter(status__in=('extracting', 'structuring', 'clarifying', 'designing')):
         _recover_stale_designing(p)
+    # ⚠️ 必须用轻量序列化器（2026-10-23）：
+    # 原来这里用完整的 ModaoPrototypeSerializer，把每个原型的全部阶段产物
+    # （extracted_json / testcases_json / pages 逐页数据等）都塞进列表响应，
+    # 实测 35 个原型 = **26.9MB**，页面表现为"标题先出、表格数据等很久"。
+    # 列表页一个都不渲染这些字段，改用 ModaoPrototypeListSerializer 后约 20KB 级。
+    qs = qs.select_related('project', 'version', 'created_by')
     return Response({
         'is_admin': is_admin,
-        'results': ModaoPrototypeSerializer(qs, many=True).data,
+        'results': ModaoPrototypeListSerializer(qs, many=True).data,
     })
 
 
@@ -792,6 +801,18 @@ def modao_reset(request, pk):
                         status=http_status.HTTP_409_CONFLICT)
 
     _reset_modao_workflow(proto)
+    # 轻量模式（?light=1）：只给画布看板首屏需要的字段。
+    # 2026-10-23 性能修复：完整详情实测 2113KB / 5s，其中 pages 重字段 1091KB
+    # （page_testcases_json/page_summary/page_testpoints_json/page_smoke_json）
+    # 只在「进入当前阶段」抽屉和「用例集合」tab 用到，首屏画布卡片完全不需要。
+    # 轻量模式约 112KB（-95%），前端切 tab / 开抽屉时再拉一次全量。
+    is_light = str(request.query_params.get('light') or '').lower() in ('1', 'true', 'yes')
+    if is_light:
+        data = ModaoPrototypeLightSerializer(proto).data
+        # 注意：轻量模式不返回用例产物，adopted_keys 依赖 testcases/smoke 解析，
+        # 首屏画布卡片也不需要它；仅全量模式提供。
+        return Response(data)
+
     data = ModaoPrototypeSerializer(proto).data
     # 前端「用例合并采纳」隐藏已采纳行用：已入库用例的 key 集合（普通=pageId#index，冒烟=smoke#pageId#index）
     data['adopted_keys'] = sorted(_adopted_entry_keys(proto))
@@ -1525,6 +1546,18 @@ def modao_detail(request, pk):
         title = proto.title
         proto.delete()
         return Response({'detail': f'已删除「{title}」'})
+    # 轻量模式（?light=1）：只给画布看板首屏需要的字段。
+    # 2026-10-23 性能修复：完整详情实测 2113KB / 5s，其中 pages 重字段 1091KB
+    # （page_testcases_json/page_summary/page_testpoints_json/page_smoke_json）
+    # 只在「进入当前阶段」抽屉和「用例集合」tab 用到，首屏画布卡片完全不需要。
+    # 轻量模式约 112KB（-95%），前端切 tab / 开抽屉时再拉一次全量。
+    is_light = str(request.query_params.get('light') or '').lower() in ('1', 'true', 'yes')
+    if is_light:
+        data = ModaoPrototypeLightSerializer(proto).data
+        # 注意：轻量模式不返回用例产物，adopted_keys 依赖 testcases/smoke 解析，
+        # 首屏画布卡片也不需要它；仅全量模式提供。
+        return Response(data)
+
     data = ModaoPrototypeSerializer(proto).data
     # 前端「用例合并采纳」隐藏已采纳行用：已入库用例的 key 集合（普通=pageId#index，冒烟=smoke#pageId#index）
     data['adopted_keys'] = sorted(_adopted_entry_keys(proto))

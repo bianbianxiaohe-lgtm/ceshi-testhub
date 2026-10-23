@@ -239,6 +239,10 @@ export default {
       // 同时用于 loadDetail 时"不被轮询覆盖"，见 loadDetail 里的注释。
       pendingSelection: {},
       _selTimer: null,
+      // 首屏走 ?light=1 轻量接口；这两个标记控制"是否已补拉过全量详情"，
+      // 一旦补拉过，后续轮询也必须用全量，避免把抽屉/用例集合刚拿到的大字段清掉。
+      _fullLoaded: false,
+      _fullLoading: false,
     }
   },
   computed: {
@@ -323,6 +327,14 @@ export default {
       return this.pages.filter(p => (p.folder || '').trim() === this.folderFilter)
     },
   },
+  watch: {
+    // 切到「用例集合」tab 时才需要逐页用例产物（allCases/allSmoke 会遍历
+    // page_testcases_json / page_smoke_json），首屏 light 模式不含这些字段，
+    // 因此在这里按需补拉全量详情。
+    activeTab(val) {
+      if (val === 'cases') this.ensureFullDetail()
+    }
+  },
   mounted() {
     // protoId 必须是数字 pk；非数字（如 'new'）说明入口错误，跳过 loadDetail 避免 404 报错
     if (this.protoId && !isNaN(Number(this.protoId))) {
@@ -402,8 +414,25 @@ export default {
     async loadDetail() {
       this.loading = true
       try {
-        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        // 首屏只拉轻量数据（?light=1）：完整详情实测 2113KB/5s，
+        // 其中 1091KB 是逐页用例产物，而画布卡片一个都不渲染。
+        // 轻量模式约 112KB（-95%）；切「用例集合」tab 或开「进入当前阶段」抽屉时
+        // 再由 ensureFullDetail() 补拉全量。
+        //
+        // ⚠️ 一旦拉过全量（_fullLoaded），之后的轮询也必须用全量：
+        // 否则 3 秒后 openCanvas/用例集合 刚拿到的 page_testcases_json 等
+        // 会被轻量响应覆盖掉，抽屉内容"闪一下又空了"。
+        const params = this._fullLoaded ? {} : { light: 1 }
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get', params })
         this.proto = res.data
+        if (this._fullLoaded) {
+          // 保持抽屉聚焦对象同步到新的页面对象（loadDetail 会替换 pages 数组）
+          const fid = this.focused && this.focused.id
+          if (fid) {
+            const found = (this.pages || []).find(x => x.id === fid)
+            if (found) this.focused = found
+          }
+        }
         const incoming = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
         // 勾选状态以服务端为准（它已持久化），但用户刚点、还没写回完成的改动
         // 不能被轮询结果覆盖 —— 否则会出现"勾了又被弹回去"的抖动。
@@ -419,6 +448,44 @@ export default {
         this.$message.error('加载失败：' + (e.response?.data?.detail || e.message))
       } finally {
         this.loading = false
+      }
+    },
+    /**
+     * 按需补拉全量详情（含逐页用例产物）。
+     *
+     * 首屏走 light 模式省掉 1091KB 的 page_testcases_json / page_summary /
+     * page_testpoints_json / page_smoke_json，只有这两处真正需要它们：
+     *   ① 切到「用例集合」tab（allCases / allSmoke 要遍历逐页用例）
+     *   ② 打开「进入当前阶段」抽屉（focused.page_* 要渲染各阶段产物）
+     * 拉过一次就置 _fullLoaded，不重复请求。
+     */
+    async ensureFullDetail() {
+      if (this._fullLoaded || this._fullLoading) return
+      this._fullLoading = true
+      try {
+        const res = await request({ url: `${this.base()}/${this.protoId}/`, method: 'get' })
+        const incoming = (res.data.pages || []).slice().sort((a, b) => (a.page_no || 0) - (b.page_no || 0))
+        const pending = this.pendingSelection
+        this.pages = incoming.map(p => {
+          if (pending && Object.prototype.hasOwnProperty.call(pending, p.id)) {
+            return { ...p, selected: pending[p.id] }
+          }
+          return p
+        })
+        // 顶层字段（testcases_json/merged_testcases_json 等）也一并补上，
+        // 但保留轻量阶段已有的 proto 结构，避免覆盖掉首屏正在用的字段
+        this.proto = { ...this.proto, ...res.data }
+        this._fullLoaded = true
+        // 抽屉正开着时，把 focused 指向新对象，产物区域才能渲染出来
+        if (this.focused) {
+          const again = this.pages.find(p => p.id === this.focused.id)
+          if (again) this.focused = again
+        }
+      } catch (e) {
+        // 补拉失败不影响首屏查看，用户仍能看到画布卡片
+        console.warn('[canvas-board] 补拉全量详情失败:', e?.message)
+      } finally {
+        this._fullLoading = false
       }
     },
     /**
@@ -454,9 +521,15 @@ export default {
           + (e.response?.data?.detail || e.message))
       }
     },
-    openCanvas(p) {
+    async openCanvas(p) {
+      // 抽屉要渲染 page_summary / page_testpoints_json / page_testcases_json /
+      // page_smoke_json 等逐页产物，首屏 light 模式没有这些字段 ⇒ 先补拉全量。
+      // 已拉过（_fullLoaded）时 ensureFullDetail 会立即返回，无额外请求。
       this.focused = p
       this.drawerVisible = true
+      if (!this._fullLoaded) {
+        await this.ensureFullDetail()
+      }
     },
     /** 画布产物保存后：刷新列表并保持抽屉停在同一个画布上（loadDetail 会替换 pages 数组） */
     async onArtifactSaved() {
