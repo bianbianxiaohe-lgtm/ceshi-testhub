@@ -28,6 +28,17 @@ services:
     restart: always
     env_file:
       - .env
+    # 非敏感运行配置：显式写在 compose 里，避免被 .env 里的人工改动悄悄覆盖。
+    # docker compose 的 environment 优先级高于 env_file，同名键以这里为准。
+    # ⚠️ 敏感项（SECRET_KEY / DB_PASSWORD / MYSQL_* / EMAIL_HOST_PASSWORD）只留在 .env，禁止写到这里。
+    environment:
+      # 生产必须为 False：True 会让 500 错误返回完整 traceback + 全部 settings，
+      # 曾因前端轮询无上限叠加导致连接数打满（2026-10-22 事故）。
+      DEBUG: "False"
+      ALLOWED_HOSTS: "localhost,127.0.0.1,192.168.8.75"
+      CORS_ALLOWED_ORIGINS: "http://localhost:8080,http://127.0.0.1:8080,http://192.168.8.75:8080"
+      CSRF_TRUSTED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://192.168.8.75:8080"
+      PYTHONUNBUFFERED: "1"
     volumes:
       - testhub-media:/app/media
       - testhub-logs:/app/logs

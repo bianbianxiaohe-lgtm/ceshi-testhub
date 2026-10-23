@@ -16,6 +16,9 @@ db.sqlite3
 # 忽略.env
 .env
 .env.dev
+# .env 备份同样含密钥，禁止入库（2026-10-23 迁移非敏感项时产生）
+.env.bak*
+.env.*.bak*
 
 # # 忽略所有 app/*/migrations/ 目录下的所有内容 (包括文件和子目录)
 # apps/*/migrations/*
@@ -118,6 +121,11 @@ nul; Write-Output cleaned
 /_*.js
 /_*.conf
 /.codebuddy/memory/
+
+# 本地临时验证目录与前端打包产物（2026-10-23 补）
+/tmp/
+frontend/_*.tar
+frontend/_*.tmp.tar
 
 # 本地数据库 dump（4GB 级，绝对禁止入库）
 _db_backup/
