@@ -1588,6 +1588,26 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             if 'test_point' in validated_data and validated_data['test_point']:
                 task_data['test_point'] = validated_data['test_point']
 
+            # 历史缺陷复盘注入（方案 A）：仅在显式传入时绑定；不传则为 NULL，行为不变
+            defect_review_id = validated_data.get('defect_review')
+            if defect_review_id:
+                from apps.zentao.models import DefectReviewReport
+                review = DefectReviewReport.objects.filter(
+                    id=defect_review_id, status='success'
+                ).first()
+                if not review:
+                    return Response(
+                        {'error': '关联的历史缺陷复盘不存在或尚未完成分析'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                task_data['defect_review'] = review.id
+                task_data['defect_review_detail_level'] = (
+                    validated_data.get('defect_review_detail_level') or ''
+                )
+                logger.info(
+                    f"[CASE-GEN] 关联历史缺陷复盘 review={review.id} tps={len(review.testpoints_json or [])}"
+                )
+
             # 处理生成模式
             generation_mode = validated_data.get('generation_mode', 'smart')
             task_data['generation_mode'] = generation_mode
@@ -1668,7 +1688,10 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                                 task._pre_fetched_knowledge_context = AIModelService.build_knowledge_context(task)
                                 # 异常场景统计（查 CoverageReport，必须在 async 外完成，否则 async 内 SynchronousOnlyOperation）
                                 task._pre_abnormal_scene = AIModelService._build_abnormal_scene_section(task)
-                                logger.info(f"[PREFETCH] writer_prompt={bool(task._pre_writer_prompt)}, reviewer_prompt={bool(task._pre_reviewer_prompt)}, kb={len(task._pre_fetched_knowledge_context)}, abnormal_scenes={len(task._pre_abnormal_scene)}")
+                                # 历史缺陷复盘测试点注入（方案 A：仅当本任务显式关联了复盘报告）
+                                # 必须在 async 外完成查询；未关联时为空串，行为与旧版完全一致
+                                task._pre_defect_testpoints = AIModelService._build_defect_review_section(task)
+                                logger.info(f"[PREFETCH] writer_prompt={bool(task._pre_writer_prompt)}, reviewer_prompt={bool(task._pre_reviewer_prompt)}, kb={len(task._pre_fetched_knowledge_context)}, abnormal_scenes={len(task._pre_abnormal_scene)}, defect_tp={len(task._pre_defect_testpoints)}")
 
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
@@ -2172,7 +2195,11 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
                 'review_feedback': task.review_feedback,
                 'final_test_cases': task.final_test_cases,
                 'error_message': task.error_message,
-                'completed_at': task.completed_at
+                'completed_at': task.completed_at,
+                # 注入审计：前端据此展示「本次实际用了哪几条历史测试点」
+                'defect_review': task.defect_review_id,
+                'defect_review_detail_level': task.defect_review_detail_level,
+                'defect_review_used': task.defect_review_used,
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
