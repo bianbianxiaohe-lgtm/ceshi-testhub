@@ -245,10 +245,16 @@ class RegistrationStatsAdmin(admin.ModelAdmin):
     list_per_page = 20
 
     def _is_allowed(self, request):
-        if not settings.REGISTRATION_STATS_ENABLED:
+        # ⚠️ 这两个配置项在 backend/settings.py 中并未定义。
+        # 2026-10-22 关闭生产 DEBUG 后，admin 登录页直接 500：
+        # `AttributeError: 'Settings' object has no attribute 'REGISTRATION_STATS_ENABLED'`
+        # 用 getattr 兜底，保持与原意一致的默认行为：
+        #   REGISTRATION_STATS_ENABLED 缺省 False（该后台区块默认不开放，更安全）
+        #   REGISTRATION_STATS_VISIBLE_USERNAMES 缺省空列表（则回退到 is_superuser 判断）
+        if not getattr(settings, 'REGISTRATION_STATS_ENABLED', False):
             return False
 
-        visible_usernames = set(settings.REGISTRATION_STATS_VISIBLE_USERNAMES or [])
+        visible_usernames = set(getattr(settings, 'REGISTRATION_STATS_VISIBLE_USERNAMES', None) or [])
         if visible_usernames:
             return request.user.is_authenticated and request.user.username in visible_usernames
         return request.user.is_authenticated and request.user.is_superuser

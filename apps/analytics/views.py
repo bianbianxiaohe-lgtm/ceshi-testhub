@@ -36,7 +36,9 @@ class AnalyticsEventIngestView(APIView):
         if not events:
             return Response({'detail': '埋点数据不能为空'}, status=status.HTTP_400_BAD_REQUEST)
 
-        max_batch_size = max(1, settings.ANALYTICS_MAX_BATCH_SIZE)
+        # ANALYTICS_MAX_BATCH_SIZE 在 backend/settings.py 中并未定义；
+        # 关闭 DEBUG 后这类未定义属性会直接 AttributeError → 500，故用 getattr 兜底。
+        max_batch_size = max(1, getattr(settings, 'ANALYTICS_MAX_BATCH_SIZE', 500))
         if len(events) > max_batch_size:
             return Response(
                 {'detail': f'单次最多允许上报 {max_batch_size} 条埋点事件'},

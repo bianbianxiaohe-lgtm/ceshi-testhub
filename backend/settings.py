@@ -8,7 +8,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = config('SECRET_KEY')
 
-DEBUG = config('DEBUG', default=True, cast=bool)
+# ⚠️ 默认必须是 False：2026-10-22 生产事故中生产环境跑在 DEBUG=True 下，
+# 任何 500 都会返回含完整源码的 ~313KB 调试页，既泄露代码又把响应体放大百倍。
+# 需要调试的环境（dev）必须在 .env.dev 里显式写 DEBUG=True，不做隐式兜底。
+DEBUG = config('DEBUG', default=False, cast=bool)
 
 # 设备端 agent（scripts/ios_wda_host.bat）自动注册设备时使用的共享令牌。
 # 留空 = 不校验（内网部署）；配置后 agent 必须在 X-Device-Token 头里带上同值。
