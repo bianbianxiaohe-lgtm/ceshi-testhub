@@ -148,6 +148,80 @@ if not cur.fetchone()[0]:
 else:
     print('projects.role_id already exists')
 
+# ---------------------------------------------------------------------------
+# 2026-10-22 历史缺陷复盘（从禅道库读取全量历史 Bug → 提炼测试点 → 生成用例）
+# ---------------------------------------------------------------------------
+# zentao_configs 增加禅道 MySQL 只读连接字段。
+# 背景：HTTP 接口只能同步到当前 Build 的 Bug，全量历史必须直连库。
+cur.execute('''
+CREATE TABLE IF NOT EXISTS zentao_defect_reviews (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(200) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'running',
+    product_ids JSON NULL,
+    date_from DATE NULL,
+    date_to DATE NULL,
+    excluded_types JSON NULL,
+    bug_total INT NOT NULL DEFAULT 0,
+    domain_count INT NOT NULL DEFAULT 0,
+    testpoint_count INT NOT NULL DEFAULT 0,
+    stats_json JSON NULL,
+    testpoints_json JSON NULL,
+    error_message LONGTEXT NOT NULL,
+    llm_model VARCHAR(100) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL,
+    finished_at DATETIME NULL,
+    config_id INT NULL,
+    project_id INT NULL,
+    version_id INT NULL,
+    created_by_id INT NULL,
+    KEY zentao_defect_reviews_created_idx (created_at),
+    KEY zentao_defect_reviews_project_idx (project_id),
+    KEY zentao_defect_reviews_config_idx (config_id)
+)
+''')
+print('ensured table zentao_defect_reviews')
+
+# ⚠️ 每个 DDL 必须用**独立 cursor**：MySQL 的 DDL 会隐式提交，
+# 使复用同一个 cursor 的后续 execute 抛 "Cursor closed"（2026-10-22 实测踩过）。
+for _col, _ddl in (
+    ('db_host', "ALTER TABLE zentao_configs ADD COLUMN db_host VARCHAR(200) NOT NULL DEFAULT ''"),
+    ('db_port', "ALTER TABLE zentao_configs ADD COLUMN db_port VARCHAR(10) NOT NULL DEFAULT ''"),
+    ('db_name', "ALTER TABLE zentao_configs ADD COLUMN db_name VARCHAR(100) NOT NULL DEFAULT ''"),
+    ('db_user', "ALTER TABLE zentao_configs ADD COLUMN db_user VARCHAR(100) NOT NULL DEFAULT ''"),
+    ('db_password', "ALTER TABLE zentao_configs ADD COLUMN db_password VARCHAR(200) NOT NULL DEFAULT ''"),
+    ('db_prefix', "ALTER TABLE zentao_configs ADD COLUMN db_prefix VARCHAR(20) NOT NULL DEFAULT ''"),
+):
+    with connection.cursor() as _c:
+        _c.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                   "AND TABLE_NAME = 'zentao_configs' AND COLUMN_NAME = %s", (_col,))
+        _exists = _c.fetchone()[0]
+    if not _exists:
+        with connection.cursor() as _c2:
+            _c2.execute(_ddl)
+        print('ensured column zentao_configs.%s' % _col)
+
+# 用例生成任务支持「关联历史缺陷复盘」（2026-10-22，方案 A）：默认 NULL 不注入
+for _col, _ddl in (
+    ('defect_review_id',
+     "ALTER TABLE testcase_generation_task ADD COLUMN defect_review_id BIGINT NULL DEFAULT NULL, "
+     "ADD KEY tgt_defect_review_idx (defect_review_id)"),
+    ('defect_review_detail_level',
+     "ALTER TABLE testcase_generation_task ADD COLUMN defect_review_detail_level "
+     "VARCHAR(20) NOT NULL DEFAULT ''"),
+    # 注入审计：记录本次实际注入的历史测试点快照（用户要能查到「用了哪几条」）
+    ('defect_review_used',
+     "ALTER TABLE testcase_generation_task ADD COLUMN defect_review_used JSON NULL"),
+):
+    with connection.cursor() as _c:
+        _c.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                   "AND TABLE_NAME = 'testcase_generation_task' AND COLUMN_NAME = %s", (_col,))
+        _exists = _c.fetchone()[0]
+    if not _exists:
+        with connection.cursor() as _c2:
+            _c2.execute(_ddl)
+        print('ensured column testcase_generation_task.%s' % _col)
+
 # ui_elements.platform：元素库区分平台（Android/iOS/HarmonyOS/Web）
 # 同一业务元素在不同平台 locator 不同，必须分平台保存，否则多平台互相覆盖。
 cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
@@ -597,6 +671,18 @@ print('ensured table app_pipeline_runs')
         subprocess.run([sys.executable, "manage.py", "init_locator_strategies"], check=False)
     except Exception as e:
         print(f"init_locator_strategies skipped: {e}")
+
+    # 生产环境 DEBUG=False 时 Django 不再自动提供 /static/，必须依赖 collectstatic 产物。
+    # 之前脚本从未跑过 collectstatic（/app/static 为空），一旦把 DEBUG 关掉，
+    # Django admin 后台会丢失全部样式。这里在启动前幂等收集一次。
+    print("Collecting static files...")
+    try:
+        subprocess.run(
+            [sys.executable, "manage.py", "collectstatic", "--noinput"],
+            check=False,
+        )
+    except Exception as e:
+        print(f"collectstatic skipped: {e}")
 
     print("Creating superuser if not exists...")
     create_su_script = """

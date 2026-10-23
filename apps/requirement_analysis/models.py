@@ -447,6 +447,23 @@ class TestCaseGenerationTask(models.Model):
         blank=True, verbose_name='需求拆解阶段确认的问答对',
         help_text='JSON数组: [{question, answer}]，来自精炼时用户确认的不确定项回答，用于生成用例时的上下文注入'
     )
+    # 历史缺陷复盘注入（2026-10-22，方案 A：任务级显式开关）
+    # 只有用户在本次任务显式选择了复盘报告时，才把该报告提炼的测试点注入 writer prompt。
+    # 默认 NULL = 不注入，保证既有任务行为完全不变，不会"一次复盘污染以后所有生成"。
+    defect_review = models.ForeignKey(
+        'zentao.DefectReviewReport',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='generation_tasks',
+        verbose_name='关联历史缺陷复盘',
+        help_text='选中后按本次需求二次筛选该报告的测试点并注入生成，不选则不注入',
+    )
+    defect_review_detail_level = models.CharField(
+        max_length=20, blank=True, default='',
+        verbose_name='测试点注入详略',
+        help_text='brief/standard/full；留空则按改动规模自动决定',
+    )
     review_count = models.IntegerField(default=0, verbose_name='评审次数')  # 0=未评审, 1=首次, 2+=重新评审
     review_updated_at = models.DateTimeField(null=True, blank=True, verbose_name='最后评审时间')
 

@@ -29,6 +29,25 @@ class ZentaoConfig(models.Model):
     )
     coverage_target = models.FloatField(default=90.0, verbose_name='覆盖率目标(%)')
 
+    # 禅道 MySQL 只读连接（用于历史缺陷复盘：HTTP 接口只能拿到当前 Build 的 Bug，
+    # 全量历史必须直连库）。留空则回退到环境变量 ZENTAO_DB_*。
+    # ⚠️ 该账号必须只有 SELECT 权限；本系统只用它做只读查询。
+    db_host = models.CharField(
+        max_length=200, blank=True, default='', verbose_name='数据库地址',
+        help_text='留空则使用环境变量 ZENTAO_DB_HOST',
+    )
+    db_port = models.CharField(max_length=10, blank=True, default='', verbose_name='数据库端口')
+    db_name = models.CharField(max_length=100, blank=True, default='', verbose_name='数据库名')
+    db_user = models.CharField(max_length=100, blank=True, default='', verbose_name='数据库只读账号')
+    db_password = models.CharField(
+        max_length=200, blank=True, default='', verbose_name='数据库密码',
+        help_text='只读账号密码，接口不返回该字段',
+    )
+    db_prefix = models.CharField(
+        max_length=20, blank=True, default='', verbose_name='表前缀',
+        help_text='禅道默认 zt_，留空则用默认值',
+    )
+
     project = models.ForeignKey(
         Project,
         on_delete=models.SET_NULL,
@@ -259,3 +278,84 @@ class CoverageItem(models.Model):
         verbose_name = '覆盖判定明细'
         verbose_name_plural = '覆盖判定明细'
         ordering = ['id']
+
+
+class DefectReviewReport(models.Model):
+    """历史缺陷复盘报告：整合历史有效 Bug → 提炼测试点，供新版本生成更精准的用例。
+
+    与 CoverageReport 的区别：
+      - CoverageReport 回答「AI 用例覆盖了哪些历史 Bug」（评估已发生的用例）
+      - DefectReviewReport 回答「历史 Bug 暴露了哪些该测的点」（生成未来的用例）
+    产物核心是 testpoints_json，而不是缺陷清单本身。
+    """
+
+    STATUS_CHOICES = [
+        ('running', '分析中'),
+        ('success', '完成'),
+        ('failed', '失败'),
+    ]
+
+    name = models.CharField(max_length=200, blank=True, default='', verbose_name='报告名称')
+    config = models.ForeignKey(
+        ZentaoConfig,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='defect_reviews',
+        verbose_name='禅道配置',
+    )
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='defect_reviews',
+        verbose_name='TestHub项目',
+    )
+    version = models.ForeignKey(
+        Version,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='defect_reviews',
+        verbose_name='TestHub版本',
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default='running', verbose_name='状态'
+    )
+
+    # 取数范围（可追溯"这份报告基于什么数据算出来"）
+    product_ids = models.JSONField(default=list, verbose_name='禅道产品ID列表')
+    date_from = models.DateField(null=True, blank=True, verbose_name='缺陷起始日期')
+    date_to = models.DateField(null=True, blank=True, verbose_name='缺陷截止日期')
+    excluded_types = models.JSONField(default=list, verbose_name='排除的缺陷类型')
+
+    bug_total = models.IntegerField(default=0, verbose_name='纳入的缺陷数')
+    domain_count = models.IntegerField(default=0, verbose_name='功能域数')
+    testpoint_count = models.IntegerField(default=0, verbose_name='测试点数')
+
+    stats_json = models.JSONField(default=dict, verbose_name='统计结果')
+    testpoints_json = models.JSONField(default=list, verbose_name='测试点')
+    error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
+
+    llm_model = models.CharField(max_length=100, blank=True, default='', verbose_name='使用的模型')
+
+    created_by = models.ForeignKey(
+        'users.User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='defect_reviews',
+        verbose_name='创建人',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+
+    class Meta:
+        db_table = 'zentao_defect_reviews'
+        verbose_name = '历史缺陷复盘报告'
+        verbose_name_plural = '历史缺陷复盘报告'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.name or f'缺陷复盘#{self.id}'
