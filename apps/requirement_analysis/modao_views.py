@@ -484,14 +484,43 @@ def _resolve_adopt_version(proto):
     return None
 
 
+def _source_page_of(proto, entry, ref=None, explicit_id=None):
+    """取来源画布（ModaoPage），用于采纳时写入来源 tags。
+
+    优先级：显式 source_page_id > entry.page_id > ref.page_id。
+    冒烟用例的 ref 被前端故意置空（防止误命中同页普通用例），
+    需靠显式 source_page_id 兜底。
+    """
+    page_id = explicit_id
+    if page_id is None and entry and entry.get('page_id') is not None:
+        page_id = entry['page_id']
+    if page_id is None and isinstance(ref, dict) and ref.get('page_id') is not None:
+        page_id = ref.get('page_id')
+    if page_id is None:
+        return None
+    try:
+        return proto.pages.filter(id=int(page_id)).first()
+    except (TypeError, ValueError):
+        return None
+
+
 def _adopt_one_case(proto, user, tc_obj, mname, sort_order, desc_suffix='逐条采纳',
-                    extra_tags=None, source='ai'):
+                    extra_tags=None, source='ai', source_page=None):
     """把一条（可能已被前端编辑过的）用例写入用例库。幂等：项目 + 标题 + 模块 去重。
 
     source：用例来源（'ai'=AI生成 / 'manual'=人工编写）。
     人工补充（_manual / 无 _ref）必须传 'manual'，否则用例库来源列会错标成「AI生成」，
     进而污染 AI 采纳率 / 真实覆盖率统计。
+    source_page：来源画布（ModaoPage），采纳时把来源画布/文件夹写入 tags 供溯源筛选。
     """
+    # 来源溯源：把来源画布/文件夹写入 tags（tags 是已有 JSONField，不涉及迁移）。
+    # 格式：画布:P{page_no} {page_name} / 文件夹:{folder}，供测试用例页按来源筛选。
+    if source_page is not None:
+        origin_tags = [f"画布:P{source_page.page_no} {source_page.page_name}"]
+        _folder = (getattr(source_page, 'folder', '') or '').strip()
+        if _folder:
+            origin_tags.append(f"文件夹:{_folder}")
+        extra_tags = list(dict.fromkeys(list(extra_tags or []) + origin_tags))
     if not proto.project_id:
         return {'ok': False, 'detail': '请先在阶段0关联项目，再采纳到用例库'}
     target_version = _resolve_adopt_version(proto)
@@ -1787,13 +1816,15 @@ def modao_adopt(request, pk):
             is_smoke = bool(data.pop('is_smoke', False))
             # 人工补充（无 _ref / 显式 _manual）：不是"编辑某条 AI 用例"，需并入汇总
             is_manual = bool(data.pop('_manual', False)) or not ref
+            src_page_id = data.pop('source_page_id', None)
             entry = _find_case_entry(entries, ref)
             sort_order = entry['ordinal'] if entry else len(entries) + i + 1
             mname = data.get('module') or (entry['module'] if entry else '未分组')
             r = _adopt_one_case(proto, request.user, data, mname, sort_order,
                                 desc_suffix='人工补充采纳' if is_manual else '编辑后采纳',
                                 extra_tags=['冒烟'] if is_smoke else None,
-                                source='manual' if is_manual else 'ai')
+                                source='manual' if is_manual else 'ai',
+                                source_page=_source_page_of(proto, entry, ref=ref, explicit_id=src_page_id))
             if not r.get('ok'):
                 counts['failed'] += 1
                 continue
@@ -1815,7 +1846,8 @@ def modao_adopt(request, pk):
                 counts['failed'] += 1
                 continue
             r = _adopt_one_case(proto, request.user, entry['tc_obj'], entry['module'],
-                                entry['ordinal'], desc_suffix='逐条采纳')
+                                entry['ordinal'], desc_suffix='逐条采纳',
+                                source_page=_source_page_of(proto, entry, ref=ref))
             if not r.get('ok'):
                 counts['failed'] += 1
                 continue
@@ -1856,7 +1888,8 @@ def _adopt_single_case(proto, user, case_index):
     if not isinstance(case_index, int) or case_index < 0 or case_index >= len(entries):
         return {'ok': False, 'detail': f'用例索引 {case_index} 超出范围（共 {len(entries)} 条）'}
     e = entries[case_index]
-    return _adopt_one_case(proto, user, e['tc_obj'], e['module'], e['ordinal'], desc_suffix='逐条采纳')
+    return _adopt_one_case(proto, user, e['tc_obj'], e['module'], e['ordinal'], desc_suffix='逐条采纳',
+                           source_page=_source_page_of(proto, e))
 
 
 @api_view(['POST'])
@@ -1892,7 +1925,9 @@ def modao_adopt_single(request, pk):
         mname = edited.get('module') or (entry['module'] if entry else '未分组')
         result = _adopt_one_case(proto, request.user, edited, mname, sort_order,
                                  desc_suffix='编辑后采纳',
-                                 extra_tags=['冒烟'] if is_smoke else None)
+                                 extra_tags=['冒烟'] if is_smoke else None,
+                                 source_page=_source_page_of(proto, entry, ref=ref,
+                                                             explicit_id=payload.get('source_page_id')))
         if not result.get('ok'):
             return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
         return Response({
@@ -1912,7 +1947,9 @@ def modao_adopt_single(request, pk):
         )
     result = _adopt_one_case(proto, request.user, entry['tc_obj'], entry['module'],
                              entry['ordinal'], desc_suffix='逐条采纳',
-                             extra_tags=['冒烟'] if is_smoke else None)
+                             extra_tags=['冒烟'] if is_smoke else None,
+                             source_page=_source_page_of(proto, entry, ref=ref,
+                                                         explicit_id=payload.get('source_page_id')))
     if not result.get('ok'):
         return Response({'detail': result.get('detail', '采纳失败')}, status=http_status.HTTP_400_BAD_REQUEST)
     return Response({

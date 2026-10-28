@@ -60,10 +60,12 @@ class TestCaseListCreateView(ProjectScopedMixin, generics.ListCreateAPIView):
         if test_point:
             qs = qs.filter(test_point_id=test_point)
         
-        # 按标签筛选（如 tags=冒烟）
+        # 按标签筛选（单值 tags=冒烟；多值逗号分隔 tags=冒烟,画布:P17 连胜入口，多标签为「且」关系，
+        # 供测试用例页「用例类别 + 来源画布 + 来源文件夹」组合筛选复用同一参数）
         tag_filter = self.request.query_params.get('tags', None)
         if tag_filter:
-            qs = qs.filter(tags__contains=[tag_filter])
+            for _t in [x.strip() for x in tag_filter.split(',') if x.strip()]:
+                qs = qs.filter(tags__contains=[_t])
         
         return qs.distinct()
     
@@ -310,3 +312,30 @@ class TestCaseImportView(ProjectScopedMixin, APIView):
             'failed': len(errors),
             'errors': errors[:50],
         })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def testcase_source_tags(request):
+    """聚合当前范围（project/version）内用例 tags 中的来源标签。
+
+    墨刀采纳时会把来源写入 tags：画布:P{page_no} {page_name} / 文件夹:{folder}
+    （见 apps/requirement_analysis/modao_views.py _adopt_one_case）。
+    返回 {'canvases': [...], 'folders': [...]} 供测试用例页「来源画布/来源文件夹」筛选。
+    """
+    from apps.core.mixins import get_accessible_projects_for_user
+    qs = TestCase.objects.filter(project__in=get_accessible_projects_for_user(request.user))
+    project_id = request.query_params.get('project')
+    version_id = request.query_params.get('version')
+    if project_id:
+        qs = qs.filter(project_id=project_id)
+    if version_id:
+        qs = qs.filter(versions__id=version_id)
+    tags = set()
+    for tag_list in qs.exclude(tags=[]).values_list('tags', flat=True):
+        for t in (tag_list or []):
+            if isinstance(t, str):
+                tags.add(t)
+    canvases = sorted(t for t in tags if t.startswith('画布:'))
+    folders = sorted(t for t in tags if t.startswith('文件夹:'))
+    return Response({'canvases': canvases, 'folders': folders})
