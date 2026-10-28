@@ -784,6 +784,7 @@ export default {
     async postAdoptSingle(row) {
       const payload = this.payloadForSubmit(row)
       const body = { is_smoke: !!row._isSmoke }
+      if (row._pageId != null) body.source_page_id = row._pageId
       const ref = this.caseRefOf(row)
       if (ref) body.case_ref = ref
       if (payload) body.case = payload
@@ -822,8 +823,11 @@ export default {
         const refs = []
         for (const row of this.selectedCases) {
           const payload = this.payloadForSubmit(row)
+          // source_page_id：来源画布 id（含冒烟用例——其 _ref 被故意置空防误命中，
+          // 后端采纳时用它把「画布:P{n} {name} / 文件夹:{folder}」写入用例 tags 供溯源筛选）
+          const srcPageId = row._pageId != null ? row._pageId : undefined
           if (payload) {
-            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined })
+            cases.push({ ...payload, _ref: this.caseRefOf(row) || undefined, source_page_id: srcPageId })
           } else {
             refs.push(this.caseRefOf(row))
           }
