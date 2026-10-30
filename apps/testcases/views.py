@@ -286,23 +286,44 @@ class TestCaseImportView(ProjectScopedMixin, APIView):
             )
             tc.versions.set(versions)
 
-            # 按名称解析功能模块 / 测试点（best-effort，找不到则跳过，不阻断导入）
+            # 按名称解析功能模块 / 测试点（若模块不存在则自动创建，避免模块丢失）
             fm_names = self._norm_list(item.get('feature_modules') or item.get('featureModules'))
             fm_ids = []
             if fm_names:
                 for name in fm_names:
-                    fm = FeatureModule.objects.filter(project=project, name=name).first()
-                    if fm:
-                        fm_ids.append(fm.id)
+                    clean_name = name.strip().strip('/')
+                    if not clean_name or clean_name == '-':
+                        continue
+                    if len(clean_name) > 100:
+                        clean_name = clean_name[:100]
+                    fm, _ = FeatureModule.objects.get_or_create(
+                        project=project,
+                        name=clean_name,
+                        defaults={
+                            'description': '测试用例导入自动创建',
+                            'created_by': user,
+                        },
+                    )
+                    if versions:
+                        fm.versions.add(*versions)
+                    fm_ids.append(fm.id)
                 if fm_ids:
                     tc.feature_modules.set(fm_ids)
 
             tp_name = (item.get('test_point') or item.get('testPoint') or '').strip()
-            if tp_name and fm_ids:
-                tp = TestPoint.objects.filter(feature_module_id__in=fm_ids, name=tp_name).first()
-                if tp:
-                    tc.test_point = tp
-                    tc.save(update_fields=['test_point'])
+            if tp_name and tp_name != '-' and fm_ids:
+                first_fm = FeatureModule.objects.get(id=fm_ids[0])
+                clean_tp = tp_name[:200]
+                tp, _ = TestPoint.objects.get_or_create(
+                    feature_module=first_fm,
+                    name=clean_tp,
+                    defaults={
+                        'description': '测试用例导入自动创建',
+                        'created_by': user,
+                    },
+                )
+                tc.test_point = tp
+                tc.save(update_fields=['test_point'])
 
             created += 1
 

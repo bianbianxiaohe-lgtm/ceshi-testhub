@@ -1486,20 +1486,20 @@ const handleImportFileChange = (uploadFile) => {
           }
           return ''
         }
-        const title = get('用例标题', 'title')
-        const expected = get('预期结果', 'expected_result', 'expectedResult')
+        const title = get('用例标题', '标题', 'title')
+        const expected = get('预期结果', '预期', 'pass_criteria', 'expected_result', 'expectedResult')
         cases.push({
           title,
           expected_result: expected,
           description: get('用例描述', '描述', 'description'),
           preconditions: get('前置条件', 'preconditions'),
-          steps: get('操作步骤', 'steps'),
+          steps: get('操作步骤', '步骤', 'steps'),
           priority: get('优先级', 'priority'),
           status: get('状态', 'status'),
-          test_type: get('测试类型', 'testType'),
-          feature_modules: get('功能模块', 'featureModules'),
+          test_type: get('测试类型', '用例类型', 'testType'),
+          feature_modules: get('功能模块', '所属模块', '模块', 'featureModules'),
           test_point: get('测试点', 'testPoint'),
-          tags: get('标签', 'tags')
+          tags: get('标签', '关键词', 'tags')
         })
         if (title && expected) valid++
         else invalid++

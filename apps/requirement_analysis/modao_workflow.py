@@ -630,8 +630,14 @@ class ModaoWorkflow:
             finish_reason = result['choices'][0].get('finish_reason')
         except Exception:
             pass
+        usage = result.get('usage') or {}
+        p_tokens = usage.get('prompt_tokens', 0)
+        c_tokens = usage.get('completion_tokens', 0)
+        t_tokens = usage.get('total_tokens', 0)
         elapsed = _time.time() - t0
-        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s finish_reason={finish_reason}', flush=True)
+        print(f'[LLM] ✓ {model_label} 返回 {len(content)}字符 耗时 {elapsed:.1f}s tokens(in={p_tokens},out={c_tokens},total={t_tokens}) finish_reason={finish_reason}', flush=True)
+        if getattr(self, 'prototype', None):
+            _wf_tlog(self.prototype.id, f'[LLM_METRICS] {model_label} role={role_label} in_tok={p_tokens} out_tok={c_tokens} total_tok={t_tokens} p_len={len(prompt)} r_len={len(content)} elapsed={elapsed:.2f}s finish_reason={finish_reason}')
         if return_meta:
             return {'content': content, 'finish_reason': finish_reason}
         return content
